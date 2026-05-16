@@ -4,7 +4,12 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="1392a802-f3c7-4bdc-840c-ddb0957d2a69" name="更改" comment="" />
+    <list default="true" id="1392a802-f3c7-4bdc-840c-ddb0957d2a69" name="更改" comment="">
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/configs/mambaad/mambaad_medical.py" beforeDir="false" afterPath="$PROJECT_DIR$/configs/mambaad/mambaad_medical.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/model/mambaad.py" beforeDir="false" afterPath="$PROJECT_DIR$/model/mambaad.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/trainer/mambaad_trainer.py" beforeDir="false" afterPath="$PROJECT_DIR$/trainer/mambaad_trainer.py" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -20,12 +25,14 @@
   <component name="ProjectViewState">
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
+    <option name="sortKey" value="BY_TIME_DESCENDING" />
   </component>
   <component name="PropertiesComponent">{
   &quot;keyToString&quot;: {
     &quot;ModuleVcsDetector.initialDetectionPerformed&quot;: &quot;true&quot;,
     &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
     &quot;RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
     &quot;WebServerToolWindowPanel.toolwindow.highlight.mappings&quot;: &quot;true&quot;,
     &quot;WebServerToolWindowPanel.toolwindow.highlight.symlinks&quot;: &quot;true&quot;,
     &quot;WebServerToolWindowPanel.toolwindow.show.date&quot;: &quot;false&quot;,
@@ -67,7 +74,9 @@
       <workItem from="1774323035193" duration="688000" />
       <workItem from="1777281751861" duration="16000" />
       <workItem from="1778411233542" duration="332000" />
-      <workItem from="1778411998272" duration="12592000" />
+      <workItem from="1778411998272" duration="21421000" />
+      <workItem from="1778639172787" duration="50000" />
+      <workItem from="1778640326615" duration="18000" />
     </task>
     <servers />
   </component>

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="PublishConfigData" autoUpload="On explicit save action" serverName="HKMU" remoteFilesAllowedToDisappearOnAutoupload="false" autoUploadExternalChanges="true">
+    <serverData>
+      <paths name="HKMU">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/wmwanghkmu/ZYH/Mamba/ADer" local="$PROJECT_DIR$" web="/" />
+          </mappings>
+          <excludedPaths>
+            <excludedPath path="/home/wmwanghkmu/ZYH/Mamba/ADer/runs" />
+            <excludedPath path="/home/wmwanghkmu/ZYH/Mamba/ADer/data" />
+            <excludedPath path="/home/wmwanghkmu/ZYH/Mamba/ADer/configs/__pycache__" />
+          </excludedPaths>
+        </serverdata>
+      </paths>
+    </serverData>
+    <option name="myAutoUpload" value="ON_EXPLICIT_SAVE" />
+  </component>
+</project>

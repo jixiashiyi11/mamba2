@@ -1,0 +1,5 @@
+1.compactness penalty
+2.hard-negative mining
+3.class ema weighting/acw
+4.semantic probe dropout
+5.no gaussian noise

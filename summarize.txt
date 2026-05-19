@@ -1,5 +1,1 @@
-1.compactness penalty
-2.hard-negative mining
-3.class ema weighting/acw
-4.semantic probe dropout
-5.no gaussian noise
+学术价值： 这是一个典型的双重保险/残差引导机制。医学文本（哪怕是 BiomedCLIP 提取的）有时候可能会因为 Prompt 的微小差异产生特征抖动（Noise）。你设定了 class_residual_weight = 0.2，让外部输入的强语义文本特征作为主导（权重 1.0），而传统的硬编码类别标签作为残差补偿（权重 0.2）进行“托底”。这在论文里是一个非常棒的 Story，能证明你在引入外部先验知识的同时，依然保持了模型对原分布的锚定稳定性。

@@ -196,9 +196,15 @@ class MAMBAADTrainer(BaseTrainer):
         self.bs = self.imgs.shape[0]
 
     def forward(self):
+        self.t_norm_batch, self.t_abn_batch = None, None
+        text_condition = None
+        if self.use_adaptive_mc:
+            self.t_norm_batch, self.t_abn_batch = self._select_text_priors(self.cls_name)
+            text_condition = self.t_norm_batch
         self.feats_t, self.feats_s, self.f_global = self.net(
             self.imgs,
             self.cls_name,
+            text_condition=text_condition,
             return_teacher_features=True,
         )
 
@@ -213,11 +219,10 @@ class MAMBAADTrainer(BaseTrainer):
             adaptive_mc_weight = 0.0
             if self.use_adaptive_mc:
                 batch_class_indices = self._class_names_to_indices(self.cls_name)
-                t_norm_batch, t_abn_batch = self._select_text_priors(self.cls_name)
                 adaptive_mc_output = self.loss_terms['adaptive_mc'](
                     self.f_global,
-                    t_norm_batch,
-                    t_abn_batch,
+                    self.t_norm_batch,
+                    self.t_abn_batch,
                     self.anomaly,
                     return_details=True,
                 )

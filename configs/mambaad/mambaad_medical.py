@@ -18,7 +18,7 @@ class cfg(cfg_common, cfg_dataset_default, cfg_model_mambaad):
 		self.fvcore_c = 3
 		self.seed = 42
 		self.size = 256
-		self.epoch_full = 1000
+		self.epoch_full = 100
 		self.warmup_epochs = 0
 		self.test_start_epoch = self.epoch_full
 		self.test_per_epoch = self.epoch_full // 20
@@ -63,8 +63,9 @@ class cfg(cfg_common, cfg_dataset_default, cfg_model_mambaad):
 		)
 		self.model = Namespace()
 		self.model.name = 'mambaad'
+		self.model.class_residual_weight = 0.2
 		self.model.kwargs = dict(pretrained=False, checkpoint_path='', strict=True, model_t=self.model_t,
-								 model_s=self.model_s)
+								 model_s=self.model_s, class_residual_weight=self.model.class_residual_weight)
 		self.biomedclip_model_name = 'hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224'
 		self.prompt_normal = {
 			'brain': 'A normal healthy brain MRI scan with symmetric hemispheres and no visible lesion or structural abnormality.',

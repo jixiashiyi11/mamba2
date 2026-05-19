@@ -656,7 +656,7 @@ class MFF_OCE(nn.Module):
         return sv_features.contiguous()
 
 class MAMBAAD(nn.Module):
-    def __init__(self, model_t, model_s, bottleneck_dim=512):
+    def __init__(self, model_t, model_s, bottleneck_dim=512, class_residual_weight=0.2):
         super(MAMBAAD, self).__init__()
         self.net_t = get_model(model_t)
         self.mff_oce = MFF_OCE(Bottleneck, 3)
@@ -669,7 +669,14 @@ class MAMBAAD(nn.Module):
         self.frozen_layers = ['net_t']
 
         self.cond_dim = 512
+        self.text_cond_proj = nn.Sequential(
+            nn.LayerNorm(512),
+            nn.Linear(512, self.cond_dim),
+            nn.SiLU(),
+            nn.Linear(self.cond_dim, self.cond_dim),
+        )
         self.class_embedding = nn.Embedding(3, self.cond_dim)
+        self.class_residual_weight = class_residual_weight
         self.name_to_id = {'brain': 0, 'liver': 1, 'retinal': 2}
 
     def _project_global_semantics(self, bottleneck_feats: torch.Tensor) -> torch.Tensor:
@@ -685,6 +692,34 @@ class MAMBAAD(nn.Module):
         for param in module.parameters():
             param.requires_grad = False
 
+    def _get_class_ids(self, cls_names, device):
+        class_ids = [self.name_to_id.get(str(name).lower(), 0) for name in cls_names]
+        return torch.tensor(class_ids, dtype=torch.long, device=device)
+
+    def _build_decoder_condition(self, imgs, cls_names=None, text_condition=None):
+        c_embed = None
+        class_ids = None
+
+        if cls_names is not None:
+            class_ids = self._get_class_ids(cls_names, imgs.device)
+
+        if text_condition is not None:
+            text_condition = text_condition.to(device=imgs.device, dtype=self.text_proj.weight.dtype)
+            if text_condition.ndim != 2 or text_condition.shape[1] != self.cond_dim:
+                raise ValueError(
+                    f'Expected text_condition to have shape (B, {self.cond_dim}), got {tuple(text_condition.shape)}.'
+                )
+            c_embed = self.text_cond_proj(text_condition)
+
+        if class_ids is not None:
+            class_embed = self.class_embedding(class_ids)
+            if c_embed is None:
+                c_embed = class_embed
+            else:
+                c_embed = c_embed + self.class_residual_weight * class_embed
+
+        return c_embed
+
     def train(self, mode=True):
         self.training = mode
         for mname, module in self.named_children():
@@ -694,11 +729,15 @@ class MAMBAAD(nn.Module):
                 module.train(mode)
         return self
 
-    def forward(self, imgs, cls_names=None, return_teacher_features=False):
+    def forward(self, imgs, cls_names=None, text_condition=None, return_teacher_features=False):
         """
         Args:
             imgs: Input image tensor of shape ``(B, 3, H, W)``.
             cls_names: Optional class-name list used for conditional decoding.
+            text_condition: Optional text-guided condition tensor of shape
+                ``(B, 512)``. When provided, it becomes the main AdaLN
+                condition source and the class embedding acts as a residual
+                modality compensation term.
             return_teacher_features: When ``True``, also returns the frozen
                 teacher features needed by the original MambaAD training and
                 evaluation pipeline.
@@ -712,12 +751,7 @@ class MAMBAAD(nn.Module):
         feats_t = [f.detach() for f in feats_t]
         fused_feats = self.mff_oce(feats_t)
         f_global = self._project_global_semantics(fused_feats)
-
-        c_embed = None
-        if cls_names is not None:
-            class_ids = [self.name_to_id.get(str(name).lower(), 0) for name in cls_names]
-            class_ids = torch.tensor(class_ids, dtype=torch.long, device=imgs.device)
-            c_embed = self.class_embedding(class_ids)
+        c_embed = self._build_decoder_condition(imgs, cls_names=cls_names, text_condition=text_condition)
 
         reconstructed_features = self.net_s(fused_feats, c_embed)
         if return_teacher_features:

@@ -1,34 +1,18 @@
-import os
 import copy
+import os
 import glob
 import shutil
-import datetime
 import time
 
+import numpy as np
 import tabulate
 import torch
-from util.util import makedirs, log_cfg, able, log_msg, get_log_terms, update_log_term
-from util.net import trans_state_dict, print_networks, get_timepc, reduce_tensor
-from util.net import get_loss_scaler, get_autocast, distribute_bn
-from optim.scheduler import get_scheduler
-from data import get_loader
-from model import get_model
-from optim import get_optim
-from loss import get_loss_terms
-from util.metric import get_evaluator
-from timm.data import Mixup
+import torch.nn.functional as F
+import matplotlib.cm as cm
+from PIL import Image
 
-import numpy as np
-from torch.nn.parallel import DistributedDataParallel as NativeDDP
-
-try:
-    from apex import amp
-    from apex.parallel import DistributedDataParallel as ApexDDP
-    from apex.parallel import convert_syncbn_model as ApexSyncBN
-except:
-    from timm.layers.norm_act import convert_sync_batchnorm as ApexSyncBN
-from timm.layers.norm_act import convert_sync_batchnorm as TIMMSyncBN
-from timm.utils import dispatch_clip_grad
+from util.util import able, log_msg, update_log_term
+from util.net import get_timepc, reduce_tensor
 
 from ._base_trainer import BaseTrainer
 from . import TRAINER
@@ -38,48 +22,180 @@ from . import TRAINER
 class MAMBAADTrainer(BaseTrainer):
     def __init__(self, cfg):
         super(MAMBAADTrainer, self).__init__(cfg)
+        self.device = torch.device(f'cuda:{cfg.local_rank}')
+        self.lambda_l1 = getattr(cfg.loss, 'lambda_l1', 0.005)
+        self.adaptive_mc_weight_start = getattr(cfg.loss, 'adaptive_mc_weight_start', 0.01)
+        self.adaptive_mc_weight_end = getattr(cfg.loss, 'adaptive_mc_weight_end', 1.0)
+        self.adaptive_mc_warmup_epochs = getattr(cfg.loss, 'adaptive_mc_warmup_epochs', 0)
+        self.use_adaptive_mc = 'adaptive_mc' in self.loss_terms
+        self.prior_names = []
+        self.prior_name_to_idx = {}
+        self.T_norm_prior = None
+        self.T_abn_prior = None
+        if self.use_adaptive_mc:
+            self.prior_names, self.T_norm_prior, self.T_abn_prior = self._setup_text_priors()
+            self.prior_name_to_idx = {name: idx for idx, name in enumerate(self.prior_names)}
+
+    def _normalize_prompt_config(self, prompt_config, name):
+        if isinstance(prompt_config, str):
+            return {'__shared__': prompt_config}
+        if isinstance(prompt_config, dict):
+            if not prompt_config:
+                raise ValueError(f'`{name}` must not be an empty dict.')
+            return {str(key).lower(): value for key, value in prompt_config.items()}
+        raise TypeError(f'`{name}` must be a string or dict, got {type(prompt_config).__name__}.')
+
+    def _resolve_prompt_template(self, prompt_template, cls_name):
+        if '{cls_name}' not in prompt_template:
+            return prompt_template
+        return prompt_template.format(cls_name=cls_name)
+
+    def _build_prompt_pairs(self, prompt_normal, prompt_abnormal):
+        normal_map = self._normalize_prompt_config(prompt_normal, 'prompt_normal')
+        abnormal_map = self._normalize_prompt_config(prompt_abnormal, 'prompt_abnormal')
+
+        if '__shared__' in normal_map and '__shared__' in abnormal_map:
+            cls_names = ['__shared__']
+        elif '__shared__' in normal_map:
+            cls_names = list(abnormal_map.keys())
+            normal_map = {name: normal_map['__shared__'] for name in cls_names}
+        elif '__shared__' in abnormal_map:
+            cls_names = list(normal_map.keys())
+            abnormal_map = {name: abnormal_map['__shared__'] for name in cls_names}
+        else:
+            cls_names = sorted(normal_map.keys())
+            if set(cls_names) != set(abnormal_map.keys()):
+                raise ValueError('`prompt_normal` and `prompt_abnormal` must have the same class keys.')
+
+        normal_prompts = [self._resolve_prompt_template(normal_map[name], name) for name in cls_names]
+        abnormal_prompts = [self._resolve_prompt_template(abnormal_map[name], name) for name in cls_names]
+        return cls_names, normal_prompts, abnormal_prompts
+
+    def _setup_text_priors(self):
+        prompt_normal = getattr(self.cfg, 'prompt_normal', None)
+        prompt_abnormal = getattr(self.cfg, 'prompt_abnormal', None)
+        if not prompt_normal or not prompt_abnormal:
+            raise ValueError('`prompt_normal` and `prompt_abnormal` must be defined in the medical config.')
+
+        try:
+            import open_clip
+        except ImportError as exc:
+            raise ImportError(
+                'BiomedCLIP prior extraction requires the `open_clip` package to be installed.'
+            ) from exc
+
+        model_name = getattr(
+            self.cfg,
+            'biomedclip_model_name',
+            'hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224',
+        )
+        cls_names, normal_prompts, abnormal_prompts = self._build_prompt_pairs(prompt_normal, prompt_abnormal)
+
+        log_msg(self.logger, f'==> Encoding cached BiomedCLIP priors from {model_name}')
+        text_encoder, _, _ = open_clip.create_model_and_transforms(model_name)
+        tokenizer = open_clip.get_tokenizer(model_name)
+        text_encoder = text_encoder.to(self.device)
+        text_encoder.eval()
+
+        with torch.no_grad():
+            tokens_normal = tokenizer(normal_prompts).to(self.device)
+            tokens_abnormal = tokenizer(abnormal_prompts).to(self.device)
+            t_norm = F.normalize(text_encoder.encode_text(tokens_normal), p=2, dim=-1).detach()
+            t_abn = F.normalize(text_encoder.encode_text(tokens_abnormal), p=2, dim=-1).detach()
+
+        del text_encoder
+        del tokenizer
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        return cls_names, t_norm.to(self.device), t_abn.to(self.device)
+
+    def _select_text_priors(self, cls_names):
+        if self.T_norm_prior is None or self.T_abn_prior is None:
+            raise RuntimeError('Text priors are not initialized.')
+
+        if self.T_norm_prior.shape[0] == 1:
+            batch_size = len(cls_names)
+            return self.T_norm_prior.expand(batch_size, -1), self.T_abn_prior.expand(batch_size, -1)
+
+        class_ids = []
+        for cls_name in cls_names:
+            key = str(cls_name).lower()
+            if key not in self.prior_name_to_idx:
+                raise KeyError(
+                    f'No cached BiomedCLIP prior found for class `{cls_name}`. '
+                    f'Available classes: {sorted(self.prior_name_to_idx.keys())}.'
+                )
+            class_ids.append(self.prior_name_to_idx[key])
+        class_ids = torch.tensor(class_ids, device=self.device, dtype=torch.long)
+        return self.T_norm_prior.index_select(0, class_ids), self.T_abn_prior.index_select(0, class_ids)
+
+    def _get_adaptive_mc_weight(self):
+        if self.adaptive_mc_warmup_epochs <= 0:
+            return self.adaptive_mc_weight_end
+        progress = min(max(float(self.epoch) / float(self.adaptive_mc_warmup_epochs), 0.0), 1.0)
+        return self.adaptive_mc_weight_start + (self.adaptive_mc_weight_end - self.adaptive_mc_weight_start) * progress
 
     def set_input(self, inputs):
         self.imgs = inputs['img'].cuda()
         self.imgs_mask = inputs['img_mask'].cuda()
         self.cls_name = inputs['cls_name']
-        self.anomaly = inputs['anomaly']
+        self.anomaly = inputs['anomaly'].cuda().long().view(-1)
         self.bs = self.imgs.shape[0]
 
     def forward(self):
-        # 💡 把文字标签 (self.cls_name) 和图片一起送进网络
-        self.feats_t, self.feats_s = self.net(self.imgs, self.cls_name)
+        self.feats_t, self.feats_s, self.f_global = self.net(
+            self.imgs,
+            self.cls_name,
+            return_teacher_features=True,
+        )
 
     def optimize_parameters(self):
         if self.mixup_fn is not None:
             self.imgs, _ = self.mixup_fn(self.imgs, torch.ones(self.imgs.shape[0], device=self.imgs.device))
         with self.amp_autocast():
             self.forward()
-            # 1. 基础任务的损失 (算均方误差)
             loss_mse = self.loss_terms['pixel'](self.feats_t, self.feats_s)
 
-            # 2. 💡 院长大查房：自动搜集全网所有门控模块里的 L1 罚款单
-            loss_l1 = 0.0
+            loss_adaptive_mc = loss_mse.new_tensor(0.0)
+            adaptive_mc_weight = 0.0
+            if self.use_adaptive_mc:
+                t_norm_batch, t_abn_batch = self._select_text_priors(self.cls_name)
+                loss_adaptive_mc = self.loss_terms['adaptive_mc'](
+                    self.f_global,
+                    t_norm_batch,
+                    t_abn_batch,
+                    self.anomaly,
+                )
+                adaptive_mc_weight = self._get_adaptive_mc_weight()
+
+            loss_l1 = loss_mse.new_tensor(0.0)
             for module in self.net.modules():
-                # 如果这个模块身上带有 'l1_penalty' 这个属性，就把它抓出来累加
                 if hasattr(module, 'l1_penalty'):
                     loss_l1 = loss_l1 + module.l1_penalty
 
-            # 3. 💡 罚款系数 (lambda_l1)：这个值决定了“老板扣工资有多狠”
-            # 设太大会导致 Mamba 直接躺平(全部输出0)，设太小又起不到稀疏的作用
-            # 经验值：对于医学图像的异常检测，通常从 0.01 或 0.001 开始尝试
-            lambda_l1 = 0.005
+            total_loss = loss_mse + self.lambda_l1 * loss_l1 + adaptive_mc_weight * loss_adaptive_mc
 
-            # 4. 合并总账单
-            total_loss = loss_mse + lambda_l1 * loss_l1
-
-        # 5. 用加上了罚款的总 Loss 去指挥网络更新参数！
         self.backward_term(total_loss, self.optim)
 
-        # 日志照常更新（这里依然只记录 mse loss 方便你观察核心指标）
-        update_log_term(self.log_terms.get('pixel'), reduce_tensor(loss_mse, self.world_size).clone().detach().item(),
-                        1,
-                        self.master)
+        update_log_term(
+            self.log_terms.get('pixel'),
+            reduce_tensor(loss_mse, self.world_size).clone().detach().item(),
+            1,
+            self.master,
+        )
+        update_log_term(
+            self.log_terms.get('adaptive_mc'),
+            reduce_tensor(loss_adaptive_mc, self.world_size).clone().detach().item(),
+            1,
+            self.master,
+        )
+        update_log_term(
+            self.log_terms.get('total'),
+            reduce_tensor(total_loss, self.world_size).clone().detach().item(),
+            1,
+            self.master,
+        )
 
     @torch.no_grad()
     def test(self):
@@ -93,21 +209,26 @@ class MAMBAADTrainer(BaseTrainer):
         test_length = self.cfg.data.test_size
         test_loader = iter(self.test_loader)
         while batch_idx < test_length:
-            # if batch_idx == 2:
-               # break
-
             t1 = get_timepc()
             batch_idx += 1
             test_data = next(test_loader)
             self.set_input(test_data)
             self.forward()
             loss_mse = self.loss_terms['pixel'](self.feats_t, self.feats_s)
-            update_log_term(self.log_terms.get('pixel'), reduce_tensor(loss_mse, self.world_size).clone().detach().item(),
-                            1, self.master)
-            # get anomaly maps
-            anomaly_map, _ = self.evaluator.cal_anomaly_map(self.feats_t, self.feats_s,
-                                                            [self.imgs.shape[2], self.imgs.shape[3]], uni_am=False,
-                                                            amap_mode='add', gaussian_sigma=4)
+            update_log_term(
+                self.log_terms.get('pixel'),
+                reduce_tensor(loss_mse, self.world_size).clone().detach().item(),
+                1,
+                self.master,
+            )
+            anomaly_map, _ = self.evaluator.cal_anomaly_map(
+                self.feats_t,
+                self.feats_s,
+                [self.imgs.shape[2], self.imgs.shape[3]],
+                uni_am=False,
+                amap_mode='add',
+                gaussian_sigma=4,
+            )
             self.imgs_mask[self.imgs_mask > 0.5], self.imgs_mask[self.imgs_mask <= 0.5] = 1, 0
             imgs_masks.append(self.imgs_mask.cpu().numpy().astype(int))
             anomaly_maps.append(anomaly_map)
@@ -116,12 +237,11 @@ class MAMBAADTrainer(BaseTrainer):
             t2 = get_timepc()
             update_log_term(self.log_terms.get('batch_t'), t2 - t1, 1, self.master)
             print(f'\r{batch_idx}/{test_length}', end='') if self.master else None
-            # ---------- log ----------
             if self.master:
                 if batch_idx % self.cfg.logging.test_log_per == 0 or batch_idx == test_length:
-                    msg = able(self.progress.get_msg(batch_idx, test_length, 0, 0, prefix=f'Test'), self.master, None)
+                    msg = able(self.progress.get_msg(batch_idx, test_length, 0, 0, prefix='Test'), self.master, None)
                     log_msg(self.logger, msg)
-        # merge results
+
         if self.cfg.dist:
             results = dict(imgs_masks=imgs_masks, anomaly_maps=anomaly_maps, cls_names=cls_names, anomalys=anomalys)
             torch.save(results, f'{self.tmp_dir}/{self.rank}.pth', _use_new_zipfile_serialization=False)
@@ -141,11 +261,12 @@ class MAMBAADTrainer(BaseTrainer):
                                 for k, v in result.items():
                                     results[k].extend(v)
                                 idx_result += 1
-                            except:
+                            except Exception:
                                 time.sleep(1)
                         valid_results = True
         else:
             results = dict(imgs_masks=imgs_masks, anomaly_maps=anomaly_maps, cls_names=cls_names, anomalys=anomalys)
+
         if self.master:
             results = {k: np.concatenate(v, axis=0) for k, v in results.items()}
             msg = {}
@@ -153,9 +274,8 @@ class MAMBAADTrainer(BaseTrainer):
                 metric_results = self.evaluator.run(results, cls_name, self.logger)
                 msg['Name'] = msg.get('Name', [])
                 msg['Name'].append(cls_name)
-                avg_act = True if len(self.cls_names) > 1 and idx == len(self.cls_names) - 1 else False
+                avg_act = len(self.cls_names) > 1 and idx == len(self.cls_names) - 1
                 msg['Name'].append('Avg') if avg_act else None
-                # msg += f'\n{cls_name:<10}'
                 for metric in self.metrics:
                     metric_result = metric_results[metric] * 100
                     self.metric_recorder[f'{metric}_{cls_name}'].append(metric_result)
@@ -172,6 +292,205 @@ class MAMBAADTrainer(BaseTrainer):
                         max_metric_idx = self.metric_recorder[f'{metric}_Avg'].index(max_metric) + 1
                         msg[metric].append(metric_result_avg)
                         msg[f'{metric} (Max)'].append(f'{max_metric:.3f} ({max_metric_idx:<3d} epoch)')
-            msg = tabulate.tabulate(msg, headers='keys', tablefmt="pipe", floatfmt='.3f', numalign="center",
-                                    stralign="center", )
+            msg = tabulate.tabulate(msg, headers='keys', tablefmt='pipe', floatfmt='.3f', numalign='center', stralign='center')
+            log_msg(self.logger, f'\n{msg}')
+
+
+@TRAINER.register_module
+class MAMBAADZeroShotTrainer(BaseTrainer):
+    def __init__(self, cfg):
+        super(MAMBAADZeroShotTrainer, self).__init__(cfg)
+        self.device = torch.device(f'cuda:{cfg.local_rank}')
+        base_output_dir = cfg.logdir if cfg.logdir is not None else cfg.trainer.checkpoint
+        self.hr_anomaly_map_dir = os.path.join(base_output_dir, 'show_test_hr_anomaly_maps')
+        os.makedirs(self.hr_anomaly_map_dir, exist_ok=True)
+        print("测试异常图保存路径：", self.hr_anomaly_map_dir)
+
+        if hasattr(cfg, 'data_train') and hasattr(cfg, 'data_test'):
+            self._rebuild_cross_domain_loaders(cfg)
+
+    def _rebuild_cross_domain_loaders(self, cfg):
+        try:
+            from data import get_loader
+        except ImportError as exc:
+            raise ImportError(
+                'Cross-domain mode requires ADer\'s native `data.get_loader` entrypoint.'
+            ) from exc
+
+        log_msg(self.logger, '==> Cross-domain mode detected, rebuilding source-train / target-test loaders')
+
+        cfg_train = copy.copy(cfg)
+        cfg_train.data = copy.deepcopy(cfg.data_train)
+        train_loader, _ = get_loader(cfg_train)
+
+        cfg_test = copy.copy(cfg)
+        cfg_test.data = copy.deepcopy(cfg.data_test)
+        _, test_loader = get_loader(cfg_test)
+
+        self.train_loader = train_loader
+        self.test_loader = test_loader
+
+        cfg.data.train_size = len(self.train_loader)
+        cfg.data.test_size = len(self.test_loader)
+        cfg.data.train_length = self.train_loader.dataset.length
+        cfg.data.test_length = self.test_loader.dataset.length
+
+        self.cls_names = list(self.test_loader.dataset.cls_names)
+        self._sync_metric_recorder(self.cls_names)
+
+        log_msg(self.logger, f'==> Source-domain train classes: {list(self.train_loader.dataset.cls_names)}')
+        log_msg(self.logger, f'==> Target-domain test classes: {self.cls_names}')
+
+    def _sync_metric_recorder(self, cls_names):
+        existing = getattr(self, 'metric_recorder', {}) or {}
+        synced = {}
+
+        for idx, cls_name in enumerate(cls_names):
+            for metric in self.metrics:
+                key = f'{metric}_{cls_name}'
+                synced[key] = list(existing.get(key, []))
+                if idx == len(cls_names) - 1 and len(cls_names) > 1:
+                    avg_key = f'{metric}_Avg'
+                    synced[avg_key] = list(existing.get(avg_key, []))
+
+        self.metric_recorder = synced
+        self.cfg.trainer.metric_recorder = synced
+
+    def set_input(self, inputs):
+        self.imgs = inputs['img'].cuda()
+        self.imgs_mask = inputs['img_mask'].cuda()
+        self.cls_name = inputs['cls_name']
+        self.anomaly = inputs['anomaly'].cuda().long().view(-1)
+        self.img_path = inputs.get('img_path') if isinstance(inputs, dict) else None
+        self.bs = self.imgs.shape[0]
+
+    def _save_high_res_anomaly_maps(self, anomaly_map, batch_idx):
+        anomaly_map_np = anomaly_map.detach().cpu().numpy()
+        for item_idx, sample_map in enumerate(anomaly_map_np):
+            sample_name = f'rank{self.rank}_batch{batch_idx:04d}_item{item_idx:02d}'
+            if self.img_path is not None:
+                raw_path = self.img_path[item_idx] if isinstance(self.img_path, (list, tuple)) else self.img_path
+                basename = os.path.splitext(os.path.basename(str(raw_path)))[0]
+                sample_name = f'rank{self.rank}_{basename}'
+
+            np.save(os.path.join(self.hr_anomaly_map_dir, f'{sample_name}.npy'), sample_map.astype(np.float32))
+
+            sample_min = float(sample_map.min())
+            sample_max = float(sample_map.max())
+            if sample_max > sample_min:
+                sample_map_norm = (sample_map - sample_min) / (sample_max - sample_min)
+            else:
+                sample_map_norm = np.zeros_like(sample_map, dtype=np.float32)
+            sample_map_vis = (cm.jet(sample_map_norm)[..., :3] * 255).astype(np.uint8)
+            Image.fromarray(sample_map_vis).save(
+                os.path.join(self.hr_anomaly_map_dir, f'{sample_name}.png')
+            )
+
+    def forward(self):
+        if self.net.training:
+            self.total_loss = self.net(self.imgs, cls_names=self.cls_name, labels=self.anomaly)
+        else:
+            self.anomaly_map = self.net(self.imgs, cls_names=self.cls_name)
+
+    def optimize_parameters(self):
+        with self.amp_autocast():
+            self.forward()
+            total_loss = self.total_loss
+
+        self.backward_term(total_loss, self.optim)
+
+        update_log_term(
+            self.log_terms.get('total'),
+            reduce_tensor(total_loss, self.world_size).clone().detach().item(),
+            1,
+            self.master,
+        )
+
+    @torch.no_grad()
+    def test(self):
+        if self.master:
+            if os.path.exists(self.tmp_dir):
+                shutil.rmtree(self.tmp_dir)
+            os.makedirs(self.tmp_dir, exist_ok=True)
+
+        self.reset(isTrain=False)
+        imgs_masks, anomaly_maps, cls_names, anomalys = [], [], [], []
+        batch_idx = 0
+        test_length = self.cfg.data.test_size
+        test_loader = iter(self.test_loader)
+
+        while batch_idx < test_length:
+            t1 = get_timepc()
+            batch_idx += 1
+            test_data = next(test_loader)
+            self.set_input(test_data)
+            self.forward()
+            anomaly_map = self.anomaly_map
+            self._save_high_res_anomaly_maps(anomaly_map, batch_idx)
+
+            self.imgs_mask[self.imgs_mask > 0.5], self.imgs_mask[self.imgs_mask <= 0.5] = 1, 0
+            imgs_masks.append(self.imgs_mask.cpu().numpy().astype(int))
+            anomaly_maps.append(anomaly_map.cpu().numpy())
+            cls_names.append(np.array(self.cls_name))
+            anomalys.append(self.anomaly.cpu().numpy().astype(int))
+
+            t2 = get_timepc()
+            update_log_term(self.log_terms.get('batch_t'), t2 - t1, 1, self.master)
+            print(f'\r{batch_idx}/{test_length}', end='') if self.master else None
+            if self.master:
+                if batch_idx % self.cfg.logging.test_log_per == 0 or batch_idx == test_length:
+                    msg = able(self.progress.get_msg(batch_idx, test_length, 0, 0, prefix='Test'), self.master, None)
+                    log_msg(self.logger, msg)
+
+        if self.cfg.dist:
+            results = dict(imgs_masks=imgs_masks, anomaly_maps=anomaly_maps, cls_names=cls_names, anomalys=anomalys)
+            torch.save(results, f'{self.tmp_dir}/{self.rank}.pth', _use_new_zipfile_serialization=False)
+            if self.master:
+                results = dict(imgs_masks=[], anomaly_maps=[], cls_names=[], anomalys=[])
+                valid_results = False
+                while not valid_results:
+                    results_files = glob.glob(f'{self.tmp_dir}/*.pth')
+                    if len(results_files) != self.cfg.world_size:
+                        time.sleep(1)
+                    else:
+                        idx_result = 0
+                        while idx_result < self.cfg.world_size:
+                            results_file = results_files[idx_result]
+                            try:
+                                result = torch.load(results_file)
+                                for k, v in result.items():
+                                    results[k].extend(v)
+                                idx_result += 1
+                            except Exception:
+                                time.sleep(1)
+                        valid_results = True
+        else:
+            results = dict(imgs_masks=imgs_masks, anomaly_maps=anomaly_maps, cls_names=cls_names, anomalys=anomalys)
+
+        if self.master:
+            results = {k: np.concatenate(v, axis=0) for k, v in results.items()}
+            msg = {}
+            for idx, cls_name in enumerate(self.cls_names):
+                metric_results = self.evaluator.run(results, cls_name, self.logger)
+                msg['Name'] = msg.get('Name', [])
+                msg['Name'].append(cls_name)
+                avg_act = len(self.cls_names) > 1 and idx == len(self.cls_names) - 1
+                msg['Name'].append('Avg') if avg_act else None
+                for metric in self.metrics:
+                    metric_result = metric_results[metric] * 100
+                    self.metric_recorder[f'{metric}_{cls_name}'].append(metric_result)
+                    max_metric = max(self.metric_recorder[f'{metric}_{cls_name}'])
+                    max_metric_idx = self.metric_recorder[f'{metric}_{cls_name}'].index(max_metric) + 1
+                    msg[metric] = msg.get(metric, [])
+                    msg[metric].append(metric_result)
+                    msg[f'{metric} (Max)'] = msg.get(f'{metric} (Max)', [])
+                    msg[f'{metric} (Max)'].append(f'{max_metric:.3f} ({max_metric_idx:<3d} epoch)')
+                    if avg_act:
+                        metric_result_avg = sum(msg[metric]) / len(msg[metric])
+                        self.metric_recorder[f'{metric}_Avg'].append(metric_result_avg)
+                        max_metric = max(self.metric_recorder[f'{metric}_Avg'])
+                        max_metric_idx = self.metric_recorder[f'{metric}_Avg'].index(max_metric) + 1
+                        msg[metric].append(metric_result_avg)
+                        msg[f'{metric} (Max)'].append(f'{max_metric:.3f} ({max_metric_idx:<3d} epoch)')
+            msg = tabulate.tabulate(msg, headers='keys', tablefmt='pipe', floatfmt='.3f', numalign='center', stralign='center')
             log_msg(self.logger, f'\n{msg}')

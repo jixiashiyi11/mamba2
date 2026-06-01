@@ -55,16 +55,39 @@ class cfg(cfg_common, cfg_dataset_default, cfg_model_mambaad):
 		self.model_t = Namespace()
 		self.model_t.name = 'timm_resnet34'
 		self.model_t.kwargs = dict(pretrained=False, checkpoint_path='model/pretrain/resnet34-43635321.pth',
-								   strict=False, features_only=True, out_indices=[1, 2, 3])
+								   strict=False, features_only=True, out_indices=[4])
 		self.model_s = dict(
 			depths_decoder=[3, 4, 6, 3],
 			scan_type='hilbert',
 			num_direction=8,
 		)
 		self.model = Namespace()
-		self.model.name = 'mambaad'
+		self.model.name = 'mambaad_zsad'
+		self.biomedclip_model_name = 'hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224'
+		self.prompt_normal = {
+			'brain': 'A normal healthy brain MRI scan with symmetric hemispheres and no visible lesion or structural abnormality.',
+			'liver': 'A normal healthy liver CT scan with homogeneous parenchyma, clear boundaries, and no focal lesion.',
+			'retinal': 'A normal healthy retinal fundus photograph with a clear optic disc, macula, and no visible pathological finding.',
+		}
+		self.prompt_abnormal = {
+			'brain': 'An abnormal brain MRI scan showing a lesion, tumor, hemorrhage, edema, infarct, or other pathological structural abnormality.',
+			'liver': 'An abnormal liver CT scan showing a focal lesion, metastasis, cyst, cirrhotic change, or other pathological structural abnormality.',
+			'retinal': 'An abnormal retinal fundus photograph showing hemorrhages, exudates, microaneurysms, neovascularization, or other pathological abnormality.',
+		}
+		self.class_prompts = {
+			'brain': 'A medical image showing global brain anatomical structure with symmetric cerebral morphology.',
+			'liver': 'A medical image showing global liver anatomical structure with preserved organ contour and parenchymal layout.',
+			'retinal': 'A medical image showing retinal anatomical structure with optic disc, macular region, and vascular layout.',
+		}
+		self.class_prompt_template = 'A medical image of {class_name}'
 		self.model.kwargs = dict(pretrained=False, checkpoint_path='', strict=True, model_t=self.model_t,
-								 model_s=self.model_s)
+								 model_s=self.model_s, image_size=self.size,
+								 biomedclip_model_name=self.biomedclip_model_name,
+								 prompt_normal=self.prompt_normal,
+								 prompt_abnormal=self.prompt_abnormal,
+								 class_prompts=self.class_prompts,
+								 class_prompt_template=self.class_prompt_template,
+								 adaptive_mc_kwargs=dict(m_base=0.2, alpha=0.3, mil_topk_ratio=0.1, mil_weight=1.0))
 
 		# ==> evaluator
 		self.evaluator.kwargs = dict(metrics=self.metrics, pooling_ks=None, max_step_aupro=100)
@@ -75,7 +98,7 @@ class cfg(cfg_common, cfg_dataset_default, cfg_model_mambaad):
 		self.optim.kwargs = dict(name='adamw', betas=(0.9, 0.999), eps=1e-8, weight_decay=self.weight_decay, amsgrad=False)
 
 		# ==> trainer
-		self.trainer.name = 'MAMBAADTrainer'
+		self.trainer.name = 'MAMBAADZeroShotTrainer'
 		self.trainer.logdir_sub = ''
 		self.trainer.resume_dir = ''
 		self.trainer.epoch_full = self.epoch_full
@@ -91,9 +114,7 @@ class cfg(cfg_common, cfg_dataset_default, cfg_model_mambaad):
 		self.trainer.data.batch_size_per_gpu_test = self.batch_test_per
 
 		# ==> loss
-		self.loss.loss_terms = [
-			dict(type='L2Loss', name='pixel', lam=5.0),
-		]
+		self.loss.loss_terms = []
 
 		# ==> logging
 		self.logging.log_terms_train = [
@@ -101,9 +122,8 @@ class cfg(cfg_common, cfg_dataset_default, cfg_model_mambaad):
 			dict(name='data_t', fmt=':>5.3f'),
 			dict(name='optim_t', fmt=':>5.3f'),
 			dict(name='lr', fmt=':>7.6f'),
-			dict(name='cos', suffixes=[''], fmt=':>5.3f', add_name='avg'),
+			dict(name='total', suffixes=[''], fmt=':>5.3f', add_name='avg'),
 		]
 		self.logging.log_terms_test = [
 			dict(name='batch_t', fmt=':>5.3f', add_name='avg'),
-			dict(name='cos', suffixes=[''], fmt=':>5.3f', add_name='avg'),
 		]

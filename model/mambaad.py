@@ -24,6 +24,8 @@ from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, selective_
 from hilbert import decode, encode
 from pyzorder import ZOrderIndexer
 
+from loss.adaptive_mc_loss import AdaptiveMCLoss
+
 # ==============================================================================
 # 基础卷积组件
 # ==============================================================================
@@ -656,18 +658,42 @@ class MFF_OCE(nn.Module):
         return sv_features.contiguous()
 
 class MAMBAAD(nn.Module):
-    def __init__(self, model_t, model_s):
+    def __init__(
+            self,
+            model_t,
+            model_s,
+            bottleneck_dim=512,
+            biomedclip_model_name='hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224',
+            class_prompt_template='A medical image of {class_name}',
+            class_prompts=None,
+    ):
         super(MAMBAAD, self).__init__()
         self.net_t = get_model(model_t)
         self.mff_oce = MFF_OCE(Bottleneck, 3)
         self.net_s = MambaUPNet(depths_decoder=model_s['depths_decoder'], scan_type=model_s['scan_type'],
                                 num_direction=model_s['num_direction'])
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.text_proj = nn.Linear(bottleneck_dim, 512)
 
-        self.frozen_layers = ['net_t']
+        # The AdaLN condition must come from a frozen semantic prior rather
+        # than an industrially learned class table. A learned embedding only
+        # reflects the source industrial domain and is not a valid medical
+        # semantic prior at cross-domain zero-shot inference time.
+        self.semantic_conditioner = FrozenBiomedTextEncoder(
+            biomedclip_model_name,
+            prompt_normal=None,
+            prompt_abnormal=None,
+            class_prompt_template=class_prompt_template,
+            class_prompts=class_prompts,
+        )
 
-        self.cond_dim = 512
-        self.class_embedding = nn.Embedding(3, self.cond_dim)
-        self.name_to_id = {'brain': 0, 'liver': 1, 'retinal': 2}
+        self.frozen_layers = ['net_t', 'semantic_conditioner']
+
+    def _project_global_semantics(self, bottleneck_feats: torch.Tensor) -> torch.Tensor:
+        global_tokens = self.gap(bottleneck_feats)
+        global_tokens = torch.flatten(global_tokens, 1)
+        f_global = self.text_proj(global_tokens)
+        return F.normalize(f_global, p=2, dim=1)
 
     def freeze_layer(self, module):
         module.eval()
@@ -683,21 +709,351 @@ class MAMBAAD(nn.Module):
                 module.train(mode)
         return self
 
-    def forward(self, imgs, cls_names=None):
+    def _encode_semantic_condition(self, cls_names, batch_size, device):
+        # Frozen BiomedCLIP prompt embeddings are used as the only AdaLN
+        # condition source so the decoder sees a semantic prior instead of a
+        # trainable source-domain embedding.
+        with torch.no_grad():
+            return self.semantic_conditioner.encode_class_prompts(
+                cls_names=cls_names,
+                batch_size=batch_size,
+                device=device,
+            )
+
+    def forward(self, imgs, cls_names=None, return_teacher_features=False):
+        """
+        Args:
+            imgs: Input image tensor of shape ``(B, 3, H, W)``.
+            cls_names: Optional class-name list used for conditional decoding.
+            return_teacher_features: When ``True``, also returns the frozen
+                teacher features needed by the original MambaAD training and
+                evaluation pipeline.
+
+        Returns:
+            - Default: ``(reconstructed_features, f_global)``
+            - If ``return_teacher_features=True``:
+              ``(teacher_features, reconstructed_features, f_global)``
+        """
         feats_t = self.net_t(imgs)
         feats_t = [f.detach() for f in feats_t]
         fused_feats = self.mff_oce(feats_t)
+        f_global = self._project_global_semantics(fused_feats)
 
         c_embed = None
         if cls_names is not None:
-            class_ids = [self.name_to_id.get(str(name).lower(), 0) for name in cls_names]
-            class_ids = torch.tensor(class_ids, dtype=torch.long, device=imgs.device)
-            c_embed = self.class_embedding(class_ids)
+            c_embed = self._encode_semantic_condition(
+                cls_names=cls_names,
+                batch_size=imgs.shape[0],
+                device=imgs.device,
+            )
 
-        feats_s = self.net_s(fused_feats, c_embed)
-        return feats_t, feats_s
+        reconstructed_features = self.net_s(fused_feats, c_embed)
+        if return_teacher_features:
+            return feats_t, reconstructed_features, f_global
+        return reconstructed_features, f_global
 
 @MODEL.register_module
 def mambaad(pretrained=False, **kwargs):
     model = MAMBAAD(**kwargs)
+    return model
+
+
+class FrozenVisualSequenceEncoder(nn.Module):
+    def __init__(self, backbone):
+        super().__init__()
+        self.backbone = backbone
+
+    def forward(self, imgs):
+        feats = self.backbone(imgs)
+        if isinstance(feats, (list, tuple)):
+            feats = feats[-1]
+        if feats.ndim != 4:
+            raise ValueError(f'Expected visual encoder to output a 4D feature map, got {tuple(feats.shape)}.')
+
+        bsz, channels, height, width = feats.shape
+        seq = feats.flatten(2).transpose(1, 2).contiguous()
+        return seq, (height, width), channels
+
+
+class FrozenBiomedTextEncoder(nn.Module):
+    def __init__(self, model_name, prompt_normal=None, prompt_abnormal=None,
+                 class_prompt_template='A medical image of {class_name}', class_prompts=None):
+        super().__init__()
+        try:
+            import open_clip
+        except ImportError as exc:
+            raise ImportError(
+                'BiomedCLIP zero-shot inference requires the `open_clip` package to be installed.'
+            ) from exc
+
+        self.model_name = model_name
+        self.text_encoder, _, _ = open_clip.create_model_and_transforms(model_name)
+        self.tokenizer = open_clip.get_tokenizer(model_name)
+        self.class_prompt_template = class_prompt_template
+        self.class_prompt_map = None
+        self.normal_prompt_map = None
+        self.abnormal_prompt_map = None
+        self.class_names = []
+        if prompt_normal is not None or prompt_abnormal is not None:
+            if prompt_normal is None or prompt_abnormal is None:
+                raise ValueError('`prompt_normal` and `prompt_abnormal` must be provided together.')
+            self.class_names, _, _ = self._build_prompt_pairs(prompt_normal, prompt_abnormal)
+            self.normal_prompt_map = self._normalize_prompt_config(prompt_normal, 'prompt_normal')
+            self.abnormal_prompt_map = self._normalize_prompt_config(prompt_abnormal, 'prompt_abnormal')
+
+        if class_prompts is not None:
+            class_prompt_map = self._normalize_prompt_config(class_prompts, 'class_prompts')
+            if '__shared__' not in class_prompt_map and self.class_names:
+                missing = sorted(set(self.class_names) - set(class_prompt_map.keys()))
+                if missing:
+                    raise ValueError(f'`class_prompts` is missing class keys: {missing}.')
+            self.class_prompt_map = class_prompt_map
+            if not self.class_names and '__shared__' not in class_prompt_map:
+                self.class_names = sorted(class_prompt_map.keys())
+
+        with torch.no_grad():
+            sample_prompt = self._get_sample_class_prompt()
+            sample_tokens = self.tokenizer([sample_prompt])
+            self.text_dim = int(self.text_encoder.encode_text(sample_tokens).shape[-1])
+
+    def _normalize_prompt_config(self, prompt_config, name):
+        if isinstance(prompt_config, str):
+            return {'__shared__': prompt_config}
+        if isinstance(prompt_config, dict):
+            if not prompt_config:
+                raise ValueError(f'`{name}` must not be an empty dict.')
+            return {str(key).lower(): value for key, value in prompt_config.items()}
+        raise TypeError(f'`{name}` must be a string or dict, got {type(prompt_config).__name__}.')
+
+    def _resolve_prompt_template(self, prompt_template, cls_name):
+        if '{cls_name}' in prompt_template:
+            return prompt_template.format(cls_name=cls_name)
+        if '{class_name}' in prompt_template:
+            return prompt_template.format(class_name=cls_name)
+        return prompt_template
+
+    def _build_prompt_pairs(self, prompt_normal, prompt_abnormal):
+        normal_map = self._normalize_prompt_config(prompt_normal, 'prompt_normal')
+        abnormal_map = self._normalize_prompt_config(prompt_abnormal, 'prompt_abnormal')
+
+        if '__shared__' in normal_map and '__shared__' in abnormal_map:
+            cls_names = ['__shared__']
+        elif '__shared__' in normal_map:
+            cls_names = list(abnormal_map.keys())
+            normal_map = {name: normal_map['__shared__'] for name in cls_names}
+        elif '__shared__' in abnormal_map:
+            cls_names = list(normal_map.keys())
+            abnormal_map = {name: abnormal_map['__shared__'] for name in cls_names}
+        else:
+            cls_names = sorted(normal_map.keys())
+            if set(cls_names) != set(abnormal_map.keys()):
+                raise ValueError('`prompt_normal` and `prompt_abnormal` must have the same class keys.')
+
+        normal_prompts = [self._resolve_prompt_template(normal_map[name], name) for name in cls_names]
+        abnormal_prompts = [self._resolve_prompt_template(abnormal_map[name], name) for name in cls_names]
+        return cls_names, normal_prompts, abnormal_prompts
+
+    def _get_sample_class_prompt(self):
+        sample_name = self.class_names[0] if len(self.class_names) > 0 else 'organ'
+        if self.class_prompt_map is None:
+            return self.class_prompt_template.format(class_name=sample_name)
+        if '__shared__' in self.class_prompt_map:
+            return self._resolve_prompt_template(self.class_prompt_map['__shared__'], sample_name)
+        return self._resolve_prompt_template(self.class_prompt_map[sample_name], sample_name)
+
+    def _build_semantic_prompts(self, cls_names, prompt_map, batch_size):
+        if cls_names is None:
+            cls_names = [self.class_names[0] if len(self.class_names) > 0 else 'organ'] * batch_size
+        elif isinstance(cls_names, str):
+            cls_names = [cls_names] * batch_size
+        elif len(cls_names) != batch_size:
+            raise ValueError(f'Expected {batch_size} class names, got {len(cls_names)}.')
+
+        prompts = []
+        for class_name in cls_names:
+            class_key = str(class_name).lower()
+            if prompt_map is None:
+                prompts.append(self.class_prompt_template.format(class_name=class_key))
+            elif '__shared__' in prompt_map:
+                prompts.append(self._resolve_prompt_template(prompt_map['__shared__'], class_key))
+            else:
+                if class_key not in prompt_map:
+                    raise KeyError(
+                        f'No prompt found for class `{class_name}`. Available classes: {sorted(prompt_map.keys())}.'
+                    )
+                prompts.append(self._resolve_prompt_template(prompt_map[class_key], class_key))
+        return prompts
+
+    def encode_class_prompts(self, cls_names=None, batch_size=1, device=None):
+        prompt_class = self._build_semantic_prompts(cls_names, self.class_prompt_map, batch_size)
+        prompt_tokens = self.tokenizer(prompt_class)
+        token_device = device if device is not None else next(self.text_encoder.parameters()).device
+        prompt_tokens = prompt_tokens.to(token_device)
+        class_embedding = self.text_encoder.encode_text(prompt_tokens)
+        return F.normalize(class_embedding, p=2, dim=-1)
+
+    def forward(self, cls_names=None, batch_size=1):
+        normal_prompts = self._build_semantic_prompts(cls_names, self.normal_prompt_map, batch_size)
+        abnormal_prompts = self._build_semantic_prompts(cls_names, self.abnormal_prompt_map, batch_size)
+        token_device = next(self.text_encoder.parameters()).device
+        normal_tokens = self.tokenizer(normal_prompts).to(token_device)
+        abnormal_tokens = self.tokenizer(abnormal_prompts).to(token_device)
+        t_norm = F.normalize(self.text_encoder.encode_text(normal_tokens), p=2, dim=-1)
+        t_abn = F.normalize(self.text_encoder.encode_text(abnormal_tokens), p=2, dim=-1)
+        return t_norm, t_abn
+
+
+class CSSD(nn.Module):
+    def __init__(self, hidden_dim, grid_size, depths=(3, 4, 6, 3), d_state=16, drop_path_rate=0.2,
+                 attn_drop_rate=0.0, scan_type='scan', num_direction=8):
+        super().__init__()
+        if not isinstance(depths, (list, tuple)) or len(depths) == 0:
+            raise ValueError('`depths` must be a non-empty list or tuple.')
+
+        stage_drop_paths = torch.linspace(0, drop_path_rate, len(depths)).tolist()
+        self.stages = nn.ModuleList([
+            LSSModule(
+                hidden_dim=hidden_dim,
+                drop_path=stage_drop_paths[idx],
+                norm_layer=partial(nn.LayerNorm, eps=1e-6),
+                attn_drop_rate=attn_drop_rate,
+                d_state=d_state,
+                depth=depth,
+                size=grid_size,
+                scan_type=scan_type,
+                num_direction=num_direction,
+            )
+            for idx, depth in enumerate(depths)
+        ])
+        self.out_norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, v_raw, semantic_embedding, spatial_shape):
+        bsz, num_tokens, feat_dim = v_raw.shape
+        height, width = spatial_shape
+        if height != width:
+            raise ValueError(f'CSSD currently expects square token grids, got {(height, width)}.')
+        if height * width != num_tokens:
+            raise ValueError(
+                f'Spatial shape {(height, width)} does not match sequence length {num_tokens}.'
+            )
+
+        x = v_raw.view(bsz, height, width, feat_dim)
+        pool_feat = None
+        for stage in self.stages:
+            x = stage(x, semantic_embedding, pool_feat)
+            if pool_feat is None:
+                pool_feat = x
+        x = self.out_norm(x)
+        return x.view(bsz, num_tokens, feat_dim)
+
+
+class MAMBAADZeroShot(nn.Module):
+    def __init__(self, model_t, model_s, biomedclip_model_name, prompt_normal, prompt_abnormal, image_size=256,
+                 adaptive_mc_kwargs=None, class_prompt_template='A medical image of {class_name}', class_prompts=None):
+        super().__init__()
+        self.visual_encoder = FrozenVisualSequenceEncoder(get_model(model_t))
+        self.text_encoder = FrozenBiomedTextEncoder(
+            biomedclip_model_name,
+            prompt_normal=prompt_normal,
+            prompt_abnormal=prompt_abnormal,
+            class_prompt_template=class_prompt_template,
+            class_prompts=class_prompts,
+        )
+
+        visual_dim, spatial_shape = self._infer_visual_spec(image_size)
+        if visual_dim != self.text_encoder.text_dim:
+            raise ValueError(
+                f'Visual feature dim ({visual_dim}) must match text dim ({self.text_encoder.text_dim}). '
+                'Use a visual encoder stage whose channel width matches BiomedCLIP.'
+            )
+        if spatial_shape[0] != spatial_shape[1]:
+            raise ValueError(f'CSSD requires a square feature grid, got {spatial_shape}.')
+
+        self.grid_size = spatial_shape[0]
+        self.cssd = CSSD(
+            hidden_dim=visual_dim,
+            grid_size=self.grid_size,
+            depths=model_s.get('depths_decoder', [3, 4, 6, 3]),
+            d_state=model_s.get('d_state', 16),
+            drop_path_rate=model_s.get('drop_path_rate', 0.2),
+            attn_drop_rate=model_s.get('attn_drop_rate', 0.0),
+            scan_type=model_s.get('scan_type', 'scan'),
+            num_direction=model_s.get('num_direction', 8),
+        )
+        self.adaptive_mc_loss = AdaptiveMCLoss(**(adaptive_mc_kwargs or {}))
+
+        self._freeze_module(self.visual_encoder)
+        self._freeze_module(self.text_encoder)
+        self._set_requires_grad(self.cssd, True)
+
+    def _infer_visual_spec(self, image_size):
+        was_training = self.visual_encoder.training
+        self.visual_encoder.eval()
+        with torch.no_grad():
+            dummy = torch.zeros(1, 3, image_size, image_size)
+            _, spatial_shape, visual_dim = self.visual_encoder(dummy)
+        self.visual_encoder.train(was_training)
+        return visual_dim, spatial_shape
+
+    def _freeze_module(self, module):
+        module.eval()
+        for param in module.parameters():
+            param.requires_grad = False
+
+    def _set_requires_grad(self, module, requires_grad):
+        for param in module.parameters():
+            # 只有浮点数或复数才允许开启梯度求导，跳过底层的整数索引(LongTensor)
+            if param.is_floating_point() or param.is_complex():
+                param.requires_grad = requires_grad
+
+    def train(self, mode=True):
+        self.training = mode
+        self.visual_encoder.eval()
+        self.text_encoder.eval()
+        self.cssd.train(mode)
+        self.adaptive_mc_loss.train(mode)
+        return self
+
+    def forward(self, imgs, cls_names=None, labels=None):
+        with torch.no_grad():
+            v_raw, spatial_shape, _ = self.visual_encoder(imgs)
+            t_norm, t_abn = self.text_encoder(cls_names, batch_size=imgs.shape[0])
+            # Frozen BiomedCLIP semantics are the only condition vector used by
+            # AdaLN. This keeps semantic conditioning aligned with medical
+            # language priors instead of source-domain learned embeddings.
+            semantic_embedding = self.text_encoder.encode_class_prompts(
+                cls_names=cls_names,
+                batch_size=imgs.shape[0],
+                device=imgs.device,
+            )
+
+        # Semantic-conditioning pipeline:
+        # BiomedCLIP text prior -> AdaLN modulation in LSS/HSS blocks ->
+        # CSSD spatial refinement -> anomaly localization.
+        v_refined = self.cssd(v_raw, semantic_embedding, spatial_shape)
+        f_global = v_refined.mean(dim=1)
+
+        if self.training:
+            if labels is None:
+                raise ValueError('`labels` must be provided during training.')
+            return self.adaptive_mc_loss(v_refined, t_norm, t_abn, f_global, labels)
+
+        v_refined = F.normalize(v_refined, p=2, dim=-1)
+        t_norm = F.normalize(t_norm, p=2, dim=-1)
+        t_abn = F.normalize(t_abn, p=2, dim=-1)
+        scores = torch.einsum('bld,bd->bl', v_refined, t_abn) - torch.einsum('bld,bd->bl', v_refined, t_norm)
+        height, width = spatial_shape
+        anomaly_map = scores.view(scores.shape[0], height, width)
+        anomaly_map = F.interpolate(
+            anomaly_map.unsqueeze(1),
+            size=(imgs.shape[2], imgs.shape[3]),
+            mode='bilinear',
+            align_corners=False,
+        ).squeeze(1)
+        return anomaly_map
+
+
+@MODEL.register_module
+def mambaad_zsad(pretrained=False, **kwargs):
+    model = MAMBAADZeroShot(**kwargs)
     return model

@@ -949,7 +949,8 @@ class CSSD(nn.Module):
 
 class MAMBAADZeroShot(nn.Module):
     def __init__(self, model_t, model_s, biomedclip_model_name, prompt_normal, prompt_abnormal, image_size=256,
-                 adaptive_mc_kwargs=None, class_prompt_template='A medical image of {class_name}', class_prompts=None):
+                 adaptive_mc_kwargs=None, class_prompt_template='A medical image of {class_name}', class_prompts=None,
+                 image_score_topk_ratio=0.01):
         super().__init__()
         self.visual_encoder = FrozenVisualSequenceEncoder(get_model(model_t))
         self.text_encoder = FrozenBiomedTextEncoder(
@@ -980,7 +981,8 @@ class MAMBAADZeroShot(nn.Module):
             scan_type=model_s.get('scan_type', 'scan'),
             num_direction=model_s.get('num_direction', 8),
         )
-        self.adaptive_mc_loss = AdaptiveMCLoss(**(adaptive_mc_kwargs or {}))
+        self.label_free_loss = AdaptiveMCLoss(**(adaptive_mc_kwargs or {}))
+        self.image_score_topk_ratio = image_score_topk_ratio
 
         self._freeze_module(self.visual_encoder)
         self._freeze_module(self.text_encoder)
@@ -1011,10 +1013,10 @@ class MAMBAADZeroShot(nn.Module):
         self.visual_encoder.eval()
         self.text_encoder.eval()
         self.cssd.train(mode)
-        self.adaptive_mc_loss.train(mode)
+        self.label_free_loss.train(mode)
         return self
 
-    def forward(self, imgs, cls_names=None, labels=None):
+    def forward(self, imgs, cls_names=None):
         with torch.no_grad():
             v_raw, spatial_shape, _ = self.visual_encoder(imgs)
             t_norm, t_abn = self.text_encoder(cls_names, batch_size=imgs.shape[0])
@@ -1034,14 +1036,32 @@ class MAMBAADZeroShot(nn.Module):
         f_global = v_refined.mean(dim=1)
 
         if self.training:
-            if labels is None:
-                raise ValueError('`labels` must be provided during training.')
-            return self.adaptive_mc_loss(v_refined, t_norm, t_abn, f_global, labels)
+            total, normal_align, margin, token_consistency, stats = self.label_free_loss(
+                v_refined,
+                v_raw,
+                t_norm,
+                t_abn,
+                f_global=f_global,
+            )
+            return {
+                'total': total,
+                'loss_total': total,
+                'normal_align': normal_align,
+                'loss_normal_align': normal_align,
+                'margin': margin,
+                'loss_adaptive_margin': margin,
+                'token_consistency': token_consistency,
+                'loss_token_consistency': token_consistency,
+                **stats,
+            }
 
         v_refined = F.normalize(v_refined, p=2, dim=-1)
         t_norm = F.normalize(t_norm, p=2, dim=-1)
         t_abn = F.normalize(t_abn, p=2, dim=-1)
-        scores = torch.einsum('bld,bd->bl', v_refined, t_abn) - torch.einsum('bld,bd->bl', v_refined, t_norm)
+        # Cross-domain medical validation showed pixel scores were inversely
+        # correlated with anomaly masks, so high anomaly response is defined as
+        # being closer to the normal prompt than the abnormal prompt.
+        scores = torch.einsum('bld,bd->bl', v_refined, t_norm) - torch.einsum('bld,bd->bl', v_refined, t_abn)
         height, width = spatial_shape
         anomaly_map = scores.view(scores.shape[0], height, width)
         anomaly_map = F.interpolate(
@@ -1050,7 +1070,13 @@ class MAMBAADZeroShot(nn.Module):
             mode='bilinear',
             align_corners=False,
         ).squeeze(1)
-        return anomaly_map
+        flat_map = anomaly_map.flatten(1)
+        if self.image_score_topk_ratio is None:
+            image_score = flat_map.max(dim=1).values
+        else:
+            topk = max(1, int(flat_map.shape[1] * self.image_score_topk_ratio))
+            image_score = flat_map.topk(topk, dim=1).values.mean(dim=1)
+        return anomaly_map, image_score
 
 
 @MODEL.register_module

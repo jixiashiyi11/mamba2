@@ -84,6 +84,10 @@ class BaseTrainer():
         self.cls_names = self.train_loader.dataset.cls_names
         self.mixup_fn = Mixup(**cfg.trainer.mixup_kwargs) if cfg.trainer.mixup_kwargs['prob'] > 0 else None
         self.scheduler = get_scheduler(cfg, self.optim)
+        if hasattr(cfg, 'eval'):
+            for key in ['skip_tiny_mask_for_pixel', 'tiny_mask_pixel_threshold']:
+                if hasattr(cfg.eval, key):
+                    cfg.evaluator.kwargs[key] = getattr(cfg.eval, key)
         self.evaluator = get_evaluator(cfg.evaluator)
         self.metrics = self.evaluator.metrics
         self.adv = cfg.adv
@@ -103,10 +107,17 @@ class BaseTrainer():
         self.iter_full, self.epoch_full = cfg.trainer.iter_full, cfg.trainer.epoch_full
         if cfg.trainer.resume_dir:
             state_dict = torch.load(cfg.model.kwargs['checkpoint_path'], map_location='cpu')
-            self.optim.load_state_dict(state_dict['optimizer'])
-            self.scheduler.load_state_dict(state_dict['scheduler'])
-            self.loss_scaler.load_state_dict(state_dict['scaler']) if self.loss_scaler else None
-            self.cfg.task_start_time = get_timepc() - state_dict['total_time']
+            has_train_state = isinstance(state_dict, dict) and 'optimizer' in state_dict and 'scheduler' in state_dict
+            if has_train_state:
+                self.optim.load_state_dict(state_dict['optimizer'])
+                self.scheduler.load_state_dict(state_dict['scheduler'])
+                self.loss_scaler.load_state_dict(state_dict['scaler']) if self.loss_scaler and 'scaler' in state_dict else None
+                self.cfg.task_start_time = get_timepc() - state_dict.get('total_time', 0)
+            elif cfg.mode != 'test':
+                raise KeyError(
+                    "Checkpoint does not contain optimizer/scheduler state. "
+                    "Use a full ckpt.pth for train resume, or run in test mode for net_*.pth weights."
+                )
         # self.tmp_dir = f'/dev/shm/tmp/{cfg.logdir}'
         # tmp_dir = f'/dev/shm/tmp/tmp'
         tmp_dir = f'{cfg.trainer.checkpoint}/tmp'
@@ -254,4 +265,3 @@ class BaseTrainer():
             self.test()
         else:
             raise NotImplementedError
-

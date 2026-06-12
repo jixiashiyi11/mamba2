@@ -22,10 +22,19 @@ class cfg_common(Namespace):
 			'mIoU_max_px',
 		]
 		self.use_adeval = True
+		self.eval = Namespace()
+		self.eval.skip_tiny_mask_for_pixel = False
+		self.eval.tiny_mask_pixel_threshold = 10
 		self.evaluator = Namespace()
-		self.evaluator.kwargs = dict(metrics=self.metrics, pooling_ks=[16, 16], max_step_aupro=100, mp=False, use_adeval=self.use_adeval)
+		self.evaluator.kwargs = dict(metrics=self.metrics, pooling_ks=[16, 16], max_step_aupro=100, mp=False,
+									 use_adeval=self.use_adeval, skip_tiny_mask_for_pixel=self.eval.skip_tiny_mask_for_pixel,
+									 tiny_mask_pixel_threshold=self.eval.tiny_mask_pixel_threshold)
 		self.vis = False
 		self.vis_dir = None
+		self.debug_eval = False
+		self.debug_eval_vis_per_organ = 20
+		self.debug_eval_seed = 42
+		self.debug_eval_preview_rows = 8
 
 		# ==> optim
 		self.optim = Namespace()

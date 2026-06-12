@@ -3,6 +3,7 @@ import os
 import glob
 import shutil
 import time
+import math
 
 import numpy as np
 import tabulate
@@ -13,9 +14,50 @@ from PIL import Image
 
 from util.util import able, log_msg, update_log_term
 from util.net import get_timepc, reduce_tensor
+from optim.scheduler import get_scheduler
+from util.debug_eval import DebugEvalHelper
 
 from ._base_trainer import BaseTrainer
 from . import TRAINER
+
+
+def _emit_metric_summary_table(trainer, results):
+    msg = {}
+    for idx, cls_name in enumerate(trainer.cls_names):
+        metric_results = trainer.evaluator.run(results, cls_name, trainer.logger)
+        msg['Name'] = msg.get('Name', [])
+        msg['Name'].append(cls_name)
+        avg_act = len(trainer.cls_names) > 1 and idx == len(trainer.cls_names) - 1
+        msg['Name'].append('Avg') if avg_act else None
+        for metric in trainer.metrics:
+            metric_result = metric_results[metric] * 100
+            trainer.metric_recorder[f'{metric}_{cls_name}'].append(metric_result)
+            max_metric = max(trainer.metric_recorder[f'{metric}_{cls_name}'])
+            max_metric_idx = trainer.metric_recorder[f'{metric}_{cls_name}'].index(max_metric) + 1
+            msg[metric] = msg.get(metric, [])
+            msg[metric].append(metric_result)
+            msg[f'{metric} (Max)'] = msg.get(f'{metric} (Max)', [])
+            msg[f'{metric} (Max)'].append(f'{max_metric:.3f} ({max_metric_idx:<3d} epoch)')
+            if avg_act:
+                metric_result_avg = sum(msg[metric]) / len(msg[metric])
+                trainer.metric_recorder[f'{metric}_Avg'].append(metric_result_avg)
+                max_metric = max(trainer.metric_recorder[f'{metric}_Avg'])
+                max_metric_idx = trainer.metric_recorder[f'{metric}_Avg'].index(max_metric) + 1
+                msg[metric].append(metric_result_avg)
+                msg[f'{metric} (Max)'].append(f'{max_metric:.3f} ({max_metric_idx:<3d} epoch)')
+    table = tabulate.tabulate(msg, headers='keys', tablefmt='pipe', floatfmt='.3f', numalign='center', stralign='center')
+    print(f'\n{table}')
+    log_msg(trainer.logger, f'\n{table}')
+    return table
+
+
+def _write_debug_eval_safely(debug_helper, results, evaluator, logger):
+    try:
+        debug_helper.write_and_summarize(results, evaluator)
+    except Exception as exc:
+        msg = f'Warning: DebugEval failed after final metric table was printed: {exc}'
+        print(msg)
+        log_msg(logger, msg)
 
 
 @TRAINER.register_module
@@ -160,13 +202,10 @@ class MAMBAADTrainer(BaseTrainer):
             loss_adaptive_mc = loss_mse.new_tensor(0.0)
             adaptive_mc_weight = 0.0
             if self.use_adaptive_mc:
-                t_norm_batch, t_abn_batch = self._select_text_priors(self.cls_name)
-                loss_adaptive_mc = self.loss_terms['adaptive_mc'](
-                    self.f_global,
-                    t_norm_batch,
-                    t_abn_batch,
-                    self.anomaly,
-                )
+                t_norm_batch, _ = self._select_text_priors(self.cls_name)
+                f_global = F.normalize(self.f_global, p=2, dim=1)
+                t_norm_batch = F.normalize(t_norm_batch.to(device=f_global.device, dtype=f_global.dtype), p=2, dim=1)
+                loss_adaptive_mc = 1.0 - torch.sum(f_global * t_norm_batch, dim=1).mean()
                 adaptive_mc_weight = self._get_adaptive_mc_weight()
 
             loss_l1 = loss_mse.new_tensor(0.0)
@@ -193,6 +232,18 @@ class MAMBAADTrainer(BaseTrainer):
         update_log_term(
             self.log_terms.get('total'),
             reduce_tensor(total_loss, self.world_size).clone().detach().item(),
+            1,
+            self.master,
+        )
+        update_log_term(
+            self.log_terms.get('normal_align'),
+            reduce_tensor(self.loss_dict['normal_align'], self.world_size).clone().detach().item(),
+            1,
+            self.master,
+        )
+        update_log_term(
+            self.log_terms.get('token_consistency'),
+            reduce_tensor(self.loss_dict['token_consistency'], self.world_size).clone().detach().item(),
             1,
             self.master,
         )
@@ -269,31 +320,7 @@ class MAMBAADTrainer(BaseTrainer):
 
         if self.master:
             results = {k: np.concatenate(v, axis=0) for k, v in results.items()}
-            msg = {}
-            for idx, cls_name in enumerate(self.cls_names):
-                metric_results = self.evaluator.run(results, cls_name, self.logger)
-                msg['Name'] = msg.get('Name', [])
-                msg['Name'].append(cls_name)
-                avg_act = len(self.cls_names) > 1 and idx == len(self.cls_names) - 1
-                msg['Name'].append('Avg') if avg_act else None
-                for metric in self.metrics:
-                    metric_result = metric_results[metric] * 100
-                    self.metric_recorder[f'{metric}_{cls_name}'].append(metric_result)
-                    max_metric = max(self.metric_recorder[f'{metric}_{cls_name}'])
-                    max_metric_idx = self.metric_recorder[f'{metric}_{cls_name}'].index(max_metric) + 1
-                    msg[metric] = msg.get(metric, [])
-                    msg[metric].append(metric_result)
-                    msg[f'{metric} (Max)'] = msg.get(f'{metric} (Max)', [])
-                    msg[f'{metric} (Max)'].append(f'{max_metric:.3f} ({max_metric_idx:<3d} epoch)')
-                    if avg_act:
-                        metric_result_avg = sum(msg[metric]) / len(msg[metric])
-                        self.metric_recorder[f'{metric}_Avg'].append(metric_result_avg)
-                        max_metric = max(self.metric_recorder[f'{metric}_Avg'])
-                        max_metric_idx = self.metric_recorder[f'{metric}_Avg'].index(max_metric) + 1
-                        msg[metric].append(metric_result_avg)
-                        msg[f'{metric} (Max)'].append(f'{max_metric:.3f} ({max_metric_idx:<3d} epoch)')
-            msg = tabulate.tabulate(msg, headers='keys', tablefmt='pipe', floatfmt='.3f', numalign='center', stralign='center')
-            log_msg(self.logger, f'\n{msg}')
+            _emit_metric_summary_table(self, results)
 
 
 @TRAINER.register_module
@@ -303,11 +330,14 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
         self.device = torch.device(f'cuda:{cfg.local_rank}')
         base_output_dir = cfg.logdir if cfg.logdir is not None else cfg.trainer.checkpoint
         self.hr_anomaly_map_dir = os.path.join(base_output_dir, 'show_test_hr_anomaly_maps')
-        os.makedirs(self.hr_anomaly_map_dir, exist_ok=True)
-        print("测试异常图保存路径：", self.hr_anomaly_map_dir)
+        self.save_hr_anomaly_maps = getattr(cfg.trainer, 'save_hr_anomaly_maps', False)
+        if self.save_hr_anomaly_maps:
+            os.makedirs(self.hr_anomaly_map_dir, exist_ok=True)
+            print("测试异常图保存路径：", self.hr_anomaly_map_dir)
 
         if hasattr(cfg, 'data_train') and hasattr(cfg, 'data_test'):
             self._rebuild_cross_domain_loaders(cfg)
+        self.debug_helper = DebugEvalHelper(cfg, self.logger, rank=self.rank, master=self.master)
 
     def _rebuild_cross_domain_loaders(self, cfg):
         try:
@@ -334,6 +364,9 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
         cfg.data.test_size = len(self.test_loader)
         cfg.data.train_length = self.train_loader.dataset.length
         cfg.data.test_length = self.test_loader.dataset.length
+        self.scheduler = get_scheduler(cfg, self.optim)
+        self.iter_full = cfg.trainer.iter_full
+        self.epoch_full = cfg.trainer.epoch_full
 
         self.cls_names = list(self.test_loader.dataset.cls_names)
         self._sync_metric_recorder(self.cls_names)
@@ -356,12 +389,70 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
         self.metric_recorder = synced
         self.cfg.trainer.metric_recorder = synced
 
+    def _get_debug_anomaly_map_before_resize_shape(self):
+        net = self.net.module if hasattr(self.net, 'module') else self.net
+        grid_size = getattr(net, 'grid_size', None)
+        if grid_size is None:
+            return None
+        return int(grid_size), int(grid_size)
+
+    def _normalize_batch_paths(self, paths, batch_size, fill_value=''):
+        if paths is None:
+            return [fill_value] * batch_size
+        if isinstance(paths, (list, tuple)):
+            paths = list(paths)
+        else:
+            paths = [paths]
+        paths = [str(path) for path in paths]
+        if len(paths) < batch_size:
+            paths.extend([fill_value] * (batch_size - len(paths)))
+        return paths[:batch_size]
+
+    def _candidate_data_roots(self):
+        roots = []
+        if hasattr(self.cfg, 'data_test') and getattr(self.cfg.data_test, 'root', None):
+            roots.append(self.cfg.data_test.root)
+        if getattr(self.cfg.data, 'root', None):
+            roots.append(self.cfg.data.root)
+        return roots
+
+    def _resolve_mask_path(self, mask_path):
+        if not mask_path:
+            return None
+        candidates = [mask_path]
+        for root in self._candidate_data_roots():
+            candidates.append(os.path.join(root, mask_path))
+        for candidate in candidates:
+            candidate = str(candidate).replace('/', os.sep)
+            if os.path.exists(candidate):
+                return candidate
+        return None
+
+    def _raw_positive_pixels_from_paths(self, mask_paths, final_masks):
+        final_masks_np = final_masks.detach().cpu().numpy()
+        if final_masks_np.ndim == 4:
+            final_masks_np = np.squeeze(final_masks_np, axis=1)
+        positives = []
+        for idx, mask_path in enumerate(mask_paths):
+            resolved = self._resolve_mask_path(mask_path)
+            if resolved is None:
+                positives.append(int(final_masks_np[idx].sum()))
+                continue
+            try:
+                with Image.open(resolved) as mask_img:
+                    mask_arr = np.asarray(mask_img.convert('L'))
+                positives.append(int((mask_arr > 0).sum()))
+            except Exception:
+                positives.append(int(final_masks_np[idx].sum()))
+        return positives
+
     def set_input(self, inputs):
         self.imgs = inputs['img'].cuda()
         self.imgs_mask = inputs['img_mask'].cuda()
         self.cls_name = inputs['cls_name']
         self.anomaly = inputs['anomaly'].cuda().long().view(-1)
         self.img_path = inputs.get('img_path') if isinstance(inputs, dict) else None
+        self.mask_path = inputs.get('mask_path') if isinstance(inputs, dict) else None
         self.bs = self.imgs.shape[0]
 
     def _save_high_res_anomaly_maps(self, anomaly_map, batch_idx):
@@ -388,14 +479,18 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
 
     def forward(self):
         if self.net.training:
-            self.total_loss = self.net(self.imgs, cls_names=self.cls_name, labels=self.anomaly)
+            self.loss_dict = self.net(self.imgs, cls_names=self.cls_name)
+            self.total_loss = self.loss_dict['total']
         else:
-            self.anomaly_map = self.net(self.imgs, cls_names=self.cls_name)
+            self.anomaly_map, self.image_score = self.net(self.imgs, cls_names=self.cls_name)
 
     def optimize_parameters(self):
         with self.amp_autocast():
             self.forward()
             total_loss = self.total_loss
+
+        if not torch.isfinite(total_loss):
+            raise FloatingPointError(f'Non-finite total loss detected: {float(total_loss.detach().cpu())}')
 
         self.backward_term(total_loss, self.optim)
 
@@ -406,6 +501,28 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
             self.master,
         )
 
+        if self.master and self.iter % self.cfg.logging.train_log_per == 0:
+            debug_names = [
+                'loss_total',
+                'loss_normal_align',
+                'loss_token_consistency',
+                'loss_adaptive_margin',
+                'loss_score_separation',
+                'sim_normal_mean',
+                'sim_abnormal_mean',
+                'adaptive_margin_mean',
+                'score_train_topk_mean',
+            ]
+            debug_vals = {
+                name: float(self.loss_dict[name].detach().cpu())
+                for name in debug_names
+                if name in self.loss_dict
+            }
+            has_nan = any(math.isnan(val) or math.isinf(val) for val in debug_vals.values())
+            mem_mb = torch.cuda.max_memory_allocated(self.device) / 1024 ** 2
+            debug_msg = ' '.join([f'{name}={val:.6f}' for name, val in debug_vals.items()])
+            log_msg(self.logger, f'==> LossDebug {debug_msg} has_nan={has_nan} max_mem_mb={mem_mb:.1f}')
+
     @torch.no_grad()
     def test(self):
         if self.master:
@@ -414,7 +531,9 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
             os.makedirs(self.tmp_dir, exist_ok=True)
 
         self.reset(isTrain=False)
-        imgs_masks, anomaly_maps, cls_names, anomalys = [], [], [], []
+        imgs_masks, anomaly_maps, image_scores, cls_names, anomalys = [], [], [], [], []
+        img_paths, mask_paths, raw_positive_pixels, model_input_shapes, anomaly_map_shapes, gt_mask_shapes = [], [], [], [], [], []
+        collect_eval_aux = self.debug_helper.enabled or getattr(self.evaluator, 'skip_tiny_mask_for_pixel', False)
         batch_idx = 0
         test_length = self.cfg.data.test_size
         test_loader = iter(self.test_loader)
@@ -426,11 +545,43 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
             self.set_input(test_data)
             self.forward()
             anomaly_map = self.anomaly_map
-            self._save_high_res_anomaly_maps(anomaly_map, batch_idx)
+            if self.save_hr_anomaly_maps:
+                self._save_high_res_anomaly_maps(anomaly_map, batch_idx)
 
             self.imgs_mask[self.imgs_mask > 0.5], self.imgs_mask[self.imgs_mask <= 0.5] = 1, 0
+            batch_size = self.imgs.shape[0]
+            if collect_eval_aux:
+                paths = self._normalize_batch_paths(
+                    self.img_path,
+                    batch_size,
+                    fill_value='',
+                )
+                if not any(paths):
+                    paths = [f'rank{self.rank}_batch{batch_idx}_item{i}' for i in range(batch_size)]
+                masks_paths = self._normalize_batch_paths(self.mask_path, batch_size, fill_value='')
+                img_paths.append(np.array(paths))
+                mask_paths.append(np.array(masks_paths))
+                raw_positive_pixels.append(np.array(self._raw_positive_pixels_from_paths(masks_paths, self.imgs_mask)))
+
+            if self.debug_helper.enabled:
+                self.debug_helper.add_vis_batch(
+                    self.imgs,
+                    self.imgs_mask,
+                    anomaly_map,
+                    self.image_score,
+                    self.cls_name,
+                    self.anomaly,
+                    self.img_path,
+                )
+                map_before_resize_shape = self._get_debug_anomaly_map_before_resize_shape()
+                if map_before_resize_shape is None:
+                    map_before_resize_shape = (anomaly_map.shape[-2], anomaly_map.shape[-1])
+                model_input_shapes.append(np.tile(np.array([[self.imgs.shape[2], self.imgs.shape[3]]]), (batch_size, 1)))
+                anomaly_map_shapes.append(np.tile(np.array([map_before_resize_shape]), (batch_size, 1)))
+                gt_mask_shapes.append(np.tile(np.array([[self.imgs_mask.shape[-2], self.imgs_mask.shape[-1]]]), (batch_size, 1)))
             imgs_masks.append(self.imgs_mask.cpu().numpy().astype(int))
             anomaly_maps.append(anomaly_map.cpu().numpy())
+            image_scores.append(self.image_score.cpu().numpy())
             cls_names.append(np.array(self.cls_name))
             anomalys.append(self.anomaly.cpu().numpy().astype(int))
 
@@ -442,11 +593,32 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
                     msg = able(self.progress.get_msg(batch_idx, test_length, 0, 0, prefix='Test'), self.master, None)
                     log_msg(self.logger, msg)
 
+        if self.debug_helper.enabled:
+            self.debug_helper.save_visualizations()
+
         if self.cfg.dist:
-            results = dict(imgs_masks=imgs_masks, anomaly_maps=anomaly_maps, cls_names=cls_names, anomalys=anomalys)
+            results = dict(
+                imgs_masks=imgs_masks,
+                anomaly_maps=anomaly_maps,
+                image_scores=image_scores,
+                cls_names=cls_names,
+                anomalys=anomalys,
+            )
+            if self.debug_helper.enabled:
+                results.update(
+                    model_input_shapes=model_input_shapes,
+                    anomaly_map_shapes=anomaly_map_shapes,
+                    gt_mask_shapes=gt_mask_shapes,
+                )
+            if collect_eval_aux:
+                results.update(img_paths=img_paths, mask_paths=mask_paths, raw_positive_pixels=raw_positive_pixels)
             torch.save(results, f'{self.tmp_dir}/{self.rank}.pth', _use_new_zipfile_serialization=False)
             if self.master:
-                results = dict(imgs_masks=[], anomaly_maps=[], cls_names=[], anomalys=[])
+                results = dict(imgs_masks=[], anomaly_maps=[], image_scores=[], cls_names=[], anomalys=[])
+                if self.debug_helper.enabled:
+                    results.update(model_input_shapes=[], anomaly_map_shapes=[], gt_mask_shapes=[])
+                if collect_eval_aux:
+                    results.update(img_paths=[], mask_paths=[], raw_positive_pixels=[])
                 valid_results = False
                 while not valid_results:
                     results_files = glob.glob(f'{self.tmp_dir}/*.pth')
@@ -465,32 +637,23 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
                                 time.sleep(1)
                         valid_results = True
         else:
-            results = dict(imgs_masks=imgs_masks, anomaly_maps=anomaly_maps, cls_names=cls_names, anomalys=anomalys)
+            results = dict(
+                imgs_masks=imgs_masks,
+                anomaly_maps=anomaly_maps,
+                image_scores=image_scores,
+                cls_names=cls_names,
+                anomalys=anomalys,
+            )
+            if self.debug_helper.enabled:
+                results.update(
+                    model_input_shapes=model_input_shapes,
+                    anomaly_map_shapes=anomaly_map_shapes,
+                    gt_mask_shapes=gt_mask_shapes,
+                )
+            if collect_eval_aux:
+                results.update(img_paths=img_paths, mask_paths=mask_paths, raw_positive_pixels=raw_positive_pixels)
 
         if self.master:
             results = {k: np.concatenate(v, axis=0) for k, v in results.items()}
-            msg = {}
-            for idx, cls_name in enumerate(self.cls_names):
-                metric_results = self.evaluator.run(results, cls_name, self.logger)
-                msg['Name'] = msg.get('Name', [])
-                msg['Name'].append(cls_name)
-                avg_act = len(self.cls_names) > 1 and idx == len(self.cls_names) - 1
-                msg['Name'].append('Avg') if avg_act else None
-                for metric in self.metrics:
-                    metric_result = metric_results[metric] * 100
-                    self.metric_recorder[f'{metric}_{cls_name}'].append(metric_result)
-                    max_metric = max(self.metric_recorder[f'{metric}_{cls_name}'])
-                    max_metric_idx = self.metric_recorder[f'{metric}_{cls_name}'].index(max_metric) + 1
-                    msg[metric] = msg.get(metric, [])
-                    msg[metric].append(metric_result)
-                    msg[f'{metric} (Max)'] = msg.get(f'{metric} (Max)', [])
-                    msg[f'{metric} (Max)'].append(f'{max_metric:.3f} ({max_metric_idx:<3d} epoch)')
-                    if avg_act:
-                        metric_result_avg = sum(msg[metric]) / len(msg[metric])
-                        self.metric_recorder[f'{metric}_Avg'].append(metric_result_avg)
-                        max_metric = max(self.metric_recorder[f'{metric}_Avg'])
-                        max_metric_idx = self.metric_recorder[f'{metric}_Avg'].index(max_metric) + 1
-                        msg[metric].append(metric_result_avg)
-                        msg[f'{metric} (Max)'].append(f'{max_metric:.3f} ({max_metric_idx:<3d} epoch)')
-            msg = tabulate.tabulate(msg, headers='keys', tablefmt='pipe', floatfmt='.3f', numalign='center', stralign='center')
-            log_msg(self.logger, f'\n{msg}')
+            _emit_metric_summary_table(self, results)
+            _write_debug_eval_safely(self.debug_helper, results, self.evaluator, self.logger)

@@ -1,0 +1,21 @@
+.DS_Store
+
+# Local IDE / environment files
+.idea/
+.venv/
+__pycache__/
+*.py[cod]
+.pycache_tmp/
+
+# Data, checkpoints, and generated experiment outputs
+runs/
+vis_results/
+model/pretrain/
+*.pth
+*.npy
+*.pkl
+*.zip
+
+# Keep this small project prior tracked if present.
+*.pt
+!uni_medical_delta_priors.pt

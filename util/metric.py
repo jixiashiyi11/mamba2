@@ -1,6 +1,7 @@
 from scipy.ndimage import gaussian_filter
 from sklearn.metrics import auc, roc_auc_score, average_precision_score, precision_recall_curve
 from skimage import measure
+
 import multiprocessing
 import copy
 
@@ -33,7 +34,8 @@ def func(th, amaps, binary_amaps, masks):
 
 
 class Evaluator(object):
-    def __init__(self, metrics=[], pooling_ks=None, max_step_aupro=200, mp=False, use_adeval=False):
+    def __init__(self, metrics=[], pooling_ks=None, max_step_aupro=200, mp=False, use_adeval=False,
+                 skip_tiny_mask_for_pixel=False, tiny_mask_pixel_threshold=10):
         if len(metrics) == 0:
             self.metrics = [
                 'mAUROC_sp_max', 'mAUROC_px', 'mAUPRO_px',
@@ -54,11 +56,13 @@ class Evaluator(object):
 
         self.boundary = 1e-7
         self.use_adeval = use_adeval
+        self.skip_tiny_mask_for_pixel = skip_tiny_mask_for_pixel
+        self.tiny_mask_pixel_threshold = tiny_mask_pixel_threshold
 
     def run(self, results, cls_name, logger=None):
         idxes = results['cls_names'] == cls_name
-        gt_px = results['imgs_masks'][idxes].squeeze(1)
-        pr_px = results['anomaly_maps'][idxes]
+        gt_px_all = results['imgs_masks'][idxes].squeeze(1)
+        pr_px_all = results['anomaly_maps'][idxes]
         pr_sp = results['anomalys'][idxes]
         if 'smp_pre' in results:
             pr_sample = results['smp_pre'][idxes]
@@ -67,32 +71,67 @@ class Evaluator(object):
             subarray2 = np.split(idxes, len(idxes) // 5)
             sample_idxes = np.array([subarr[0] for subarr in subarray2])
             gt_sa = results['smp_masks'][sample_idxes]
-        if len(gt_px.shape) == 4:
-            gt_px = gt_px.squeeze(1)
-        if len(pr_px.shape) == 4:
-            pr_px = pr_px.squeeze(1)
+        if len(gt_px_all.shape) == 4:
+            gt_px_all = gt_px_all.squeeze(1)
+        if len(pr_px_all.shape) == 4:
+            pr_px_all = pr_px_all.squeeze(1)
         # cls_names = results['cls_names'][idxes]
         # anomalys = results['anomalys'][idxes]
+        gt_sp = pr_sp.reshape(-1).astype(int)
+        raw_positive_pixels = results.get('raw_positive_pixels', None)
+        if raw_positive_pixels is not None:
+            raw_positive_pixels = raw_positive_pixels[idxes].reshape(-1)
+        else:
+            raw_positive_pixels = gt_px_all.reshape(gt_px_all.shape[0], -1).sum(axis=1)
+        pixel_keep = np.ones(gt_sp.shape[0], dtype=np.bool_)
+        skipped_tiny = np.zeros(gt_sp.shape[0], dtype=np.bool_)
+        if self.skip_tiny_mask_for_pixel:
+            positive = gt_sp == 1
+            skipped_tiny = positive & (raw_positive_pixels > 0) & (raw_positive_pixels <= self.tiny_mask_pixel_threshold)
+            pixel_keep = ~skipped_tiny
+            if logger is not None and skipped_tiny.any():
+                msg = (
+                    f'==> TinyMaskSkip for {cls_name:<15}: skipped {int(skipped_tiny.sum())} pixel-metric samples '
+                    f'(raw_positive_pixels <= {self.tiny_mask_pixel_threshold}); image metrics keep all samples'
+                )
+                if 'img_paths' in results:
+                    paths = results['img_paths'][idxes][skipped_tiny]
+                    msg += ' | ' + ', '.join([str(path) for path in paths[:10]])
+                log_msg(logger, msg)
+        gt_px = gt_px_all[pixel_keep]
+        pr_px = pr_px_all[pixel_keep]
         # normalization for pixel-level evaluations
-        pr_px_norm = (pr_px - pr_px.min()) / (pr_px.max() - pr_px.min())
-        gt_sp = gt_px.max(axis=(1, 2))
+        pr_px_norm = (pr_px - pr_px.min()) / (pr_px.max() - pr_px.min() + self.eps)
         if self.pooling_ks is not None:
-            pr_px_pooling = F.avg_pool2d(torch.tensor(pr_px).unsqueeze(1), self.pooling_ks, stride=1).numpy().squeeze(1)
+            pr_px_pooling = F.avg_pool2d(torch.tensor(pr_px_all).unsqueeze(1), self.pooling_ks, stride=1).numpy().squeeze(1)
             pr_sp_max = pr_px_pooling.max(axis=(1, 2))
             pr_sp_mean = pr_px_pooling.mean(axis=(1, 2))
         else:
-            pr_sp_max = pr_px.max(axis=(1, 2))
-            pr_sp_mean = pr_px.mean(axis=(1, 2))
+            pr_sp_max = pr_px_all.max(axis=(1, 2))
+            pr_sp_mean = pr_px_all.mean(axis=(1, 2))
+        if 'image_scores' in results:
+            pr_sp_max = results['image_scores'][idxes].reshape(-1)
 
         if self.use_adeval:
             score_min = min(pr_sp_max) - self.boundary
             score_max = max(pr_sp_max) + self.boundary
             anomap_min = pr_px.min()
             anomap_max = pr_px.max()
-            accum = EvalAccumulatorCuda(score_min, score_max, anomap_min, anomap_max, skip_pixel_aupro=False, nstrips=50)
+
+            # ==========================================
+            # 🛡️ 防爆炸护盾 (Gradient Explosion Shield) 🛡️
+            # ==========================================
+            if score_max <= score_min or np.isnan(score_max):
+                score_max = score_min + 1e-5
+            if anomap_max <= anomap_min or np.isnan(anomap_max):
+                anomap_max = anomap_min + 1e-5
+            # ==========================================
+
+            accum = EvalAccumulatorCuda(score_min, score_max, anomap_min, anomap_max, skip_pixel_aupro=False,
+                                        nstrips=50)
             accum.add_anomap_batch(torch.tensor(pr_px).cuda(non_blocking=True),
                                    torch.tensor(gt_px.astype(np.uint8)).cuda(non_blocking=True))
-            for i in range(torch.tensor(pr_px).size(0)):
+            for i in range(len(pr_sp_max)):
                 accum.add_image(torch.tensor(pr_sp_max[i]), torch.tensor(gt_sp[i]))
             metrics = accum.summary()
 
@@ -125,7 +164,9 @@ class Evaluator(object):
                     metric_results[metric] = metrics['p_auroc']
             elif metric.startswith('mAUPRO_px'):
                 if not self.use_adeval:
-                    aupro_px = self.cal_pro_score(gt_px, pr_px, max_step=self.max_step_aupro, mp=self.mp)
+                    aupro_px = self.cal_pro_score(
+                        gt_px, pr_px, max_step=self.max_step_aupro, mp=self.mp, cls_name=cls_name, logger=logger
+                    )
                     metric_results[metric] = aupro_px
                 else:
                     metric_results[metric] = metrics['p_aupro']
@@ -311,10 +352,32 @@ class Evaluator(object):
         # return [np.array(pro).mean(), fpr, th]
 
     @staticmethod
-    def cal_pro_score(masks, amaps, max_step=200, expect_fpr=0.3, mp=False):
+    def cal_pro_score(masks, amaps, max_step=200, expect_fpr=0.3, mp=False, cls_name=None, logger=None):
         # ref: https://github.com/gudovskiy/cflow-ad/blob/master/train.py
+        def warn_unavailable(reason):
+            name = cls_name if cls_name is not None else 'unknown'
+            msg = f'Warning: AUPRO for class {name} cannot be computed ({reason}); returning 0.0.'
+            print(msg)
+            if logger is not None:
+                log_msg(logger, msg)
+            return 0.0
+
+        masks = np.asarray(masks)
+        amaps = np.asarray(amaps)
+        if masks.size == 0 or amaps.size == 0:
+            return warn_unavailable('empty masks or anomaly maps')
+        if masks.sum() <= 0:
+            return warn_unavailable('no positive mask regions')
+        inverse_masks = 1 - masks
+        if inverse_masks.sum() <= 0:
+            return warn_unavailable('no negative pixels for FPR')
+
         min_th, max_th = amaps.min(), amaps.max()
+        if not np.isfinite(min_th) or not np.isfinite(max_th) or max_th <= min_th:
+            return warn_unavailable('invalid or constant anomaly map scores')
         delta = (max_th - min_th) / max_step
+        if delta <= 0 or not np.isfinite(delta):
+            return warn_unavailable('invalid threshold step')
         pros, fprs, ths = [], [], []
         if mp:
             # enable in the main process, i.e., __main__
@@ -354,21 +417,30 @@ class Evaluator(object):
                     for region in measure.regionprops(measure.label(mask)):
                         tp_pixels = binary_amap[region.coords[:, 0], region.coords[:, 1]].sum()
                         pro.append(tp_pixels / region.area)
-                inverse_masks = 1 - masks
                 fp_pixels = np.logical_and(inverse_masks, binary_amaps).sum()
                 fpr = fp_pixels / inverse_masks.sum()
-                pros.append(np.array(pro).mean())
-                fprs.append(fpr)
-                ths.append(th)
+                pro_mean = np.array(pro).mean() if len(pro) > 0 else np.nan
+                if np.isfinite(pro_mean) and np.isfinite(fpr):
+                    pros.append(pro_mean)
+                    fprs.append(fpr)
+                    ths.append(th)
         pros, fprs, ths = np.array(pros), np.array(fprs), np.array(ths)
+        finite = np.isfinite(pros) & np.isfinite(fprs)
+        if finite.sum() < 2:
+            return warn_unavailable(f'less than 2 finite AUPRO points: {int(finite.sum())}')
+        pros, fprs = pros[finite], fprs[finite]
         idxes = fprs < expect_fpr
+        if idxes.sum() < 2:
+            return warn_unavailable(f'less than 2 AUPRO points under FPR<{expect_fpr}: {int(idxes.sum())}')
         fprs = fprs[idxes]
+        pros = pros[idxes]
+        if len(np.unique(fprs)) < 2:
+            return warn_unavailable('less than 2 unique FPR points')
         fprs = (fprs - fprs.min()) / (fprs.max() - fprs.min())
-        pro_auc = auc(fprs, pros[idxes])
+        pro_auc = auc(fprs, pros)
         return pro_auc
 
 
 def get_evaluator(cfg_evaluator):
     evaluator, kwargs = Evaluator, cfg_evaluator.kwargs
     return evaluator(**kwargs)
-

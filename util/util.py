@@ -68,8 +68,17 @@ def init_checkpoint(cfg):
         else:
             cfg.model.kwargs['checkpoint_path'] = '{}/{}'.format(cfg.logdir, checkpoint_path.split('/')[-1])
         state_dict = torch.load(cfg.model.kwargs['checkpoint_path'], map_location='cpu')
-        cfg.trainer.iter, cfg.trainer.epoch = state_dict['iter'], state_dict['epoch']
-        cfg.trainer.metric_recorder = state_dict['metric_recorder']
+        if isinstance(state_dict, dict) and 'iter' in state_dict and 'epoch' in state_dict:
+            cfg.trainer.iter, cfg.trainer.epoch = state_dict['iter'], state_dict['epoch']
+            if 'metric_recorder' in state_dict:
+                cfg.trainer.metric_recorder = state_dict['metric_recorder']
+        elif cfg.mode == 'test':
+            cfg.trainer.iter, cfg.trainer.epoch = 0, 0
+        else:
+            raise KeyError(
+                "Checkpoint does not contain 'iter'/'epoch'. "
+                "Use a full ckpt.pth for train resume, or run in test mode for net_*.pth weights."
+            )
     else:
         if cfg.master:
             logdir_sub = cfg.trainer.logdir_sub if cfg.trainer.logdir_sub != '' else time.strftime("%Y%m%d-%H%M%S")

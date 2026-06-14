@@ -22,10 +22,44 @@ class cfg_common(Namespace):
 			'mIoU_max_px',
 		]
 		self.use_adeval = True
+		self.eval = Namespace()
+		self.eval.skip_tiny_mask_for_pixel = False
+		self.eval.tiny_mask_pixel_threshold = 10
 		self.evaluator = Namespace()
-		self.evaluator.kwargs = dict(metrics=self.metrics, pooling_ks=[16, 16], max_step_aupro=100, mp=False, use_adeval=self.use_adeval)
+		self.evaluator.kwargs = dict(metrics=self.metrics, pooling_ks=[16, 16], max_step_aupro=100, mp=False,
+									 use_adeval=self.use_adeval, skip_tiny_mask_for_pixel=self.eval.skip_tiny_mask_for_pixel,
+									 tiny_mask_pixel_threshold=self.eval.tiny_mask_pixel_threshold)
 		self.vis = False
 		self.vis_dir = None
+		self.debug_eval = False
+		self.debug_eval_vis_per_organ = 20
+		self.debug_eval_seed = 42
+		self.debug_eval_preview_rows = 8
+		self.debug_eval_foreground_mask = True
+		self.debug_eval_foreground_threshold = 5.0 / 255.0
+		self.debug_eval_foreground_background_value = 'min'
+		self.debug_eval_score_modes = ['model_top1', 'fg_top1', 'fg_eroded_top1', 'fg_top5', 'fg_mean']
+		self.debug_eval_foreground_erode_iters = 3
+		self.debug_eval_vis_norm = 'both'
+		self.debug_eval_vis_percentile_low = 1.0
+		self.debug_eval_vis_percentile_high = 99.0
+		self.eval_image_score_mode = 'model'
+		self.eval_adapter_mode = 'trained'
+		self.eval_random_adapter_seed = 123
+		self.eval_force_cls_name = None
+
+		self.synthetic_local_anomaly = Namespace()
+		self.synthetic_local_anomaly.enabled = False
+		self.synthetic_local_anomaly.prob = 1.0
+		self.synthetic_local_anomaly.loss_weight = 0.1
+		self.synthetic_local_anomaly.bce_weight = 1.0
+		self.synthetic_local_anomaly.dice_weight = 1.0
+		self.synthetic_local_anomaly.score_temperature = 0.1
+		self.synthetic_local_anomaly.min_area = 0.005
+		self.synthetic_local_anomaly.max_area = 0.08
+		self.synthetic_local_anomaly.noise_std = 0.18
+		self.synthetic_local_anomaly.intensity_delta = 0.35
+		self.synthetic_local_anomaly.foreground_threshold = 5.0 / 255.0
 
 		# ==> optim
 		self.optim = Namespace()

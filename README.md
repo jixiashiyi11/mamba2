@@ -1,166 +1,84 @@
 <div align="center">
-  <img src="assets/ADer_git_1024.png" width="30%" />
+<img src="assets/caption.png" width="1000">
+<h3>MambaAD: Exploring State Space Models for Multi-class Unsupervised Anomaly Detection</h3>
+
+[Haoyang He<sup>1*</sup>](https://scholar.google.com/citations?hl=zh-CN&user=8NfQv1sAAAAJ),
+[Yuhu Bai<sup>1*</sup>](https://scholar.google.com/citations?hl=zh-CN&user=ucCvgooAAAAJ),
+[Jiangning Zhang<sup>2</sup>](https://zhangzjn.github.io),
+[Qingdong He<sup>2</sup>](https://scholar.google.com/citations?hl=zh-CN&user=gUJWww0AAAAJ),
+[Hongxu Chen<sup>1</sup>](https://scholar.google.com/citations?hl=zh-CN&user=uFT3YfMAAAAJ)
+
+[Zhenye Gan<sup>2</sup>](https://scholar.google.com/citations?user=fa4NkScAAAAJ&hl=zh-CN),
+[Chengjie Wang<sup>2</sup>](https://scholar.google.com/citations?hl=zh-CN&user=fqte5H4AAAAJ),
+[Xiangtai Li<sup>3</sup>](https://lxtgh.github.io/),
+[Guanzhong Tian<sup>1</sup>](https://scholar.google.com/citations?hl=zh-CN&user=0q-7PI4AAAAJ),
+[Lei Xie<sup>1</sup>](https://scholar.google.com/citations?hl=zh-CN&user=7ZZ_-m0AAAAJ)
+
+<sup>1</sup>College of Control Science and Engineering, Zhejiang University, 
+<sup>2</sup>Youtu Lab, Tencent,
+<sup>3</sup>Nanyang Technological University, Singapore
+
+[[`Paper`](https://arxiv.org/pdf/2404.06564.pdf)] 
+[[`Project Page`](https://lewandofskee.github.io/projects/MambaAD/)]
+
+Our MambaAD is based on [ADer](https://github.com/zhangzjn/ADer).
+
+<h3>Congratulations! Our MambaAD has been accepted at the NeurIPS 2024 conference!</h3>
+
 </div>
 
-> - <span style="color:red">**ADer**</span> is an open source visual **A**nomaly **D**etection toolbox based on PyTorch, which supports multiple popular AD datasets and approaches. </br> 
-> - We reproduce popular AD methods under the **M**ulti-class **U**nsupervised **A**nomaly **D**etection (<span style="color:red">**MUAD**</span>) by default. </br>
-> - We hope it can bring convenience to your research and application. </br>
+## Abstract
+Recent advancements in anomaly detection have seen the efficacy of CNN- and transformer-based approaches. However, CNNs struggle with long-range dependencies, while transformers are burdened by quadratic computational complexity. Mamba-based models, with their superior long-range modeling and linear efficiency, have garnered substantial attention. This study pioneers the application of Mamba to multi-class unsupervised anomaly detection, presenting MambaAD, which consists of a pre-trained encoder and a Mamba decoder featuring Locality-Enhanced State Space (LSS) modules at multi-scales. The proposed LSS module, integrating parallel cascaded (Hybrid State Space) HSS blocks and multi-kernel convolutions operations, effectively captures both long-range and local information. The HSS block, utilizing (Hybrid Scanning) HS encoders, encodes feature maps into five scanning methods and eight directions, thereby strengthening global connections through the (State Space Model) SSM. The use of Hilbert scanning and eight directions significantly improves feature sequence modeling. Comprehensive experiments on six diverse anomaly detection datasets and seven metrics demonstrate SoTA performance, substantiating the method's effectiveness.
 
-[//]: # (<p align="center">)
-
-[//]: # (    <a href="https://zhangzjn.github.io/"><strong>Jiangning Zhang<sup>*</strong></a>)
-
-[//]: # (    ·)
-
-[//]: # (</p>)
-
-## 🐉 News
-- 🔥 Plain ViT based <span style="color:red">**ViTAD**</span> is accepted by CVIU'25 🐲 [**Paper**](https://arxiv.org/abs/2312.07495) | [**Project**](https://zhangzjn.github.io/projects/ViTAD) | [**Code**](https://github.com/zhangzjn/ader/configs/vitad)
-- 🔥 We have released several reproduced models, configuration files, and training logs in our <span style="color:red">**benchmark**</span> paper 🐲 [**Paper**](https://arxiv.org/abs/2406.03262) | [**Results & CFGs**](configs/benchmark/README.md)
-- 🔥 <span style="color:red">**COCO-AD**</span> and powerful <span style="color:red">**InvAD**</span> is released 🐲 [**Paper**](https://arxiv.org/abs/2404.10760) | [**Project**](https://zhangzjn.github.io/projects/InvAD) | [**Code**](https://github.com/zhangzjn/ader/configs/invad)
-- 🔥 <span style="color:red">**Real-IAD**</span> is released: a new large-scale challenging industrial AD dataset 🐲 [**Paper**](https://arxiv.org/abs/2403.12580) | [**Project**](https://realiad4ad.github.io/Real-IAD) | [**Code**](https://github.com/TencentYoutuResearch/AnomalyDetection_Real-IAD) 
-
-## 💡 Property
-
-- [x] 🚀Support Visualization
-- [x] 🚀 Multi-/Single-class Training and Testing
-- [x] 🚀 Convenient and flexible way to implement a new approach, refer to [here](#How-to-Build-a-Custom-Approach).
-- [x] Reproduced popular methods in [ADer Benchmark](https://arxiv.org/abs/2406.03262): 
-  - 🚀Augmentation-based
-    - [x] [DRAEM, ICCV'21](https://github.com/VitjanZ/DRAEM)
-    - [x] [SimpleNet, CVPR'23](https://github.com/DonaldRR/SimpleNet)
-    - [x] [RealNet, CVPR'24](https://github.com/cnulab/RealNet)
-  - 🚀Embedding-based
-    - [x] [CFA, Access'22](https://github.com/sungwool/CFA_for_anomaly_localization)
-    - [x] [PatchCore, CVPR'22](https://github.com/amazon-science/patchcore-inspection)
-    - [x] [CFLOW-AD, WACV'22](https://github.com/gudovskiy/cflow-ad)
-    - [x] [PyramidalFlow, CVPR'23](https://github.com/gasharper/PyramidFlow)
-  - 🚀Reconstruction-based
-    - [x] [ViTAD, arXiv'23](https://zhangzjn.github.io/projects/ViTAD)
-    - [x] [InvAD, arXiv'24](https://zhangzjn.github.io/projects/InvAD)
-    - [x] [InvAD-lite, arXiv'24](https://zhangzjn.github.io/projects/InvAD)
-    - [ ] [DiAD, AAAI'24](https://github.com/lewandofskee/DiAD): See tripartite implementation in this [website](https://github.com/lewandofskee/DiAD)
-    - [x] [MambaAD, arXiv'24](https://github.com/lewandofskee/MambaAD)
-    - [x] [RD, CVPR'22](https://github.com/hq-deng/RD4AD)
-  - 🚀Hybrid
-    - [x] [UniAD, NeurIPS'22](https://github.com/zhiyuanyou/UniAD): download  in `TIMM` to `model/pretrain`
-    - [x] [RD++, CVPR'23](https://github.com/tientrandinh/Revisiting-Reverse-Distillation)
-    - [x] [DesTSeg, CVPR'23](https://github.com/apple/ml-destseg)
-- [x] 🚀 (Opt.) DDP Training
-- [x] By default, the weights used by different methods are automatically downloaded (`model.kwargs.pretrained=True`, `model.kwargs.checkpoint_path=''`). If you prefer to specify offline weights, you can download the model weights to `model/pretrain` and modify the settings to `model.kwargs.pretrained=False`, `model.kwargs.checkpoint_path='model/pretrain/xxx.pth'`. 
-
-[//]: # (- Some pre-trained weights that may be used: )
-[//]: # (  - [wide_resnet50_2]&#40;https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-weights/wide_resnet50_racm-8234f177.pth&#41; in `TIMM`)
-[//]: # (  - [efficientnet_b4]&#40;https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-weights/tf_efficientnet_b4_aa-818f208c.pth&#41; in `TIMM`)
-
-
+## Overview
+<p align="center">
+  <img src="assets/mambaad.png" alt="accuracy" width="100%">
+</p>
 
 ---
 ## 🛠️ Getting Started
 
 ### Installation
-- Clone this repo:
-
+- Clone this repo to [ADer](https://github.com/zhangzjn/ADer).
+- Prepare the MambaAD extra environment
   ```shell
-  git clone https://github.com/zhangzjn/ader.git && cd ader
+  pip3 install triton causal_conv1d mamba_ssm numpy-hilbert-curve pyzorder
   ```
-- Prepare general experimental environment
-  ```shell
-  pip3 install timm==0.8.15dev0 mmselfsup pandas transformers openpyxl imgaug numba numpy tensorboard fvcore accimage Ninja
-  pip3 install mmdet==2.25.3
-  pip3 install --upgrade protobuf==3.20.1 scikit-image faiss-gpu
-  pip3 install adeval
-  pip3 install torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 --index-url https://download.pytorch.org/whl/cu118
-  pip3 install fastprogress geomloss FrEIA mamba_ssm adeval fvcore==0.1.5.post20221221
-  (or) conda install pytorch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 pytorch-cuda=11.8 -c pytorch -c nvidia
-  ```
-  
-### Dataset Preparation 
-Please refer to [Datasets Description](data/README.md) for preparing visual AD datasets as needed.
-- [x] [Real-IAD](data/README.md/###Real-IAD): A new large-scale challenging industrial AD dataset, containing 30 classes with totally 151,050 images; 2,000 ∼ 5,000 resolution; 0.01% ~ 6.75% defect proportions; 1:1 ~ 1:10 defect ratio.
-- [x] [COCO-AD](data/README.md/###COCO-AD): Large-scale and general-purpose challenging AD-adapted dataset.
-- [x] [MVTec AD](data/README.md/###MVTec AD): Most popular AD dataset.
-- [x] [VisA](data/README.md/###VisA): Popular AD dataset.
-- [x] [Uni-Medical](data/README.md/###Uni-Medical): Unified medical AD dataset.
-- [x] (Opt.) [MVTec 3D-AD](data/README.md/###MVTec 3D-AD): Improved 3D version of MVTec AD.
-- [x] (Opt.) [Cifar10 & Cifar100](data/README.md/###Cifar): For one-class-train, one-class-test, and unified settings.
-- [x] (Opt.) [Tiny-ImageNet](data/README.md/###Tiny-ImageNet-200): A larger one-class dataset.
 
-### Train (Multi-class Unsupervised AD setting by default, MUAD)
-- Check `data` and `model` settings for the config file `configs/METHOD/METHOD_CFG.py`
-- Train with single GPU example: `CUDA_VISIBLE_DEVICES=0 python run.py -c configs/METHOD/METHOD_cfg.py -m train`
-- Train with multiple GPUs (DDP) in one node: 
-  - `export nproc_per_node=8`
-  - `export nnodes=1`
-  - `export node_rank=0`
-  - `export master_addr=YOUR_MACHINE_ADDRESS`
-  - `export master_port=12315`
-  - `python -m torch.distributed.launch --nproc_per_node=$nproc_per_node --nnodes=$nnodes --node_rank=$node_rank --master_addr=$master_addr --master_port=$master_port --use_env run.py -c configs/METHOD/METHOD_CFG.py -m train`.
-- Modify `trainer.resume_dir` to resume training. 
-- Single-class Unsupervised AD (SUAD, not recommend currently)
-  1. one `GPU-0` for training one `grid` class in `mvtec` dataset: `CUDA_VISIBLE_DEVICES=0 python3 run.py -c configs/vitad/single_cls/vitad_mvtec_bs16.py -m train data.cls_names=grid trainer.checkpoint=runs/vitad/single_class/vitad_mvtec_bs16/grid`
-  2. one `GPU-0` for training all classes serially in `mvtec` dataset: `python3 runs_single_class.py -d mvtec -c configs/vitad/single_cls/vitad_mvtec_bs16.py -n 1 -m -1 -g 0`
-  3. `$GPU_NUM` GPUs for training all classes parallelly in `mvtec` dataset:: `python3 runs_single_class.py -d mvtec -c configs/vitad/single_cls/vitad_mvtec_bs16.py -n $GPU_NUM -m 1`
-  4. results will be saved in default dir: `runs/vitad/single_cls/vitad_mvtec_bs16`
+## 📜 Multi-class Results on Popular AD Datasets
+
+Subscripts `I`, `R`, and `P` represent `image-level`, `region-level`, and `pixel-level`, respectively.
+
+### MambaAD Results
+|   Method    | mAU-ROC<sub>I</sub> | mAP<sub>I</sub> | m*F*1-max<sub>I</sub> | mAU-ROC<sub>P</sub> | mAP<sub>P</sub> | m*F*1-max<sub>P</sub> | mAU-PRO<sub>R</sub> |                                                                            <span style="color:blue">Download</span>                                                                            |
+|:-----------:|:-------------------:|:---------------:|:---------------------:|:-------------------:|:---------------:|:---------------------:|:-------------------:|:----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------:|
+|  MVTec-AD   |        98.6         |      99.6       |         97.8          |        97.7         |      56.3       |         59.2          |        93.1         | [log](https://huggingface.co/Lewandofski/MambaAD/blob/main/mvtec/log_train.txt) & [weight](https://huggingface.co/Lewandofski/MambaAD/blob/main/mvtec/mambaad_mvtec.pth) |
+|    VisA     |        94.3         |      94.5       |         89.4          |        98.5         |      39.4       |         44.0          |        91.0         | [log](https://huggingface.co/Lewandofski/MambaAD/blob/main/visa/log_train.txt) & [weight](https://huggingface.co/Lewandofski/MambaAD/blob/main/visa/mambaad_visa.pth)                                                  |
+|  Real-IAD   |        86.3         |      84.6       |         77.0          |        98.5         |      33.0       |         38.7          |        90.5         | [log](https://huggingface.co/Lewandofski/MambaAD/blob/main/realiad/log_train.txt) & [weight](https://huggingface.co/Lewandofski/MambaAD/blob/main/realiad/mambaad_realiad.pth) |
+| Uni-Medical |        83.7         |      80.1       |         82.0          |        96.9         |      45.4       |         47.3          |        87.5         | [log](https://huggingface.co/Lewandofski/MambaAD/blob/main/medical/log_train.txt) & [weight](https://huggingface.co/Lewandofski/MambaAD/blob/main/medical/mambaad_medical.pth)        |
+|   COCO-AD   |        63.9         |      56.2       |         63.2          |        69.3         |      16.9       |         22.2          |        40.5         | [log](https://huggingface.co/Lewandofski/MambaAD/blob/main/cocoad/coco0/mambaad_coco0.txt) & [weight](https://huggingface.co/Lewandofski/MambaAD/blob/main/cocoad/coco0/mambaad_coco0.pth)                                                                                                                                                                         |
+|  MVTec-3D   |        86.2         |      95.8       |         92.8          |        98.6         |      37.5       |         41.1          |        93.6         | [log](https://huggingface.co/Lewandofski/MambaAD/blob/main/mvtec3d/log_train.txt) & [weight](https://huggingface.co/Lewandofski/MambaAD/blob/main/mvtec3d/mambaad_mvtec3d.pth)                                                                                          |
 
 
-### Test
-- Modify `trainer.resume_dir` or `model.kwargs['checkpoint_path']`
-- Test with single GPU example: `CUDA_VISIBLE_DEVICES=0 python run.py -c configs/METHOD/METHOD_cfg.py -m test`
-- Test with multiple GPUs (DDP) in one node:  `python -m torch.distributed.launch --nproc_per_node=$nproc_per_node --nnodes=$nnodes --node_rank=$node_rank --master_addr=$master_addr --master_port=$master_port --use_env run.py -c configs/METHOD/METHOD_CFG.py -m test`.
 
-### Visualization
-- Modify `trainer.resume_dir` or `model.kwargs['checkpoint_path']`
-- Visualize with single GPU example: `CUDA_VISIBLE_DEVICES=0 python run.py -c configs/METHOD/METHOD_cfg.py -m test vis=True vis_dir=VISUALIZATION_DIR`
+[//]: # (## Main results)
 
-### How to Build a Custom Approach
-1. Add a model config `cfg_model_MODEL_NAME` to `configs/__base__`
-2. Add configs to `configs/MODEL_NAME/CFG.py` for training and testing.
-3. Add a model implementation file `model/MODEL_NAME.py`
-4. Add a trainer implementation file `trainer/MODEL_NAME_trainer.py`
-5. (Optional) Add specific files to `data`, `loss`, `optim`, *etc*.
+[//]: # (<p align="center">)
 
----
+[//]: # (  <img src="assets/all_result.png" alt="arch" width="100%">)
 
-## 📜 MUAD Results on Popular AD Datasets
-> Detailed results are available on the [benchmark page](configs/benchmark/README.md)
-
+[//]: # (</p>)
 
 ## Citation
-If you use this toolbox or benchmark in your research, please cite our related works.
-```angular2html
-@article{ader,
-  title={ADer: A Comprehensive Benchmark for Multi-class Visual Anomaly Detection},
-  author={Jiangning Zhang and Haoyang He and Zhenye Gan and Qingdong He and Yuxuan Cai and Zhucun Xue and Yabiao Wang and Chengjie Wang and Lei Xie and Yong Liu},
-  journal={arXiv preprint arXiv:2406.03262},
-  year={2024}
-}
-
-@inproceedings{realiad,
-  title={Real-IAD: A Real-World Multi-View Dataset for Benchmarking Versatile Industrial Anomaly Detection},
-  author={Wang, Chengjie and Zhu, Wenbing and Gao, Bin-Bin and Gan, Zhenye and Zhang, Jianning and Gu, Zhihao and Qian, Shuguang and Chen, Mingang and Ma, Lizhuang},
-  booktitle={CVPR},
-  year={2024}
-}
-
-@article{vitad,
-  title={Exploring Plain ViT Reconstruction for Multi-class Unsupervised Anomaly Detection},
-  author={Zhang, Jiangning and Chen, Xuhai and Wang, Yabiao and Wang, Chengjie and Liu, Yong and Li, Xiangtai and Yang, Ming-Hsuan and Tao, Dacheng},
-  journal={CVIU},
-  year={2025}
-}
-
-@article{invad,
-  title={Learning Feature Inversion for Multi-class Anomaly Detection under General-purpose COCO-AD Benchmark},
-  author={Jiangning Zhang and Chengjie Wang and Xiangtai Li and Guanzhong Tian and Zhucun Xue and Yong Liu and Guansong Pang and Dacheng Tao},
-  journal={arXiv preprint arXiv:2404.10760},
-  year={2024}
-}
-
-@article{mambaad,
-  title={MambaAD: Exploring State Space Models for Multi-class Unsupervised Anomaly Detection},
-  author={He, Haoyang and Bai, Yuhu and Zhang, Jiangning and He, Qingdong and Chen, Hongxu and Gan, Zhenye and Wang, Chengjie and Li, Xiangtai and Tian, Guanzhong and Xie, Lei},
-  year={2024}
-}
-
+If you find this code useful, don't forget to star the repo and cite the paper:
 ```
+@article{he2024mambaad,
+      title={MambaAD: Exploring State Space Models for Multi-class Unsupervised Anomaly Detection}, 
+      author={Haoyang He and Yuhu Bai and Jiangning Zhang and Qingdong He and Hongxu Chen and Zhenye Gan and Chengjie Wang and Xiangtai Li and Guanzhong Tian and Lei Xie},
+      journal={arXiv preprint arXiv:2404.06564},
+      year={2024},
+}
+```
+## Acknowledgements
+We thank the great works [ADer](https://github.com/zhangzjn/ADer), [VMamba](https://github.com/MzeroMiko/VMamba) for providing assistance for our research.
+

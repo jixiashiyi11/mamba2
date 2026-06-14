@@ -1,4 +1,3 @@
-
 import math
 import numpy as np
 from typing import Optional, Callable
@@ -14,36 +13,28 @@ from einops import rearrange, repeat
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 from timm.models.resnet import Bottleneck
 
-# 尝试导入 load_state_dict_from_url
 try:
     from torch.hub import load_state_dict_from_url
 except ImportError:
     from torch.utils.model_zoo import load_url as load_state_dict_from_url
 
-# 假设这些是你项目本地的依赖
 from model import get_model
 from model import MODEL
 from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, selective_scan_ref
 from hilbert import decode, encode
 from pyzorder import ZOrderIndexer
 
+from loss.adaptive_mc_loss import AdaptiveMCLoss
 
 # ==============================================================================
-# 基础卷积组件 (Base Convolutional Components)
+# 基础卷积组件
 # ==============================================================================
 def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
     return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=dilation, groups=groups, bias=False,
                      dilation=dilation)
 
-
 def conv1x1(in_planes, out_planes, stride=1) -> nn.Conv2d:
     return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
-
-
-def deconv2x2(in_planes, out_planes, stride=1, groups=1, dilation=1):
-    return nn.ConvTranspose2d(in_planes, out_planes, kernel_size=2, stride=stride, groups=groups, bias=False,
-                              dilation=dilation)
-
 
 class PatchExpand2D(nn.Module):
     def __init__(self, dim, dim_scale=2, norm_layer=nn.LayerNorm):
@@ -61,9 +52,8 @@ class PatchExpand2D(nn.Module):
         x = self.norm(x)
         return x
 
-
 # ==============================================================================
-# Mamba 核心组件 (Mamba Core Components)
+# Mamba 核心组件
 # ==============================================================================
 class HSCANS(nn.Module):
     def __init__(self, size=16, dim=2, scan_type='scan'):
@@ -72,7 +62,7 @@ class HSCANS(nn.Module):
         max_num = size ** dim
         indexes = np.arange(max_num)
 
-        if 'sweep' == scan_type:  # ['sweep', 'scan', 'zorder', 'zigzag', 'hilbert']
+        if 'sweep' == scan_type:
             locs_flat = indexes
         elif 'scan' == scan_type:
             indexes = indexes.reshape(size, size)
@@ -138,7 +128,6 @@ class HSCANS(nn.Module):
         img_decode = torch.zeros(img.shape, dtype=img.dtype, device=img.device).scatter_(
             2, self.index_flat.expand(img.shape), img)
         return img_decode
-
 
 class SS2D(nn.Module):
     def __init__(
@@ -335,7 +324,6 @@ class SS2D(nn.Module):
             out = self.dropout(out)
         return out
 
-
 class HSSBlock(nn.Module):
     def __init__(
             self,
@@ -355,150 +343,69 @@ class HSSBlock(nn.Module):
                                    scan_type=scan_type, num_direction=num_direction, **kwargs)
         self.drop_path = DropPath(drop_path)
 
-        # ====================================================
-        # 💡 AdaLN 控制台：生成通道级别的 gamma 和 beta
-        # ====================================================
         cond_dim = 512
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(cond_dim, hidden_dim * 2, bias=True)
         )
-        # 顶级技巧：零初始化
         nn.init.zeros_(self.adaLN_modulation[1].weight)
         nn.init.zeros_(self.adaLN_modulation[1].bias)
 
     def forward(self, input: torch.Tensor, c=None):
-        # 1. 过普通的安检门
         x_norm = self.ln_1(input)
 
-        # 2. 💡 如果有器官密码传过来，开启 AdaLN 通道洗脑！
         if c is not None:
             gamma_c, beta_c = self.adaLN_modulation(c).chunk(2, dim=1)
             gamma_c = gamma_c.unsqueeze(1).unsqueeze(1)
             beta_c = beta_c.unsqueeze(1).unsqueeze(1)
             x_norm = x_norm * (1 + gamma_c) + beta_c
 
-        # 3. Mamba 戴着滤镜去扫图找病灶
         x = input + self.drop_path(self.self_attention(x_norm))
         return x
 
-
 # ==============================================================================
-# 跨层动态与可变形注意力模块 (Deformable Cross-Layer Attention Modules)
+# 无瓶颈直通版：跨层动态与可变形注意力模块 (完全契合 93.8 的检查点)
 # ==============================================================================
-class SpatialAdaptiveAffineGate(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.norm = nn.InstanceNorm2d(channels, affine=False)
-        self.conv_gamma = nn.Conv2d(channels, 1, kernel_size=1)
-        self.conv_beta = nn.Conv2d(channels, 1, kernel_size=1)
-        nn.init.zeros_(self.conv_gamma.weight)
-        nn.init.zeros_(self.conv_gamma.bias)
-        nn.init.zeros_(self.conv_beta.weight)
-        nn.init.zeros_(self.conv_beta.bias)
-
-        self.spatial_attention = nn.Sequential(
-            nn.Conv2d(in_channels=4, out_channels=1, kernel_size=7, padding=3, bias=False),
-            nn.Sigmoid()
-        )
-
-        self.l1_penalty = 0.0
-
-    def forward(self, f_global, cnn_feat):
-        gamma_spatial = self.conv_gamma(f_global)
-        beta_spatial = self.conv_beta(f_global)
-        cnn_norm = self.norm(cnn_feat)
-
-        max_cnn, _ = torch.max(cnn_norm, dim=1, keepdim=True)
-        avg_cnn = torch.mean(cnn_norm, dim=1, keepdim=True)
-
-        max_global, _ = torch.max(f_global, dim=1, keepdim=True)
-        avg_global = torch.mean(f_global, dim=1, keepdim=True)
-
-        pool_concat = torch.cat([max_cnn, avg_cnn, max_global, avg_global], dim=1)
-
-        w_xy = self.spatial_attention(pool_concat)
-
-        self.l1_penalty = torch.abs(gamma_spatial).mean() + torch.abs(beta_spatial).mean()
-
-        modulation_term = gamma_spatial * cnn_norm + beta_spatial
-
-        # 保底机制
-        w_xy_soft = 0.2 + 0.8 * w_xy
-
-        out = cnn_norm + w_xy_soft * modulation_term
-        return out
-
-import torch
-import torch.nn as nn
-import torchvision.ops as ops
-
 class DeformableAttnRes(nn.Module):
-    """
-    带瓶颈设计 (Bottleneck) 的跨层可变形注意力残差模块
-    """
-    # 🌟 重点 1：这里加上了 ratio 参数！
-    def __init__(self, channels, ratio=0.5, kernel_size=3):
+    def __init__(self, channels, kernel_size=3):
         super().__init__()
         self.channels = channels
-        # 根据 ratio 算出内部通道数 (沙漏最窄的地方)
-        self.inner_channels = int(channels * ratio)
         self.kernel_size = kernel_size
         self.padding = kernel_size // 2
 
-        # 🌟 重点 2：降维安检门 (大幅压缩通道，逼迫网络抛弃背景噪点)
-        self.reduce_conv = nn.Conv2d(channels, self.inner_channels, kernel_size=1, bias=False)
-        self.reduce_norm = nn.InstanceNorm2d(self.inner_channels)
-
-        # 司令部预测网络 (注意：这里的输入变成了压缩后的 inner_channels)
         self.offset_mask_conv = nn.Conv2d(
-            self.inner_channels,
+            channels,
             3 * kernel_size * kernel_size,
             kernel_size=kernel_size,
             padding=self.padding
         )
 
-        # 核心 DeformConv (在极其纯净的 inner_channels 里抓取)
         self.deform_conv = ops.DeformConv2d(
-            in_channels=self.inner_channels,
-            out_channels=self.inner_channels,
+            in_channels=channels,
+            out_channels=channels,
             kernel_size=kernel_size,
             padding=self.padding,
             bias=False
         )
 
-        # 🌟 重点 3：升维出口 (把抓回来的纯净特征放大回原通道数)
-        self.expand_conv = nn.Conv2d(self.inner_channels, channels, kernel_size=1, bias=False)
         self.dropout = nn.Dropout2d(0.1)
 
-        # 初始化权重为 0，保证初始状态下残差分支不干扰主干道
         nn.init.zeros_(self.offset_mask_conv.weight)
         nn.init.zeros_(self.offset_mask_conv.bias)
-        nn.init.zeros_(self.expand_conv.weight)
 
     def forward(self, x_query, x_pool=None):
         if x_pool is None:
             x_pool = x_query
 
-        # A. 探长和干警同时“瘦身” (经过降维安检门，抛弃噪点)
-        q_reduced = self.reduce_norm(self.reduce_conv(x_query))
-        v_reduced = self.reduce_norm(self.reduce_conv(x_pool))
-
-        # B. 探长下达指令 (基于精简后的特征)
-        out = self.offset_mask_conv(q_reduced)
+        out = self.offset_mask_conv(x_query)
         o1, o2, mask = torch.chunk(out, 3, dim=1)
         offset = torch.cat((o1, o2), dim=1)
         mask = torch.sigmoid(mask)
 
-        # C. 干警出击抓取 (只在纯净的通道里抓)
-        fused_feature = self.deform_conv(v_reduced, offset, mask)
-
-        # D. 带着战利品“膨胀”回原维度 (为了和原通道完美相加)
-        out_res = self.expand_conv(fused_feature)
-        out_res = self.dropout(out_res)
+        fused_feature = self.deform_conv(x_pool, offset, mask)
+        out_res = self.dropout(fused_feature)
 
         return out_res
-
 
 class LSSModule(nn.Module):
     def __init__(
@@ -520,12 +427,8 @@ class LSSModule(nn.Module):
                      d_state=d_state, size=size, scan_type=scan_type, num_direction=num_direction, **kwargs)
             for i in range(depth)])
 
-        # 🗑️ 历史包袱全部清空：没有 CNN，没有 Concat，没有 1x1 降维卷积！
-
-        # ✨ 终极形态：Deformable Cross-Layer Module (跨层形变模块)
-        # 将原有的 Sequential 拆开，方便我们分别传入 query 和 pool
         self.query_norm = nn.InstanceNorm2d(hidden_dim)
-        self.deform_attn = DeformableAttnRes(channels=hidden_dim, ratio=0.25, kernel_size=3)
+        self.deform_attn = DeformableAttnRes(channels=hidden_dim, kernel_size=3)
         self.deform_act = nn.SiLU()
 
         self.apply(self._init_weights)
@@ -538,37 +441,25 @@ class LSSModule(nn.Module):
             if m.bias is not None:
                 m.bias.data.zero_()
 
-    # 💡 核心改动：增加 pool_feat 参数，接收来自浅层的特征
     def forward(self, input: torch.Tensor, c=None, pool_feat=None):
         out_ssm = input
 
-        # Mamba 绿线：主干道不断向前推进
         for blk in self.smm_blocks:
             out_ssm = blk(out_ssm, c)
 
-        # 深层特征 (作为探长司令部)
         out_ssm_permuted = out_ssm.permute(0, 3, 1, 2).contiguous()
 
-        # 📦 获取浅层特征池 (如果没传，说明是第一层，就抓自己)
         if pool_feat is not None:
             v_pool = pool_feat.permute(0, 3, 1, 2).contiguous()
         else:
             v_pool = input.permute(0, 3, 1, 2).contiguous()
 
-        # ==========================================
-        # 🎯 执行 Deformable AttnRes (对应图纸 1,2,3步)
-        # ==========================================
-        # 1. Learned Query: 深层特征归一化，准备发号施令
         q = self.query_norm(out_ssm_permuted)
-
-        # 2. Deformable Sampling: 深层做 Query，去浅层池(v_pool)里抓高清像素
         deform_residual = self.deform_attn(x_query=q, x_pool=v_pool)
         deform_residual = self.deform_act(deform_residual)
 
-        # 3. Weighting & Summation (纯粹的残差相加 ⊕)
         output = out_ssm_permuted + deform_residual
 
-        # 维度还原
         output = output.permute(0, 2, 3, 1).contiguous()
         return output + input
 
@@ -639,19 +530,14 @@ class LSSLayer_up(nn.Module):
         if self.upsample is not None:
             x = self.upsample(x)
 
-        # 🌟 建立 Dynamic Feature Pool (动态特征池)
         dynamic_feature_pool = None
 
         for i, blk in enumerate(self.blocks):
             if self.use_checkpoint:
-                # 传入 pool
                 x = checkpoint.checkpoint(blk, x, c, dynamic_feature_pool)
             else:
-                # 传入 pool
                 x = blk(x, c, dynamic_feature_pool)
 
-            # 📥 关键操作：在第一层 (Layer 1) 跑完后，把它的高清输出存入特征池！
-            # 这样后面的 Layer 2, Layer 3 就能跨层去抓取它的特征了
             if i == 0:
                 dynamic_feature_pool = x.clone()
 
@@ -706,7 +592,6 @@ class MambaUPNet(nn.Module):
     @torch.jit.ignore
     def no_weight_decay_keywords(self):
         return {'relative_position_bias_table'}
-
 
 # ==============================================================================
 # 上层架构组装 (Architecture Assembly)
@@ -772,20 +657,43 @@ class MFF_OCE(nn.Module):
 
         return sv_features.contiguous()
 
-
 class MAMBAAD(nn.Module):
-    def __init__(self, model_t, model_s):
+    def __init__(
+            self,
+            model_t,
+            model_s,
+            bottleneck_dim=512,
+            biomedclip_model_name='hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224',
+            class_prompt_template='A medical image of {class_name}',
+            class_prompts=None,
+    ):
         super(MAMBAAD, self).__init__()
         self.net_t = get_model(model_t)
         self.mff_oce = MFF_OCE(Bottleneck, 3)
         self.net_s = MambaUPNet(depths_decoder=model_s['depths_decoder'], scan_type=model_s['scan_type'],
                                 num_direction=model_s['num_direction'])
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.text_proj = nn.Linear(bottleneck_dim, 512)
 
-        self.frozen_layers = ['net_t']
+        # The AdaLN condition must come from a frozen semantic prior rather
+        # than an industrially learned class table. A learned embedding only
+        # reflects the source industrial domain and is not a valid medical
+        # semantic prior at cross-domain zero-shot inference time.
+        self.semantic_conditioner = FrozenBiomedTextEncoder(
+            biomedclip_model_name,
+            prompt_normal=None,
+            prompt_abnormal=None,
+            class_prompt_template=class_prompt_template,
+            class_prompts=class_prompts,
+        )
 
-        self.cond_dim = 512
-        self.class_embedding = nn.Embedding(3, self.cond_dim)
-        self.name_to_id = {'brain': 0, 'liver': 1, 'retinal': 2}
+        self.frozen_layers = ['net_t', 'semantic_conditioner']
+
+    def _project_global_semantics(self, bottleneck_feats: torch.Tensor) -> torch.Tensor:
+        global_tokens = self.gap(bottleneck_feats)
+        global_tokens = torch.flatten(global_tokens, 1)
+        f_global = self.text_proj(global_tokens)
+        return F.normalize(f_global, p=2, dim=1)
 
     def freeze_layer(self, module):
         module.eval()
@@ -801,20 +709,48 @@ class MAMBAAD(nn.Module):
                 module.train(mode)
         return self
 
-    def forward(self, imgs, cls_names=None):
+    def _encode_semantic_condition(self, cls_names, batch_size, device):
+        # Frozen BiomedCLIP prompt embeddings are used as the only AdaLN
+        # condition source so the decoder sees a semantic prior instead of a
+        # trainable source-domain embedding.
+        with torch.no_grad():
+            return self.semantic_conditioner.encode_class_prompts(
+                cls_names=cls_names,
+                batch_size=batch_size,
+                device=device,
+            )
+
+    def forward(self, imgs, cls_names=None, return_teacher_features=False):
+        """
+        Args:
+            imgs: Input image tensor of shape ``(B, 3, H, W)``.
+            cls_names: Optional class-name list used for conditional decoding.
+            return_teacher_features: When ``True``, also returns the frozen
+                teacher features needed by the original MambaAD training and
+                evaluation pipeline.
+
+        Returns:
+            - Default: ``(reconstructed_features, f_global)``
+            - If ``return_teacher_features=True``:
+              ``(teacher_features, reconstructed_features, f_global)``
+        """
         feats_t = self.net_t(imgs)
         feats_t = [f.detach() for f in feats_t]
         fused_feats = self.mff_oce(feats_t)
+        f_global = self._project_global_semantics(fused_feats)
 
         c_embed = None
         if cls_names is not None:
-            class_ids = [self.name_to_id.get(str(name).lower(), 0) for name in cls_names]
-            class_ids = torch.tensor(class_ids, dtype=torch.long, device=imgs.device)
-            c_embed = self.class_embedding(class_ids)
+            c_embed = self._encode_semantic_condition(
+                cls_names=cls_names,
+                batch_size=imgs.shape[0],
+                device=imgs.device,
+            )
 
-        feats_s = self.net_s(fused_feats, c_embed)
-        return feats_t, feats_s
-
+        reconstructed_features = self.net_s(fused_feats, c_embed)
+        if return_teacher_features:
+            return feats_t, reconstructed_features, f_global
+        return reconstructed_features, f_global
 
 @MODEL.register_module
 def mambaad(pretrained=False, **kwargs):
@@ -822,29 +758,411 @@ def mambaad(pretrained=False, **kwargs):
     return model
 
 
-if __name__ == '__main__':
-    from fvcore.nn import FlopCountAnalysis, flop_count_table, parameter_count
-    from util.util import get_timepc, get_net_params
+class FrozenVisualSequenceEncoder(nn.Module):
+    def __init__(self, backbone):
+        super().__init__()
+        self.backbone = backbone
 
-    vmunet = MambaUPNet([512, 256, 128, 64], [3, 4, 6, 3])
-    bs = 1
-    reso = 8
-    x = torch.randn(bs, 512, reso, reso).cuda()
-    net = vmunet.cuda()
-    net.eval()
-    y = net(x)
-    Flops = FlopCountAnalysis(net, x)
-    print(flop_count_table(Flops, max_depth=5))
-    flops = Flops.total() / bs / 1e9
-    params = parameter_count(net)[''] / 1e6
+    def forward(self, imgs):
+        feats = self.backbone(imgs)
+        if isinstance(feats, (list, tuple)):
+            feats = feats[-1]
+        if feats.ndim != 4:
+            raise ValueError(f'Expected visual encoder to output a 4D feature map, got {tuple(feats.shape)}.')
 
-    with torch.no_grad():
-        pre_cnt, cnt = 5, 10
-        for _ in range(pre_cnt):
-            y = net(x)
-        t_s = get_timepc()
-        for _ in range(cnt):
-            y = net(x)
-        t_e = get_timepc()
-        print('[GFLOPs: {:>6.3f}G]\t[Params: {:>6.3f}M]\t[Speed: {:>7.3f}]\n'.format(
-            flops, params, bs * cnt / (t_e - t_s)))
+        bsz, channels, height, width = feats.shape
+        seq = feats.flatten(2).transpose(1, 2).contiguous()
+        return seq, (height, width), channels
+
+
+class FrozenBiomedTextEncoder(nn.Module):
+    def __init__(self, model_name, prompt_normal=None, prompt_abnormal=None,
+                 class_prompt_template='A medical image of {class_name}', class_prompts=None):
+        super().__init__()
+        try:
+            import open_clip
+        except ImportError as exc:
+            raise ImportError(
+                'BiomedCLIP zero-shot inference requires the `open_clip` package to be installed.'
+            ) from exc
+
+        self.model_name = model_name
+        self.text_encoder, _, _ = open_clip.create_model_and_transforms(model_name)
+        self.tokenizer = open_clip.get_tokenizer(model_name)
+        self.class_prompt_template = class_prompt_template
+        self.class_prompt_map = None
+        self.normal_prompt_map = None
+        self.abnormal_prompt_map = None
+        self.class_names = []
+        if prompt_normal is not None or prompt_abnormal is not None:
+            if prompt_normal is None or prompt_abnormal is None:
+                raise ValueError('`prompt_normal` and `prompt_abnormal` must be provided together.')
+            self.class_names, _, _ = self._build_prompt_pairs(prompt_normal, prompt_abnormal)
+            self.normal_prompt_map = self._normalize_prompt_config(prompt_normal, 'prompt_normal')
+            self.abnormal_prompt_map = self._normalize_prompt_config(prompt_abnormal, 'prompt_abnormal')
+
+        if class_prompts is not None:
+            class_prompt_map = self._normalize_prompt_config(class_prompts, 'class_prompts')
+            if '__shared__' not in class_prompt_map and self.class_names:
+                missing = sorted(set(self.class_names) - set(class_prompt_map.keys()))
+                if missing:
+                    raise ValueError(f'`class_prompts` is missing class keys: {missing}.')
+            self.class_prompt_map = class_prompt_map
+            if not self.class_names and '__shared__' not in class_prompt_map:
+                self.class_names = sorted(class_prompt_map.keys())
+
+        with torch.no_grad():
+            sample_prompt = self._get_sample_class_prompt()
+            sample_tokens = self.tokenizer([sample_prompt])
+            self.text_dim = int(self.text_encoder.encode_text(sample_tokens).shape[-1])
+
+    def _normalize_prompt_config(self, prompt_config, name):
+        if isinstance(prompt_config, str):
+            return {'__shared__': prompt_config}
+        if isinstance(prompt_config, dict):
+            if not prompt_config:
+                raise ValueError(f'`{name}` must not be an empty dict.')
+            return {str(key).lower(): value for key, value in prompt_config.items()}
+        raise TypeError(f'`{name}` must be a string or dict, got {type(prompt_config).__name__}.')
+
+    def _resolve_prompt_template(self, prompt_template, cls_name):
+        if '{cls_name}' in prompt_template:
+            return prompt_template.format(cls_name=cls_name)
+        if '{class_name}' in prompt_template:
+            return prompt_template.format(class_name=cls_name)
+        return prompt_template
+
+    def _build_prompt_pairs(self, prompt_normal, prompt_abnormal):
+        normal_map = self._normalize_prompt_config(prompt_normal, 'prompt_normal')
+        abnormal_map = self._normalize_prompt_config(prompt_abnormal, 'prompt_abnormal')
+
+        if '__shared__' in normal_map and '__shared__' in abnormal_map:
+            cls_names = ['__shared__']
+        elif '__shared__' in normal_map:
+            cls_names = list(abnormal_map.keys())
+            normal_map = {name: normal_map['__shared__'] for name in cls_names}
+        elif '__shared__' in abnormal_map:
+            cls_names = list(normal_map.keys())
+            abnormal_map = {name: abnormal_map['__shared__'] for name in cls_names}
+        else:
+            cls_names = sorted(normal_map.keys())
+            if set(cls_names) != set(abnormal_map.keys()):
+                raise ValueError('`prompt_normal` and `prompt_abnormal` must have the same class keys.')
+
+        normal_prompts = [self._resolve_prompt_template(normal_map[name], name) for name in cls_names]
+        abnormal_prompts = [self._resolve_prompt_template(abnormal_map[name], name) for name in cls_names]
+        return cls_names, normal_prompts, abnormal_prompts
+
+    def _get_sample_class_prompt(self):
+        sample_name = self.class_names[0] if len(self.class_names) > 0 else 'organ'
+        if self.class_prompt_map is None:
+            return self.class_prompt_template.format(class_name=sample_name)
+        if '__shared__' in self.class_prompt_map:
+            return self._resolve_prompt_template(self.class_prompt_map['__shared__'], sample_name)
+        return self._resolve_prompt_template(self.class_prompt_map[sample_name], sample_name)
+
+    def _build_semantic_prompts(self, cls_names, prompt_map, batch_size):
+        if cls_names is None:
+            cls_names = [self.class_names[0] if len(self.class_names) > 0 else 'organ'] * batch_size
+        elif isinstance(cls_names, str):
+            cls_names = [cls_names] * batch_size
+        elif len(cls_names) != batch_size:
+            raise ValueError(f'Expected {batch_size} class names, got {len(cls_names)}.')
+
+        prompts = []
+        for class_name in cls_names:
+            class_key = str(class_name).lower()
+            if prompt_map is None:
+                prompts.append(self.class_prompt_template.format(class_name=class_key))
+            elif '__shared__' in prompt_map:
+                prompts.append(self._resolve_prompt_template(prompt_map['__shared__'], class_key))
+            else:
+                if class_key not in prompt_map:
+                    raise KeyError(
+                        f'No prompt found for class `{class_name}`. Available classes: {sorted(prompt_map.keys())}.'
+                    )
+                prompts.append(self._resolve_prompt_template(prompt_map[class_key], class_key))
+        return prompts
+
+    def encode_class_prompts(self, cls_names=None, batch_size=1, device=None):
+        prompt_class = self._build_semantic_prompts(cls_names, self.class_prompt_map, batch_size)
+        prompt_tokens = self.tokenizer(prompt_class)
+        token_device = device if device is not None else next(self.text_encoder.parameters()).device
+        prompt_tokens = prompt_tokens.to(token_device)
+        class_embedding = self.text_encoder.encode_text(prompt_tokens)
+        return F.normalize(class_embedding, p=2, dim=-1)
+
+    def forward(self, cls_names=None, batch_size=1):
+        normal_prompts = self._build_semantic_prompts(cls_names, self.normal_prompt_map, batch_size)
+        abnormal_prompts = self._build_semantic_prompts(cls_names, self.abnormal_prompt_map, batch_size)
+        token_device = next(self.text_encoder.parameters()).device
+        normal_tokens = self.tokenizer(normal_prompts).to(token_device)
+        abnormal_tokens = self.tokenizer(abnormal_prompts).to(token_device)
+        t_norm = F.normalize(self.text_encoder.encode_text(normal_tokens), p=2, dim=-1)
+        t_abn = F.normalize(self.text_encoder.encode_text(abnormal_tokens), p=2, dim=-1)
+        return t_norm, t_abn
+
+
+class CSSD(nn.Module):
+    def __init__(self, hidden_dim, grid_size, depths=(3, 4, 6, 3), d_state=16, drop_path_rate=0.2,
+                 attn_drop_rate=0.0, scan_type='scan', num_direction=8):
+        super().__init__()
+        if not isinstance(depths, (list, tuple)) or len(depths) == 0:
+            raise ValueError('`depths` must be a non-empty list or tuple.')
+
+        stage_drop_paths = torch.linspace(0, drop_path_rate, len(depths)).tolist()
+        self.stages = nn.ModuleList([
+            LSSModule(
+                hidden_dim=hidden_dim,
+                drop_path=stage_drop_paths[idx],
+                norm_layer=partial(nn.LayerNorm, eps=1e-6),
+                attn_drop_rate=attn_drop_rate,
+                d_state=d_state,
+                depth=depth,
+                size=grid_size,
+                scan_type=scan_type,
+                num_direction=num_direction,
+            )
+            for idx, depth in enumerate(depths)
+        ])
+        self.out_norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, v_raw, semantic_embedding, spatial_shape):
+        bsz, num_tokens, feat_dim = v_raw.shape
+        height, width = spatial_shape
+        if height != width:
+            raise ValueError(f'CSSD currently expects square token grids, got {(height, width)}.')
+        if height * width != num_tokens:
+            raise ValueError(
+                f'Spatial shape {(height, width)} does not match sequence length {num_tokens}.'
+            )
+
+        x = v_raw.view(bsz, height, width, feat_dim)
+        pool_feat = None
+        for stage in self.stages:
+            x = stage(x, semantic_embedding, pool_feat)
+            if pool_feat is None:
+                pool_feat = x
+        x = self.out_norm(x)
+        return x.view(bsz, num_tokens, feat_dim)
+
+
+class MAMBAADZeroShot(nn.Module):
+    def __init__(self, model_t, model_s, biomedclip_model_name, prompt_normal, prompt_abnormal, image_size=256,
+                 adaptive_mc_kwargs=None, class_prompt_template='A medical image of {class_name}', class_prompts=None,
+                 image_score_topk_ratio=0.01):
+        super().__init__()
+        self.visual_encoder = FrozenVisualSequenceEncoder(get_model(model_t))
+        self.text_encoder = FrozenBiomedTextEncoder(
+            biomedclip_model_name,
+            prompt_normal=prompt_normal,
+            prompt_abnormal=prompt_abnormal,
+            class_prompt_template=class_prompt_template,
+            class_prompts=class_prompts,
+        )
+
+        visual_dim, spatial_shape = self._infer_visual_spec(image_size)
+        if visual_dim != self.text_encoder.text_dim:
+            raise ValueError(
+                f'Visual feature dim ({visual_dim}) must match text dim ({self.text_encoder.text_dim}). '
+                'Use a visual encoder stage whose channel width matches BiomedCLIP.'
+            )
+        if spatial_shape[0] != spatial_shape[1]:
+            raise ValueError(f'CSSD requires a square feature grid, got {spatial_shape}.')
+
+        self.grid_size = spatial_shape[0]
+        self.cssd = CSSD(
+            hidden_dim=visual_dim,
+            grid_size=self.grid_size,
+            depths=model_s.get('depths_decoder', [3, 4, 6, 3]),
+            d_state=model_s.get('d_state', 16),
+            drop_path_rate=model_s.get('drop_path_rate', 0.2),
+            attn_drop_rate=model_s.get('attn_drop_rate', 0.0),
+            scan_type=model_s.get('scan_type', 'scan'),
+            num_direction=model_s.get('num_direction', 8),
+        )
+        self.label_free_loss = AdaptiveMCLoss(**(adaptive_mc_kwargs or {}))
+        self.image_score_topk_ratio = image_score_topk_ratio
+        self.eval_adapter_mode = 'trained'
+        self.last_adapter_debug = {}
+
+        self._freeze_module(self.visual_encoder)
+        self._freeze_module(self.text_encoder)
+        self._set_requires_grad(self.cssd, True)
+
+    def _infer_visual_spec(self, image_size):
+        was_training = self.visual_encoder.training
+        self.visual_encoder.eval()
+        with torch.no_grad():
+            dummy = torch.zeros(1, 3, image_size, image_size)
+            _, spatial_shape, visual_dim = self.visual_encoder(dummy)
+        self.visual_encoder.train(was_training)
+        return visual_dim, spatial_shape
+
+    def _freeze_module(self, module):
+        module.eval()
+        for param in module.parameters():
+            param.requires_grad = False
+
+    def _set_requires_grad(self, module, requires_grad):
+        for param in module.parameters():
+            # 只有浮点数或复数才允许开启梯度求导，跳过底层的整数索引(LongTensor)
+            if param.is_floating_point() or param.is_complex():
+                param.requires_grad = requires_grad
+
+    def set_eval_adapter_mode(self, mode):
+        mode = str(mode).lower()
+        if mode not in ('trained', 'bypass', 'random'):
+            raise ValueError(f'Invalid eval_adapter_mode={mode}. Expected trained, bypass, or random.')
+        self.eval_adapter_mode = mode
+
+    def reset_adapter_parameters(self, seed=None):
+        device = next(self.cssd.parameters()).device
+        devices = [device.index] if device.type == 'cuda' and device.index is not None else []
+        with torch.random.fork_rng(devices=devices, enabled=seed is not None):
+            if seed is not None:
+                torch.manual_seed(int(seed))
+                if device.type == 'cuda':
+                    torch.cuda.manual_seed_all(int(seed))
+            self._reset_module_parameters(self.cssd)
+
+    def _reset_module_parameters(self, module):
+        for child in module.children():
+            self._reset_module_parameters(child)
+        reset = getattr(module, 'reset_parameters', None)
+        if callable(reset):
+            reset()
+
+    def adapter_param_norm(self):
+        total_sq = 0.0
+        total_params = 0
+        for param in self.cssd.parameters():
+            if not param.is_floating_point():
+                continue
+            value = param.detach().float()
+            total_sq += float(torch.sum(value * value).cpu())
+            total_params += value.numel()
+        return math.sqrt(total_sq), total_params
+
+    def train(self, mode=True):
+        self.training = mode
+        self.visual_encoder.eval()
+        self.text_encoder.eval()
+        self.cssd.train(mode)
+        self.label_free_loss.train(mode)
+        return self
+
+    def _anomaly_outputs(self, v_refined, t_norm, t_abn, spatial_shape, image_shape):
+        v_refined = F.normalize(v_refined, p=2, dim=-1)
+        t_norm = F.normalize(t_norm, p=2, dim=-1)
+        t_abn = F.normalize(t_abn, p=2, dim=-1)
+        # Cross-domain medical validation showed pixel scores were inversely
+        # correlated with anomaly masks, so high anomaly response is defined as
+        # being closer to the normal prompt than the abnormal prompt.
+        scores = torch.einsum('bld,bd->bl', v_refined, t_norm) - torch.einsum('bld,bd->bl', v_refined, t_abn)
+        height, width = spatial_shape
+        anomaly_map = scores.view(scores.shape[0], height, width)
+        anomaly_map = F.interpolate(
+            anomaly_map.unsqueeze(1),
+            size=image_shape,
+            mode='bilinear',
+            align_corners=False,
+        ).squeeze(1)
+        flat_map = anomaly_map.flatten(1)
+        if self.image_score_topk_ratio is None:
+            image_score = flat_map.max(dim=1).values
+        else:
+            topk = max(1, int(flat_map.shape[1] * self.image_score_topk_ratio))
+            image_score = flat_map.topk(topk, dim=1).values.mean(dim=1)
+        return anomaly_map, image_score
+
+    def forward(self, imgs, cls_names=None, return_anomaly_map=False, compute_label_free=True):
+        with torch.no_grad():
+            v_raw, spatial_shape, _ = self.visual_encoder(imgs)
+            t_norm, t_abn = self.text_encoder(cls_names, batch_size=imgs.shape[0])
+            # Frozen BiomedCLIP semantics are the only condition vector used by
+            # AdaLN. This keeps semantic conditioning aligned with medical
+            # language priors instead of source-domain learned embeddings.
+            semantic_embedding = self.text_encoder.encode_class_prompts(
+                cls_names=cls_names,
+                batch_size=imgs.shape[0],
+                device=imgs.device,
+            )
+
+        if self.training and self.eval_adapter_mode != 'trained':
+            raise RuntimeError('eval_adapter_mode is only for test/eval; use trained mode during training.')
+
+        # Semantic-conditioning pipeline:
+        # BiomedCLIP text prior -> AdaLN modulation in LSS/HSS blocks ->
+        # CSSD spatial refinement -> anomaly localization.
+        if self.eval_adapter_mode == 'bypass':
+            v_refined = v_raw
+        else:
+            v_refined = self.cssd(v_raw, semantic_embedding, spatial_shape)
+        with torch.no_grad():
+            delta = (v_refined.detach() - v_raw.detach()).float()
+            raw = v_raw.detach().float()
+            refined = v_refined.detach().float()
+            self.last_adapter_debug = {
+                'adapter_feature_delta_l2': delta.pow(2).sum(dim=-1).sqrt().mean(dim=1),
+                'adapter_feature_delta_abs': delta.abs().mean(dim=(1, 2)),
+                'adapter_raw_l2': raw.pow(2).sum(dim=-1).sqrt().mean(dim=1),
+                'adapter_refined_l2': refined.pow(2).sum(dim=-1).sqrt().mean(dim=1),
+            }
+        f_global = v_refined.mean(dim=1)
+
+        if self.training:
+            if not compute_label_free:
+                anomaly_map, image_score = self._anomaly_outputs(
+                    v_refined,
+                    t_norm,
+                    t_abn,
+                    spatial_shape,
+                    (imgs.shape[2], imgs.shape[3]),
+                )
+                return {
+                    'anomaly_map': anomaly_map,
+                    'image_score': image_score,
+                }
+            total, normal_align, margin, token_consistency, stats = self.label_free_loss(
+                v_refined,
+                v_raw,
+                t_norm,
+                t_abn,
+                f_global=f_global,
+            )
+            out = {
+                'total': total,
+                'loss_total': total,
+                'normal_align': normal_align,
+                'loss_normal_align': normal_align,
+                'margin': margin,
+                'loss_adaptive_margin': margin,
+                'token_consistency': token_consistency,
+                'loss_token_consistency': token_consistency,
+                **stats,
+            }
+            if return_anomaly_map:
+                anomaly_map, image_score = self._anomaly_outputs(
+                    v_refined,
+                    t_norm,
+                    t_abn,
+                    spatial_shape,
+                    (imgs.shape[2], imgs.shape[3]),
+                )
+                out.update(anomaly_map=anomaly_map, image_score=image_score)
+            return out
+
+        return self._anomaly_outputs(
+            v_refined,
+            t_norm,
+            t_abn,
+            spatial_shape,
+            (imgs.shape[2], imgs.shape[3]),
+        )
+
+
+@MODEL.register_module
+def mambaad_zsad(pretrained=False, **kwargs):
+    model = MAMBAADZeroShot(**kwargs)
+    return model

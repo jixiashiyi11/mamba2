@@ -947,10 +947,457 @@ class CSSD(nn.Module):
         return x.view(bsz, num_tokens, feat_dim)
 
 
+class FrozenBiomedCLIPPatchEncoder(nn.Module):
+    def __init__(
+            self,
+            model_name,
+            prompt_normal,
+            prompt_abnormal,
+            input_mean=(0.485, 0.456, 0.406),
+            input_std=(0.229, 0.224, 0.225),
+            biomed_mean=(0.48145466, 0.4578275, 0.40821073),
+            biomed_std=(0.26862954, 0.26130258, 0.27577711),
+    ):
+        super().__init__()
+        try:
+            import open_clip
+        except ImportError as exc:
+            raise ImportError(
+                'BiomedCLIP patch localization requires the `open_clip` package to be installed.'
+            ) from exc
+
+        self.model_name = model_name
+        self.model, _, _ = open_clip.create_model_and_transforms(model_name)
+        self.tokenizer = open_clip.get_tokenizer(model_name)
+        self.normal_prompt_map = self._normalize_prompt_config(prompt_normal, 'prompt_normal')
+        self.abnormal_prompt_map = self._normalize_prompt_config(prompt_abnormal, 'prompt_abnormal')
+        self.class_names = sorted(
+            set(k for k in self.normal_prompt_map.keys() if k != '__shared__')
+            | set(k for k in self.abnormal_prompt_map.keys() if k != '__shared__')
+        )
+        if '__shared__' not in self.normal_prompt_map and '__shared__' not in self.abnormal_prompt_map:
+            if set(self.normal_prompt_map.keys()) != set(self.abnormal_prompt_map.keys()):
+                raise ValueError('`prompt_normal` and `prompt_abnormal` must have the same class keys.')
+
+        self.register_buffer('input_mean', torch.tensor(input_mean).view(1, 3, 1, 1), persistent=False)
+        self.register_buffer('input_std', torch.tensor(input_std).view(1, 3, 1, 1), persistent=False)
+        self.register_buffer('biomed_mean', torch.tensor(biomed_mean).view(1, 3, 1, 1), persistent=False)
+        self.register_buffer('biomed_std', torch.tensor(biomed_std).view(1, 3, 1, 1), persistent=False)
+
+        with torch.no_grad():
+            sample_tokens = self.tokenizer(['A medical image']).to(next(self.model.parameters()).device)
+            self.text_dim = int(self.model.encode_text(sample_tokens).shape[-1])
+            image_size = getattr(self.model.visual, 'image_size', 224)
+            if isinstance(image_size, (list, tuple)):
+                image_size = image_size[0]
+            self.image_size = int(image_size)
+
+    def _normalize_prompt_config(self, prompt_config, name):
+        if isinstance(prompt_config, str):
+            return {'__shared__': prompt_config}
+        if isinstance(prompt_config, dict):
+            if not prompt_config:
+                raise ValueError(f'`{name}` must not be an empty dict.')
+            return {str(key).lower(): value for key, value in prompt_config.items()}
+        raise TypeError(f'`{name}` must be a string or dict, got {type(prompt_config).__name__}.')
+
+    def _resolve_prompt(self, prompt_map, cls_name):
+        key = str(cls_name).lower()
+        if key in prompt_map:
+            prompt = prompt_map[key]
+        elif '__shared__' in prompt_map:
+            prompt = prompt_map['__shared__']
+        elif 'good' in prompt_map:
+            prompt = prompt_map['good']
+        elif self.class_names:
+            prompt = prompt_map[self.class_names[0]]
+        else:
+            raise KeyError(f'No prompt found for class `{cls_name}`.')
+
+        if '{cls_name}' in prompt:
+            return prompt.format(cls_name=key)
+        if '{class_name}' in prompt:
+            return prompt.format(class_name=key)
+        return prompt
+
+    def _expand_cls_names(self, cls_names, batch_size):
+        if cls_names is None:
+            default_name = 'good' if ('good' in self.normal_prompt_map or 'good' in self.abnormal_prompt_map) else (
+                self.class_names[0] if self.class_names else '__shared__'
+            )
+            return [default_name] * batch_size
+        if isinstance(cls_names, str):
+            return [cls_names] * batch_size
+        if len(cls_names) != batch_size:
+            raise ValueError(f'Expected {batch_size} class names, got {len(cls_names)}.')
+        return [str(name) for name in cls_names]
+
+    def _prepare_images(self, imgs):
+        imgs_01 = (imgs * self.input_std.to(dtype=imgs.dtype) + self.input_mean.to(dtype=imgs.dtype)).clamp(0.0, 1.0)
+        if imgs_01.shape[-2:] != (self.image_size, self.image_size):
+            imgs_01 = F.interpolate(
+                imgs_01,
+                size=(self.image_size, self.image_size),
+                mode='bilinear',
+                align_corners=False,
+            )
+        return (imgs_01 - self.biomed_mean.to(dtype=imgs.dtype)) / self.biomed_std.to(dtype=imgs.dtype)
+
+    def _pick_feature_tensor(self, features):
+        if isinstance(features, dict):
+            for key in ['x_norm_patchtokens', 'x_norm', 'tokens', 'last_hidden_state']:
+                if key in features:
+                    return features[key]
+            return next(reversed(features.values()))
+        if isinstance(features, (list, tuple)):
+            return features[-1]
+        return features
+
+    def _tokens_from_feature_tensor(self, features):
+        features = self._pick_feature_tensor(features)
+        if features.ndim == 4:
+            bsz, channels, height, width = features.shape
+            return features.permute(0, 2, 3, 1).reshape(bsz, height * width, channels), (height, width)
+        if features.ndim != 3:
+            raise RuntimeError(f'Expected patch features with 3 or 4 dims, got {tuple(features.shape)}.')
+
+        num_tokens = features.shape[1]
+        trunk = getattr(self.model.visual, 'trunk', self.model.visual)
+        prefix_candidates = [
+            int(getattr(trunk, 'num_prefix_tokens', 0) or 0),
+            int(getattr(trunk, 'num_tokens', 0) or 0),
+            1,
+            0,
+        ]
+        for prefix in prefix_candidates:
+            patch_count = num_tokens - prefix
+            side = int(round(math.sqrt(patch_count)))
+            if patch_count > 0 and side * side == patch_count:
+                return features[:, prefix:, :], (side, side)
+        side = int(math.floor(math.sqrt(num_tokens)))
+        patch_count = side * side
+        if patch_count <= 0:
+            raise RuntimeError(f'Cannot infer patch grid from {num_tokens} tokens.')
+        return features[:, -patch_count:, :], (side, side)
+
+    def _get_projection_module(self):
+        visual = getattr(self.model, 'visual', None)
+        candidates = []
+        if visual is not None:
+            head = getattr(visual, 'head', None)
+            if head is not None:
+                candidates.extend([getattr(head, 'proj', None), getattr(head, 'fc', None)])
+            candidates.extend([getattr(visual, 'proj', None), getattr(visual, 'projection', None)])
+            trunk = getattr(visual, 'trunk', None)
+            if trunk is not None:
+                candidates.extend([getattr(trunk, 'proj', None), getattr(trunk, 'head', None)])
+        for candidate in candidates:
+            if candidate is not None:
+                return candidate
+        return None
+
+    def _apply_projection(self, tokens, projection):
+        if projection is None or isinstance(projection, torch.nn.Identity):
+            return tokens
+        if isinstance(projection, torch.nn.Linear):
+            flat = tokens.reshape(-1, tokens.shape[-1])
+            return projection(flat).reshape(tokens.shape[0], tokens.shape[1], -1)
+        if isinstance(projection, torch.nn.Parameter):
+            return tokens @ projection
+        if torch.is_tensor(projection):
+            return tokens @ projection
+        return tokens
+
+    def encode_text_pairs(self, cls_names, batch_size, device):
+        cls_names = self._expand_cls_names(cls_names, batch_size)
+        normal_prompts = [self._resolve_prompt(self.normal_prompt_map, name) for name in cls_names]
+        abnormal_prompts = [self._resolve_prompt(self.abnormal_prompt_map, name) for name in cls_names]
+        tokens = self.tokenizer(normal_prompts + abnormal_prompts).to(device)
+        features = F.normalize(self.model.encode_text(tokens), p=2, dim=-1)
+        return features[:batch_size], features[batch_size:]
+
+    def encode_image_and_patches(self, imgs):
+        biomed_imgs = self._prepare_images(imgs)
+        image_features = F.normalize(self.model.encode_image(biomed_imgs), p=2, dim=-1)
+        visual = self.model.visual
+        trunk = getattr(visual, 'trunk', visual)
+        if hasattr(trunk, 'forward_features'):
+            features = trunk.forward_features(biomed_imgs)
+        else:
+            features = trunk(biomed_imgs)
+        tokens, grid_shape = self._tokens_from_feature_tensor(features)
+        tokens = self._apply_projection(tokens, self._get_projection_module())
+        tokens = F.normalize(tokens, p=2, dim=-1)
+        return image_features, tokens, grid_shape
+
+
+class MAMBAADBiomedCLIPLocalAdapter(nn.Module):
+    def __init__(
+            self,
+            model_s,
+            biomedclip_model_name,
+            prompt_normal,
+            prompt_abnormal,
+            image_size=256,
+            local_loss_kwargs=None,
+            input_mean=(0.485, 0.456, 0.406),
+            input_std=(0.229, 0.224, 0.225),
+            biomed_mean=(0.48145466, 0.4578275, 0.40821073),
+            biomed_std=(0.26862954, 0.26130258, 0.27577711),
+    ):
+        super().__init__()
+        self.image_size = image_size
+        self.biomedclip = FrozenBiomedCLIPPatchEncoder(
+            biomedclip_model_name,
+            prompt_normal=prompt_normal,
+            prompt_abnormal=prompt_abnormal,
+            input_mean=input_mean,
+            input_std=input_std,
+            biomed_mean=biomed_mean,
+            biomed_std=biomed_std,
+        )
+        self.visual_dim, self.grid_size = self._infer_visual_spec(image_size)
+        self.local_adapter = CSSD(
+            hidden_dim=self.visual_dim,
+            grid_size=self.grid_size,
+            depths=model_s.get('depths_decoder', [3, 4, 6, 3]),
+            d_state=model_s.get('d_state', 16),
+            drop_path_rate=model_s.get('drop_path_rate', 0.2),
+            attn_drop_rate=model_s.get('attn_drop_rate', 0.0),
+            scan_type=model_s.get('scan_type', 'scan'),
+            num_direction=model_s.get('num_direction', 8),
+        )
+        self.local_head = nn.Linear(self.visual_dim, 1)
+        nn.init.normal_(self.local_head.weight, std=0.02)
+        nn.init.zeros_(self.local_head.bias)
+        self.local_loss_kwargs = dict(local_loss_kwargs or {})
+        self.eval_adapter_mode = 'trained'
+        self.last_adapter_debug = {}
+
+        self._freeze_module(self.biomedclip)
+        self._set_requires_grad(self.local_adapter, True)
+        self._set_requires_grad(self.local_head, True)
+
+    def _infer_visual_spec(self, image_size):
+        was_training = self.biomedclip.training
+        self.biomedclip.eval()
+        with torch.no_grad():
+            dummy = torch.zeros(1, 3, image_size, image_size)
+            _, tokens, spatial_shape = self.biomedclip.encode_image_and_patches(dummy)
+        self.biomedclip.train(was_training)
+        if tokens.shape[-1] != self.biomedclip.text_dim:
+            raise ValueError(
+                f'BiomedCLIP patch token dim ({tokens.shape[-1]}) must match text dim '
+                f'({self.biomedclip.text_dim}).'
+            )
+        if spatial_shape[0] != spatial_shape[1]:
+            raise ValueError(f'CSSD requires a square patch grid, got {spatial_shape}.')
+        return int(tokens.shape[-1]), int(spatial_shape[0])
+
+    def _freeze_module(self, module):
+        module.eval()
+        for param in module.parameters():
+            param.requires_grad = False
+
+    def _set_requires_grad(self, module, requires_grad):
+        for param in module.parameters():
+            if param.is_floating_point() or param.is_complex():
+                param.requires_grad = requires_grad
+
+    def train(self, mode=True):
+        self.training = mode
+        self.biomedclip.eval()
+        self.local_adapter.train(mode)
+        self.local_head.train(mode)
+        return self
+
+    def set_eval_adapter_mode(self, mode):
+        mode = str(mode).lower()
+        if mode not in ('trained', 'bypass', 'random'):
+            raise ValueError(f'Invalid eval_adapter_mode={mode}. Expected trained, bypass, or random.')
+        self.eval_adapter_mode = mode
+
+    def reset_adapter_parameters(self, seed=None):
+        params = list(self.local_adapter.parameters()) + list(self.local_head.parameters())
+        device = params[0].device if params else torch.device('cpu')
+        devices = [device.index] if device.type == 'cuda' and device.index is not None else []
+        with torch.random.fork_rng(devices=devices, enabled=seed is not None):
+            if seed is not None:
+                torch.manual_seed(int(seed))
+                if device.type == 'cuda':
+                    torch.cuda.manual_seed_all(int(seed))
+            self._reset_module_parameters(self.local_adapter)
+            self.local_head.reset_parameters()
+            nn.init.zeros_(self.local_head.bias)
+
+    def _reset_module_parameters(self, module):
+        for child in module.children():
+            self._reset_module_parameters(child)
+        reset = getattr(module, 'reset_parameters', None)
+        if callable(reset):
+            reset()
+
+    def adapter_param_norm(self):
+        total_sq = 0.0
+        total_params = 0
+        for module in [self.local_adapter, self.local_head]:
+            for param in module.parameters():
+                if not param.is_floating_point():
+                    continue
+                value = param.detach().float()
+                total_sq += float(torch.sum(value * value).cpu())
+                total_params += value.numel()
+        return math.sqrt(total_sq), total_params
+
+    def _foreground_masks(self, imgs, target_shape):
+        cfg = self.local_loss_kwargs
+        threshold = float(cfg.get('foreground_threshold', 8.0 / 255.0))
+        input_mean = self.biomedclip.input_mean.to(device=imgs.device, dtype=imgs.dtype)
+        input_std = self.biomedclip.input_std.to(device=imgs.device, dtype=imgs.dtype)
+        imgs_01 = (imgs * input_std + input_mean).clamp(0.0, 1.0)
+        foreground = imgs_01.max(dim=1, keepdim=True).values > threshold
+        if foreground.shape[-2:] != target_shape:
+            foreground = F.interpolate(foreground.float(), size=target_shape, mode='nearest') > 0.5
+        erode_iters = int(cfg.get('foreground_erode_iters', 1))
+        interior = foreground.float()
+        for _ in range(max(erode_iters, 0)):
+            interior = 1.0 - F.max_pool2d(1.0 - interior, kernel_size=3, stride=1, padding=1)
+        interior = interior > 0.5
+        edge = foreground & ~interior
+        background = ~foreground
+        return foreground, interior, edge, background
+
+    def _masked_softplus_mean(self, logits, mask):
+        mask = mask.to(dtype=logits.dtype)
+        denom = mask.sum().clamp_min(1.0)
+        return (F.softplus(logits) * mask).sum() / denom
+
+    def _masked_topk_softplus(self, logits, mask, ratio):
+        bsz = logits.shape[0]
+        flat_logits = logits.flatten(1)
+        flat_mask = mask.flatten(1).bool()
+        losses = []
+        for idx in range(bsz):
+            values = flat_logits[idx][flat_mask[idx]]
+            if values.numel() == 0:
+                values = flat_logits[idx]
+            k = max(1, int(values.numel() * float(ratio)))
+            losses.append(F.softplus(values.topk(k).values).mean())
+        return torch.stack(losses).mean()
+
+    def _localization_losses(self, logits, imgs):
+        cfg = self.local_loss_kwargs
+        foreground, _, edge, background = self._foreground_masks(imgs, logits.shape[-2:])
+        topk_ratio = float(cfg.get('normal_topk_ratio', 0.01))
+        normal_topk = self._masked_topk_softplus(logits, foreground, topk_ratio)
+        background_loss = self._masked_softplus_mean(logits, background)
+        edge_loss = self._masked_softplus_mean(logits, edge)
+        weights = {
+            'normal_topk': float(cfg.get('normal_topk_loss_weight', 0.1)),
+            'background': float(cfg.get('background_loss_weight', 0.05)),
+            'edge': float(cfg.get('edge_loss_weight', 0.05)),
+        }
+        total = (
+            weights['normal_topk'] * normal_topk
+            + weights['background'] * background_loss
+            + weights['edge'] * edge_loss
+        )
+        return {
+            'total': total,
+            'loss_total': total,
+            'loss_normal_topk': normal_topk,
+            'loss_background': background_loss,
+            'loss_edge': edge_loss,
+            'loss_normal_topk_weighted': weights['normal_topk'] * normal_topk,
+            'loss_background_weighted': weights['background'] * background_loss,
+            'loss_edge_weighted': weights['edge'] * edge_loss,
+            'foreground_ratio': foreground.float().mean().detach(),
+            'edge_ratio': edge.float().mean().detach(),
+            'background_ratio': background.float().mean().detach(),
+        }
+
+    def _adapter_logits(self, tokens, spatial_shape, image_shape, t_norm=None, t_abn=None):
+        if self.eval_adapter_mode == 'bypass':
+            if t_norm is None or t_abn is None:
+                raise RuntimeError('bypass mode requires text priors for normal_minus_abnormal map.')
+            sim_normal = torch.einsum('bld,bd->bl', tokens, F.normalize(t_norm, p=2, dim=-1))
+            sim_abnormal = torch.einsum('bld,bd->bl', tokens, F.normalize(t_abn, p=2, dim=-1))
+            patch_logits = sim_normal - sim_abnormal
+            refined = tokens
+        else:
+            refined = self.local_adapter(tokens, None, spatial_shape)
+            patch_logits = self.local_head(refined).squeeze(-1)
+
+        height, width = spatial_shape
+        logits = patch_logits.view(patch_logits.shape[0], height, width)
+        logits = F.interpolate(
+            logits.unsqueeze(1),
+            size=image_shape,
+            mode='bilinear',
+            align_corners=False,
+        )
+        with torch.no_grad():
+            delta = (refined.detach() - tokens.detach()).float()
+            raw = tokens.detach().float()
+            refined_detached = refined.detach().float()
+            self.last_adapter_debug = {
+                'adapter_feature_delta_l2': delta.pow(2).sum(dim=-1).sqrt().mean(dim=1),
+                'adapter_feature_delta_abs': delta.abs().mean(dim=(1, 2)),
+                'adapter_raw_l2': raw.pow(2).sum(dim=-1).sqrt().mean(dim=1),
+                'adapter_refined_l2': refined_detached.pow(2).sum(dim=-1).sqrt().mean(dim=1),
+            }
+        return logits.squeeze(1)
+
+    def forward(
+            self,
+            imgs,
+            cls_names=None,
+            score_cls_names=None,
+            adapter_cls_names=None,
+            return_anomaly_map=False,
+            compute_label_free=True,
+    ):
+        del adapter_cls_names
+        if score_cls_names is None:
+            score_cls_names = cls_names
+        if self.training and self.eval_adapter_mode != 'trained':
+            raise RuntimeError('eval_adapter_mode is only for test/eval; use trained mode during training.')
+
+        with torch.no_grad():
+            image_features, tokens, spatial_shape = self.biomedclip.encode_image_and_patches(imgs)
+            t_norm, t_abn = self.biomedclip.encode_text_pairs(
+                score_cls_names,
+                batch_size=imgs.shape[0],
+                device=imgs.device,
+            )
+            image_score = torch.sum(image_features * t_abn, dim=1) - torch.sum(image_features * t_norm, dim=1)
+
+        anomaly_map = self._adapter_logits(
+            tokens.detach(),
+            spatial_shape,
+            (imgs.shape[2], imgs.shape[3]),
+            t_norm=t_norm,
+            t_abn=t_abn,
+        )
+
+        if self.training:
+            if not compute_label_free:
+                return {
+                    'anomaly_map': anomaly_map,
+                    'image_score': image_score.detach(),
+                }
+            out = self._localization_losses(anomaly_map.unsqueeze(1), imgs)
+            if return_anomaly_map:
+                out.update(anomaly_map=anomaly_map, image_score=image_score.detach())
+            return out
+
+        return anomaly_map, image_score.detach()
+
+
 class MAMBAADZeroShot(nn.Module):
     def __init__(self, model_t, model_s, biomedclip_model_name, prompt_normal, prompt_abnormal, image_size=256,
                  adaptive_mc_kwargs=None, class_prompt_template='A medical image of {class_name}', class_prompts=None,
-                 image_score_topk_ratio=0.01):
+                 image_score_topk_ratio=0.01, anomaly_score_direction='normal_minus_abnormal'):
         super().__init__()
         self.visual_encoder = FrozenVisualSequenceEncoder(get_model(model_t))
         self.text_encoder = FrozenBiomedTextEncoder(
@@ -983,6 +1430,7 @@ class MAMBAADZeroShot(nn.Module):
         )
         self.label_free_loss = AdaptiveMCLoss(**(adaptive_mc_kwargs or {}))
         self.image_score_topk_ratio = image_score_topk_ratio
+        self.anomaly_score_direction = self._normalize_anomaly_score_direction(anomaly_score_direction)
         self.eval_adapter_mode = 'trained'
         self.last_adapter_debug = {}
 
@@ -1009,6 +1457,23 @@ class MAMBAADZeroShot(nn.Module):
             # 只有浮点数或复数才允许开启梯度求导，跳过底层的整数索引(LongTensor)
             if param.is_floating_point() or param.is_complex():
                 param.requires_grad = requires_grad
+
+    def _normalize_anomaly_score_direction(self, direction):
+        direction = str(direction).lower()
+        aliases = {
+            'normal_minus_abnormal': 'normal_minus_abnormal',
+            'normal-abnormal': 'normal_minus_abnormal',
+            'normal_abnormal': 'normal_minus_abnormal',
+            'abnormal_minus_normal': 'abnormal_minus_normal',
+            'abnormal-normal': 'abnormal_minus_normal',
+            'abnormal_normal': 'abnormal_minus_normal',
+        }
+        if direction not in aliases:
+            raise ValueError(
+                f'Invalid anomaly_score_direction={direction}. '
+                'Expected normal_minus_abnormal or abnormal_minus_normal.'
+            )
+        return aliases[direction]
 
     def set_eval_adapter_mode(self, mode):
         mode = str(mode).lower()
@@ -1056,10 +1521,12 @@ class MAMBAADZeroShot(nn.Module):
         v_refined = F.normalize(v_refined, p=2, dim=-1)
         t_norm = F.normalize(t_norm, p=2, dim=-1)
         t_abn = F.normalize(t_abn, p=2, dim=-1)
-        # Cross-domain medical validation showed pixel scores were inversely
-        # correlated with anomaly masks, so high anomaly response is defined as
-        # being closer to the normal prompt than the abnormal prompt.
-        scores = torch.einsum('bld,bd->bl', v_refined, t_norm) - torch.einsum('bld,bd->bl', v_refined, t_abn)
+        sim_normal = torch.einsum('bld,bd->bl', v_refined, t_norm)
+        sim_abnormal = torch.einsum('bld,bd->bl', v_refined, t_abn)
+        if self.anomaly_score_direction == 'abnormal_minus_normal':
+            scores = sim_abnormal - sim_normal
+        else:
+            scores = sim_normal - sim_abnormal
         height, width = spatial_shape
         anomaly_map = scores.view(scores.shape[0], height, width)
         anomaly_map = F.interpolate(
@@ -1076,15 +1543,27 @@ class MAMBAADZeroShot(nn.Module):
             image_score = flat_map.topk(topk, dim=1).values.mean(dim=1)
         return anomaly_map, image_score
 
-    def forward(self, imgs, cls_names=None, return_anomaly_map=False, compute_label_free=True):
+    def forward(
+            self,
+            imgs,
+            cls_names=None,
+            score_cls_names=None,
+            adapter_cls_names=None,
+            return_anomaly_map=False,
+            compute_label_free=True,
+    ):
+        if score_cls_names is None:
+            score_cls_names = cls_names
+        if adapter_cls_names is None:
+            adapter_cls_names = cls_names
         with torch.no_grad():
             v_raw, spatial_shape, _ = self.visual_encoder(imgs)
-            t_norm, t_abn = self.text_encoder(cls_names, batch_size=imgs.shape[0])
+            t_norm, t_abn = self.text_encoder(score_cls_names, batch_size=imgs.shape[0])
             # Frozen BiomedCLIP semantics are the only condition vector used by
             # AdaLN. This keeps semantic conditioning aligned with medical
             # language priors instead of source-domain learned embeddings.
             semantic_embedding = self.text_encoder.encode_class_prompts(
-                cls_names=cls_names,
+                cls_names=adapter_cls_names,
                 batch_size=imgs.shape[0],
                 device=imgs.device,
             )
@@ -1160,6 +1639,12 @@ class MAMBAADZeroShot(nn.Module):
             spatial_shape,
             (imgs.shape[2], imgs.shape[3]),
         )
+
+
+@MODEL.register_module
+def mambaad_biomedclip_local_adapter(pretrained=False, **kwargs):
+    model = MAMBAADBiomedCLIPLocalAdapter(**kwargs)
+    return model
 
 
 @MODEL.register_module

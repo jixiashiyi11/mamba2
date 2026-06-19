@@ -31,6 +31,7 @@ class AdaptiveMCLoss(nn.Module):
             score_topk_ratio=0.1,
             score_temperature=0.1,
             score_target=0.0,
+            anomaly_score_direction='normal_minus_abnormal',
             eps=1e-6,
             m_base=None,
             mil_topk_ratio=None,
@@ -46,7 +47,25 @@ class AdaptiveMCLoss(nn.Module):
         self.score_topk_ratio = score_topk_ratio if mil_topk_ratio is None else mil_topk_ratio
         self.score_temperature = score_temperature
         self.score_target = score_target
+        self.anomaly_score_direction = self._normalize_anomaly_score_direction(anomaly_score_direction)
         self.eps = eps
+
+    def _normalize_anomaly_score_direction(self, direction):
+        direction = str(direction).lower()
+        aliases = {
+            'normal_minus_abnormal': 'normal_minus_abnormal',
+            'normal-abnormal': 'normal_minus_abnormal',
+            'normal_abnormal': 'normal_minus_abnormal',
+            'abnormal_minus_normal': 'abnormal_minus_normal',
+            'abnormal-normal': 'abnormal_minus_normal',
+            'abnormal_normal': 'abnormal_minus_normal',
+        }
+        if direction not in aliases:
+            raise ValueError(
+                f'Invalid anomaly_score_direction={direction}. '
+                'Expected normal_minus_abnormal or abnormal_minus_normal.'
+            )
+        return aliases[direction]
 
     def forward(self, v_refined, v_raw, t_norm, t_abn, f_global=None):
         """
@@ -93,10 +112,12 @@ class AdaptiveMCLoss(nn.Module):
         raw_tokens = F.normalize(v_raw.detach(), p=2, dim=-1, eps=self.eps)
         loss_token_consistency = 1.0 - torch.sum(refined_tokens * raw_tokens, dim=-1).mean()
 
-        token_scores = (
-                torch.sum(refined_tokens * t_norm.unsqueeze(1), dim=-1)
-                - torch.sum(refined_tokens * t_abn.unsqueeze(1), dim=-1)
-        )
+        token_sim_normal = torch.sum(refined_tokens * t_norm.unsqueeze(1), dim=-1)
+        token_sim_abnormal = torch.sum(refined_tokens * t_abn.unsqueeze(1), dim=-1)
+        if self.anomaly_score_direction == 'abnormal_minus_normal':
+            token_scores = token_sim_abnormal - token_sim_normal
+        else:
+            token_scores = token_sim_normal - token_sim_abnormal
         loss_score_separation = self._normal_score_suppression(token_scores)
 
         total_loss = (

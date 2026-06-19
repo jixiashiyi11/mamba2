@@ -47,6 +47,9 @@ class cfg_common(Namespace):
 		self.eval_adapter_mode = 'trained'
 		self.eval_random_adapter_seed = 123
 		self.eval_force_cls_name = None
+		self.adapter_cls_name = None
+		self.fixed_adapter_cls_name = None
+		self.anomaly_score_direction = 'normal_minus_abnormal'
 
 		self.synthetic_local_anomaly = Namespace()
 		self.synthetic_local_anomaly.enabled = False
@@ -60,6 +63,12 @@ class cfg_common(Namespace):
 		self.synthetic_local_anomaly.noise_std = 0.18
 		self.synthetic_local_anomaly.intensity_delta = 0.35
 		self.synthetic_local_anomaly.foreground_threshold = 5.0 / 255.0
+		self.synthetic_local_anomaly.lesion_mode = 'ellipse'
+		self.synthetic_local_anomaly.foreground_erode_iters = 0
+		self.synthetic_local_anomaly.num_blobs_min = 1
+		self.synthetic_local_anomaly.num_blobs_max = 1
+		self.synthetic_local_anomaly.soft_edge_power = 1.5
+		self.synthetic_local_anomaly.soft_mask_threshold = 0.03
 
 		# ==> optim
 		self.optim = Namespace()

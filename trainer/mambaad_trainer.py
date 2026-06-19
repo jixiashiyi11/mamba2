@@ -483,6 +483,36 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
                 positives.append(int(final_masks_np[idx].sum()))
         return positives
 
+    def _expand_cls_name_like_batch(self, cls_name, batch_size):
+        if cls_name is None:
+            return None
+        if isinstance(cls_name, (list, tuple, np.ndarray)):
+            if len(cls_name) == batch_size:
+                return list(cls_name)
+            if len(cls_name) == 1:
+                return [str(cls_name[0])] * batch_size
+            raise ValueError(f'Expected 1 or {batch_size} class names, got {len(cls_name)}.')
+        return [str(cls_name)] * batch_size
+
+    def _get_model_cls_names(self):
+        score_cls_names = self.cls_name
+        force_cls_name = getattr(self.cfg, 'eval_force_cls_name', None)
+        if not self.net.training and force_cls_name:
+            score_cls_names = force_cls_name
+
+        adapter_cls_name = getattr(self.cfg, 'adapter_cls_name', None)
+        if adapter_cls_name is None:
+            adapter_cls_name = getattr(self.cfg, 'fixed_adapter_cls_name', None)
+        if adapter_cls_name is None:
+            adapter_cls_names = score_cls_names
+        else:
+            adapter_cls_names = adapter_cls_name
+
+        return (
+            self._expand_cls_name_like_batch(score_cls_names, self.bs),
+            self._expand_cls_name_like_batch(adapter_cls_names, self.bs),
+        )
+
     def set_input(self, inputs):
         self.imgs = inputs['img'].cuda()
         self.imgs_mask = inputs['img_mask'].cuda()
@@ -515,21 +545,20 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
             )
 
     def forward(self):
-        cls_name_for_model = self.cls_name
-        force_cls_name = getattr(self.cfg, 'eval_force_cls_name', None)
-        if not self.net.training and force_cls_name:
-            if isinstance(self.cls_name, (list, tuple)):
-                cls_name_for_model = [str(force_cls_name)] * len(self.cls_name)
-            else:
-                cls_name_for_model = str(force_cls_name)
+        score_cls_names, adapter_cls_names = self._get_model_cls_names()
         if self.net.training:
-            self.loss_dict = self.net(self.imgs, cls_names=cls_name_for_model)
+            self.loss_dict = self.net(
+                self.imgs,
+                cls_names=score_cls_names,
+                adapter_cls_names=adapter_cls_names,
+            )
             synthetic_cfg = getattr(self.cfg, 'synthetic_local_anomaly', None)
             if synthetic_cfg is not None and bool(getattr(synthetic_cfg, 'enabled', False)):
                 synth_imgs, synth_masks = self._make_synthetic_local_anomaly_batch(synthetic_cfg)
                 synth_out = self.net(
                     synth_imgs,
-                    cls_names=cls_name_for_model,
+                    cls_names=score_cls_names,
+                    adapter_cls_names=adapter_cls_names,
                     return_anomaly_map=True,
                     compute_label_free=False,
                 )
@@ -543,7 +572,11 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
                 self.loss_dict['loss_total'] = self.loss_dict['total']
             self.total_loss = self.loss_dict['total']
         else:
-            self.anomaly_map, self.image_score = self.net(self.imgs, cls_names=cls_name_for_model)
+            self.anomaly_map, self.image_score = self.net(
+                self.imgs,
+                cls_names=score_cls_names,
+                adapter_cls_names=adapter_cls_names,
+            )
 
     def _make_synthetic_local_anomaly_batch(self, synthetic_cfg):
         imgs = self.imgs
@@ -555,6 +588,14 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
         imgs_01 = (imgs * std + mean).clamp(0.0, 1.0)
         fg_threshold = float(getattr(synthetic_cfg, 'foreground_threshold', 5.0 / 255.0))
         foreground = (imgs_01.max(dim=1, keepdim=True).values > fg_threshold)
+        lesion_mode = str(getattr(synthetic_cfg, 'lesion_mode', 'ellipse')).lower()
+        candidate_foreground = foreground
+        erode_iters = int(getattr(synthetic_cfg, 'foreground_erode_iters', 0))
+        if lesion_mode == 'soft_brain' and erode_iters > 0:
+            candidate = foreground.to(dtype=dtype)
+            for _ in range(erode_iters):
+                candidate = 1.0 - F.max_pool2d(1.0 - candidate, kernel_size=3, stride=1, padding=1)
+            candidate_foreground = candidate > 0.5
         masks = torch.zeros((batch_size, 1, height, width), device=device, dtype=dtype)
         yy, xx = torch.meshgrid(
             torch.arange(height, device=device, dtype=dtype),
@@ -567,7 +608,9 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
         for idx in range(batch_size):
             if torch.rand((), device=device) > prob:
                 continue
-            fg_idx = torch.nonzero(foreground[idx, 0], as_tuple=False)
+            fg_idx = torch.nonzero(candidate_foreground[idx, 0], as_tuple=False)
+            if fg_idx.numel() == 0:
+                fg_idx = torch.nonzero(foreground[idx, 0], as_tuple=False)
             if fg_idx.numel() > 0:
                 center = fg_idx[torch.randint(fg_idx.shape[0], (1,), device=device).item()]
                 cy = center[0].to(dtype)
@@ -575,15 +618,40 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
             else:
                 cy = torch.randint(height, (1,), device=device).to(dtype)[0]
                 cx = torch.randint(width, (1,), device=device).to(dtype)[0]
-            area_ratio = min_area + (max_area - min_area) * float(torch.rand((), device=device))
-            radius_base = math.sqrt(max(area_ratio, 1e-6)) * min(height, width)
-            ry = radius_base * (0.55 + 0.9 * float(torch.rand((), device=device)))
-            rx = radius_base * (0.55 + 0.9 * float(torch.rand((), device=device)))
-            ellipse = (((yy - cy) / max(ry, 1.0)) ** 2 + ((xx - cx) / max(rx, 1.0)) ** 2) <= 1.0
-            blob = ellipse & foreground[idx, 0]
-            if int(blob.sum().detach().cpu()) < 8:
-                blob = ellipse
-            masks[idx, 0] = blob.to(dtype)
+            if lesion_mode == 'soft_brain':
+                num_blobs_min = max(1, int(getattr(synthetic_cfg, 'num_blobs_min', 1)))
+                num_blobs_max = max(num_blobs_min, int(getattr(synthetic_cfg, 'num_blobs_max', num_blobs_min)))
+                num_blobs = int(torch.randint(num_blobs_min, num_blobs_max + 1, (1,), device=device).item())
+                sample_mask = torch.zeros((height, width), device=device, dtype=dtype)
+                for _ in range(num_blobs):
+                    if fg_idx.numel() > 0:
+                        center = fg_idx[torch.randint(fg_idx.shape[0], (1,), device=device).item()]
+                        cy = center[0].to(dtype)
+                        cx = center[1].to(dtype)
+                    area_ratio = min_area + (max_area - min_area) * float(torch.rand((), device=device))
+                    radius_base = math.sqrt(max(area_ratio, 1e-6)) * min(height, width)
+                    sy = max(radius_base * (0.35 + 0.45 * float(torch.rand((), device=device))), 1.0)
+                    sx = max(radius_base * (0.35 + 0.45 * float(torch.rand((), device=device))), 1.0)
+                    soft_blob = torch.exp(-0.5 * (((yy - cy) / sy) ** 2 + ((xx - cx) / sx) ** 2))
+                    sample_mask = torch.maximum(sample_mask, soft_blob)
+                soft_edge_power = max(float(getattr(synthetic_cfg, 'soft_edge_power', 1.5)), 0.1)
+                soft_threshold = max(float(getattr(synthetic_cfg, 'soft_mask_threshold', 0.03)), 0.0)
+                sample_mask = sample_mask.pow(soft_edge_power) * foreground[idx, 0].to(dtype=dtype)
+                if soft_threshold > 0:
+                    sample_mask = torch.where(sample_mask >= soft_threshold, sample_mask, torch.zeros_like(sample_mask))
+                if int((sample_mask > 0).sum().detach().cpu()) < 8:
+                    sample_mask = sample_mask + 0.0
+                masks[idx, 0] = sample_mask.clamp(0.0, 1.0)
+            else:
+                area_ratio = min_area + (max_area - min_area) * float(torch.rand((), device=device))
+                radius_base = math.sqrt(max(area_ratio, 1e-6)) * min(height, width)
+                ry = radius_base * (0.55 + 0.9 * float(torch.rand((), device=device)))
+                rx = radius_base * (0.55 + 0.9 * float(torch.rand((), device=device)))
+                ellipse = (((yy - cy) / max(ry, 1.0)) ** 2 + ((xx - cx) / max(rx, 1.0)) ** 2) <= 1.0
+                blob = ellipse & foreground[idx, 0]
+                if int(blob.sum().detach().cpu()) < 8:
+                    blob = ellipse
+                masks[idx, 0] = blob.to(dtype)
 
         noise_std = float(getattr(synthetic_cfg, 'noise_std', 0.18))
         intensity_delta = float(getattr(synthetic_cfg, 'intensity_delta', 0.35))
@@ -657,6 +725,15 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
                 'loss_synthetic_bce',
                 'loss_synthetic_dice',
                 'synthetic_mask_ratio',
+                'loss_normal_topk',
+                'loss_background',
+                'loss_edge',
+                'loss_normal_topk_weighted',
+                'loss_background_weighted',
+                'loss_edge_weighted',
+                'foreground_ratio',
+                'edge_ratio',
+                'background_ratio',
             ]
             debug_vals = {
                 name: float(self.loss_dict[name].detach().cpu())
@@ -678,7 +755,12 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
         self.reset(isTrain=False)
         force_cls_name = getattr(self.cfg, 'eval_force_cls_name', None)
         if self.master and force_cls_name:
-            log_msg(self.logger, f'==> EvalForceClsName model_cls_name={force_cls_name} metric_cls_names=original')
+            log_msg(self.logger, f'==> EvalForceClsName score_cls_name={force_cls_name} metric_cls_names=original')
+        adapter_cls_name = getattr(self.cfg, 'adapter_cls_name', None)
+        if adapter_cls_name is None:
+            adapter_cls_name = getattr(self.cfg, 'fixed_adapter_cls_name', None)
+        if self.master and adapter_cls_name:
+            log_msg(self.logger, f'==> FixedAdapterClsName adapter_cls_name={adapter_cls_name}')
         imgs_masks, anomaly_maps, image_scores, cls_names, anomalys = [], [], [], [], []
         foreground_masks = []
         adapter_debug_results = {

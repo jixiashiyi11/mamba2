@@ -1,0 +1,118 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="900" viewBox="0 0 1500 900">
+  <defs>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#334155"/>
+    </marker>
+    <style>
+      .title { font: 700 34px Arial, Helvetica, sans-serif; fill: #0f172a; }
+      .subtitle { font: 400 18px Arial, Helvetica, sans-serif; fill: #475569; }
+      .section { font: 700 22px Arial, Helvetica, sans-serif; fill: #0f172a; }
+      .box-title { font: 700 20px Arial, Helvetica, sans-serif; fill: #0f172a; }
+      .box-text { font: 400 16px Arial, Helvetica, sans-serif; fill: #334155; }
+      .small { font: 400 14px Arial, Helvetica, sans-serif; fill: #475569; }
+      .formula { font: 700 17px Arial, Helvetica, sans-serif; fill: #0f172a; }
+      .arrow { stroke: #334155; stroke-width: 2.4; fill: none; marker-end: url(#arrow); }
+      .dash { stroke: #64748b; stroke-width: 2; fill: none; stroke-dasharray: 8 6; marker-end: url(#arrow); }
+      .frozen { fill: #e0f2fe; stroke: #0284c7; stroke-width: 2; }
+      .adapter { fill: #fef3c7; stroke: #d97706; stroke-width: 2; }
+      .output { fill: #dcfce7; stroke: #16a34a; stroke-width: 2; }
+      .loss { fill: #fee2e2; stroke: #dc2626; stroke-width: 2; }
+      .input { fill: #f1f5f9; stroke: #64748b; stroke-width: 2; }
+      .note { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 1.6; }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="1500" height="900" fill="#ffffff"/>
+
+  <text x="60" y="62" class="title">BiomedCLIP Patch Localization Adapter Overview</text>
+  <text x="60" y="95" class="subtitle">Decoupled design: BiomedCLIP handles image-level scoring, the adapter handles pixel-level lesion localization.</text>
+
+  <rect x="55" y="125" width="1390" height="705" rx="18" fill="#ffffff" stroke="#e2e8f0" stroke-width="2"/>
+
+  <!-- Input -->
+  <rect x="95" y="220" width="210" height="120" rx="12" class="input"/>
+  <text x="125" y="260" class="box-title">Input Image</text>
+  <text x="125" y="292" class="box-text">medical image</text>
+  <text x="125" y="318" class="small">brain / liver / retinal</text>
+
+  <!-- BiomedCLIP image encoder -->
+  <rect x="385" y="180" width="285" height="185" rx="12" class="frozen"/>
+  <text x="420" y="225" class="box-title">Frozen BiomedCLIP</text>
+  <text x="420" y="254" class="box-title">Image Encoder</text>
+  <text x="420" y="292" class="box-text">global image embedding</text>
+  <text x="420" y="320" class="box-text">patch tokens</text>
+  <text x="420" y="345" class="small">frozen, no target-organ training</text>
+
+  <path d="M305 280 C335 280, 350 280, 385 280" class="arrow"/>
+
+  <!-- Branch labels -->
+  <text x="725" y="170" class="section">Image-Level Branch</text>
+  <text x="725" y="545" class="section">Pixel-Level Branch</text>
+
+  <!-- Text encoder -->
+  <rect x="740" y="205" width="270" height="145" rx="12" class="frozen"/>
+  <text x="770" y="246" class="box-title">Frozen BiomedCLIP</text>
+  <text x="770" y="275" class="box-title">Text Encoder</text>
+  <text x="770" y="310" class="box-text">normal prompt</text>
+  <text x="770" y="335" class="box-text">abnormal prompt</text>
+
+  <!-- Global score -->
+  <rect x="1095" y="205" width="285" height="145" rx="12" class="output"/>
+  <text x="1125" y="244" class="box-title">Image Score</text>
+  <text x="1125" y="283" class="formula">sim(global, abnormal)</text>
+  <text x="1125" y="310" class="formula">- sim(global, normal)</text>
+  <text x="1125" y="337" class="small">used for image-level AUROC</text>
+
+  <path d="M670 245 C705 245, 710 245, 740 245" class="arrow"/>
+  <path d="M670 315 C855 380, 995 360, 1095 306" class="arrow"/>
+  <path d="M1010 278 C1040 278, 1060 278, 1095 278" class="arrow"/>
+
+  <!-- Adapter branch -->
+  <rect x="740" y="585" width="300" height="160" rx="12" class="adapter"/>
+  <text x="770" y="626" class="box-title">Localization Adapter</text>
+  <text x="770" y="656" class="box-text">Mamba / CSSD refinement</text>
+  <text x="770" y="682" class="box-text">deformable spatial pooling</text>
+  <text x="770" y="708" class="box-text">linear local head</text>
+  <text x="770" y="734" class="small">input: BiomedCLIP patch tokens</text>
+
+  <rect x="1115" y="585" width="265" height="160" rx="12" class="output"/>
+  <text x="1145" y="626" class="box-title">Anomaly Map</text>
+  <text x="1145" y="660" class="box-text">patch anomaly logits</text>
+  <text x="1145" y="687" class="box-text">upsampled to image size</text>
+  <text x="1145" y="716" class="small">used for pixel metrics</text>
+
+  <path d="M670 330 C710 470, 710 635, 740 665" class="arrow"/>
+  <path d="M1040 665 C1070 665, 1085 665, 1115 665" class="arrow"/>
+
+  <!-- Training losses -->
+  <rect x="95" y="575" width="245" height="170" rx="12" class="loss"/>
+  <text x="125" y="616" class="box-title">Training Signals</text>
+  <text x="125" y="650" class="box-text">normal-only images</text>
+  <text x="125" y="676" class="box-text">synthetic local lesions</text>
+  <text x="125" y="702" class="box-text">synthetic lesion mask</text>
+  <text x="125" y="730" class="small">no real anomaly masks in training</text>
+
+  <rect x="395" y="575" width="255" height="170" rx="12" class="loss"/>
+  <text x="425" y="616" class="box-title">Localization Loss</text>
+  <text x="425" y="650" class="box-text">BCE + Dice on synthetic mask</text>
+  <text x="425" y="676" class="box-text">foreground top-k suppression</text>
+  <text x="425" y="702" class="box-text">background suppression</text>
+  <text x="425" y="728" class="box-text">organ-edge suppression</text>
+
+  <path d="M340 660 C365 660, 370 660, 395 660" class="arrow"/>
+  <path d="M650 660 C690 660, 700 660, 740 660" class="dash"/>
+
+  <!-- Explanation note -->
+  <rect x="95" y="390" width="555" height="120" rx="12" class="note"/>
+  <text x="125" y="430" class="box-title">Key Idea</text>
+  <text x="125" y="463" class="box-text">BiomedCLIP tells whether the image is abnormal.</text>
+  <text x="125" y="491" class="box-text">The adapter tells where the abnormality is.</text>
+
+  <rect x="740" y="390" width="640" height="120" rx="12" class="note"/>
+  <text x="770" y="430" class="box-title">Why Decouple?</text>
+  <text x="770" y="463" class="box-text">Global image-text similarity is useful for classification.</text>
+  <text x="770" y="491" class="box-text">Raw patch localization is noisy, so the adapter cleans the heatmap.</text>
+
+  <!-- Footer -->
+  <text x="60" y="865" class="small">Frozen modules: BiomedCLIP image/text encoders. Trainable module: localization adapter + local head. Output: image score + anomaly map.</text>
+</svg>

@@ -69,6 +69,11 @@ class cfg_common(Namespace):
 		self.synthetic_local_anomaly.num_blobs_max = 1
 		self.synthetic_local_anomaly.soft_edge_power = 1.5
 		self.synthetic_local_anomaly.soft_mask_threshold = 0.03
+		self.synthetic_local_anomaly.wavelet_mix_prob = 0.5
+		self.synthetic_local_anomaly.wavelet_ll_delta = 0.12
+		self.synthetic_local_anomaly.wavelet_edge_noise = 0.06
+		self.synthetic_local_anomaly.wavelet_texture_noise = 0.05
+		self.synthetic_local_anomaly.wavelet_texture_attenuation = 0.15
 
 		# ==> optim
 		self.optim = Namespace()

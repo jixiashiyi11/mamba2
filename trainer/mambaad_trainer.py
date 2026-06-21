@@ -653,6 +653,26 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
                     blob = ellipse
                 masks[idx, 0] = blob.to(dtype)
 
+        if lesion_mode == 'wavelet':
+            synth_01 = self._apply_wavelet_synthetic_lesion(imgs_01, masks, synthetic_cfg)
+        elif lesion_mode == 'mixed_wavelet':
+            spatial_01 = self._apply_spatial_synthetic_lesion(imgs_01, masks, synthetic_cfg)
+            wavelet_01 = self._apply_wavelet_synthetic_lesion(imgs_01, masks, synthetic_cfg)
+            mix_prob = float(getattr(synthetic_cfg, 'wavelet_mix_prob', 0.5))
+            use_wavelet = (
+                torch.rand((batch_size, 1, 1, 1), device=device, dtype=dtype)
+                < max(0.0, min(1.0, mix_prob))
+            )
+            synth_01 = torch.where(use_wavelet, wavelet_01, spatial_01)
+        else:
+            synth_01 = self._apply_spatial_synthetic_lesion(imgs_01, masks, synthetic_cfg)
+        synth_imgs = (synth_01 - mean) / std
+        return synth_imgs, masks
+
+    def _apply_spatial_synthetic_lesion(self, imgs_01, masks, synthetic_cfg):
+        batch_size = imgs_01.shape[0]
+        device = imgs_01.device
+        dtype = imgs_01.dtype
         noise_std = float(getattr(synthetic_cfg, 'noise_std', 0.18))
         intensity_delta = float(getattr(synthetic_cfg, 'intensity_delta', 0.35))
         noise = torch.randn_like(imgs_01) * noise_std
@@ -663,9 +683,66 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
         )
         channel_scale = 0.5 + torch.rand((batch_size, 3, 1, 1), device=device, dtype=dtype)
         perturb = signs * intensity_delta * channel_scale + noise
-        synth_01 = (imgs_01 + masks * perturb).clamp(0.0, 1.0)
-        synth_imgs = (synth_01 - mean) / std
-        return synth_imgs, masks
+        return (imgs_01 + masks * perturb).clamp(0.0, 1.0)
+
+    def _haar_kernels(self, device, dtype):
+        base = torch.tensor(
+            [
+                [[0.5, 0.5], [0.5, 0.5]],
+                [[0.5, 0.5], [-0.5, -0.5]],
+                [[0.5, -0.5], [0.5, -0.5]],
+                [[0.5, -0.5], [-0.5, 0.5]],
+            ],
+            device=device,
+            dtype=dtype,
+        )
+        return base[:, None, :, :]
+
+    def _haar_dwt(self, imgs):
+        batch_size, channels, height, width = imgs.shape
+        if height % 2 != 0 or width % 2 != 0:
+            imgs = F.pad(imgs, (0, width % 2, 0, height % 2), mode='replicate')
+        kernels = self._haar_kernels(imgs.device, imgs.dtype).repeat(channels, 1, 1, 1)
+        coeffs = F.conv2d(imgs, kernels, stride=2, groups=channels)
+        return coeffs.view(batch_size, channels, 4, coeffs.shape[-2], coeffs.shape[-1])
+
+    def _haar_idwt(self, coeffs, output_size):
+        batch_size, channels, _, _, _ = coeffs.shape
+        kernels = self._haar_kernels(coeffs.device, coeffs.dtype).repeat(channels, 1, 1, 1)
+        coeffs = coeffs.view(batch_size, channels * 4, coeffs.shape[-2], coeffs.shape[-1])
+        imgs = F.conv_transpose2d(coeffs, kernels, stride=2, groups=channels)
+        return imgs[..., :output_size[0], :output_size[1]]
+
+    def _apply_wavelet_synthetic_lesion(self, imgs_01, masks, synthetic_cfg):
+        batch_size, channels, height, width = imgs_01.shape
+        device = imgs_01.device
+        dtype = imgs_01.dtype
+        coeffs = self._haar_dwt(imgs_01)
+        mask_low = F.avg_pool2d(masks, kernel_size=2, stride=2, ceil_mode=True).clamp(0.0, 1.0)
+        if mask_low.shape[-2:] != coeffs.shape[-2:]:
+            mask_low = F.interpolate(mask_low, size=coeffs.shape[-2:], mode='bilinear', align_corners=False)
+        mask_low = mask_low.unsqueeze(2)
+
+        signs = torch.where(
+            torch.rand((batch_size, 1, 1, 1, 1), device=device, dtype=dtype) > 0.5,
+            torch.ones((batch_size, 1, 1, 1, 1), device=device, dtype=dtype),
+            -torch.ones((batch_size, 1, 1, 1, 1), device=device, dtype=dtype),
+        )
+        channel_scale = 0.5 + torch.rand((batch_size, channels, 1, 1, 1), device=device, dtype=dtype)
+        ll_delta = float(getattr(synthetic_cfg, 'wavelet_ll_delta', 0.12))
+        edge_noise = float(getattr(synthetic_cfg, 'wavelet_edge_noise', 0.06))
+        texture_noise = float(getattr(synthetic_cfg, 'wavelet_texture_noise', 0.05))
+        texture_attenuation = float(getattr(synthetic_cfg, 'wavelet_texture_attenuation', 0.15))
+
+        coeffs = coeffs.clone()
+        coeffs[:, :, 0:1] = coeffs[:, :, 0:1] + signs * channel_scale * ll_delta * mask_low
+        coeffs[:, :, 1:3] = coeffs[:, :, 1:3] + torch.randn_like(coeffs[:, :, 1:3]) * edge_noise * mask_low
+        coeffs[:, :, 3:4] = coeffs[:, :, 3:4] * (1.0 - texture_attenuation * mask_low)
+        coeffs[:, :, 3:4] = coeffs[:, :, 3:4] + torch.randn_like(coeffs[:, :, 3:4]) * texture_noise * mask_low
+
+        wavelet_01 = self._haar_idwt(coeffs, (height, width)).clamp(0.0, 1.0)
+        soft_masks = masks.clamp(0.0, 1.0)
+        return (imgs_01 * (1.0 - soft_masks) + wavelet_01 * soft_masks).clamp(0.0, 1.0)
 
     def _synthetic_local_anomaly_loss(self, anomaly_map, synth_masks, synthetic_cfg):
         if anomaly_map.ndim == 3:

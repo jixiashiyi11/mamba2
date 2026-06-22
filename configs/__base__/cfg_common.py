@@ -74,6 +74,12 @@ class cfg_common(Namespace):
 		self.synthetic_local_anomaly.wavelet_edge_noise = 0.06
 		self.synthetic_local_anomaly.wavelet_texture_noise = 0.05
 		self.synthetic_local_anomaly.wavelet_texture_attenuation = 0.15
+		self.synthetic_local_anomaly.outside_suppression_weight = 0.0
+		self.synthetic_local_anomaly.area_sparsity_weight = 0.0
+		self.synthetic_local_anomaly.outside_mask_dilate_iters = 1
+		self.synthetic_local_anomaly.compact_mask_threshold = 0.05
+		self.synthetic_local_anomaly.area_target_multiplier = 1.5
+		self.synthetic_local_anomaly.area_target_slack = 0.005
 
 		# ==> optim
 		self.optim = Namespace()

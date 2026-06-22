@@ -566,6 +566,7 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
                     synth_out['anomaly_map'],
                     synth_masks,
                     synthetic_cfg,
+                    source_imgs=self.imgs,
                 )
                 self.loss_dict.update(synth_losses)
                 self.loss_dict['total'] = self.loss_dict['total'] + synth_losses['loss_synthetic_local_weighted']
@@ -744,7 +745,28 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
         soft_masks = masks.clamp(0.0, 1.0)
         return (imgs_01 * (1.0 - soft_masks) + wavelet_01 * soft_masks).clamp(0.0, 1.0)
 
-    def _synthetic_local_anomaly_loss(self, anomaly_map, synth_masks, synthetic_cfg):
+    def _foreground_mask_for_synthetic_loss(self, source_imgs, target_shape, synthetic_cfg):
+        mean = source_imgs.new_tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        std = source_imgs.new_tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        imgs_01 = (source_imgs * std + mean).clamp(0.0, 1.0)
+        threshold = float(getattr(synthetic_cfg, 'foreground_threshold', 5.0 / 255.0))
+        foreground = imgs_01.max(dim=1, keepdim=True).values > threshold
+        if foreground.shape[-2:] != target_shape:
+            foreground = F.interpolate(foreground.float(), size=target_shape, mode='nearest') > 0.5
+        return foreground
+
+    def _dilate_binary_mask(self, mask, iters):
+        mask = mask.float()
+        for _ in range(max(int(iters), 0)):
+            mask = F.max_pool2d(mask, kernel_size=3, stride=1, padding=1)
+        return mask > 0.5
+
+    def _masked_prob_mean(self, probs, mask):
+        mask = mask.to(dtype=probs.dtype)
+        denom = mask.sum(dim=(1, 2, 3)).clamp_min(1.0)
+        return ((probs * mask).sum(dim=(1, 2, 3)) / denom).mean()
+
+    def _synthetic_local_anomaly_loss(self, anomaly_map, synth_masks, synthetic_cfg, source_imgs=None):
         if anomaly_map.ndim == 3:
             anomaly_map = anomaly_map.unsqueeze(1)
         if synth_masks.shape[-2:] != anomaly_map.shape[-2:]:
@@ -761,13 +783,57 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
         bce_weight = float(getattr(synthetic_cfg, 'bce_weight', 1.0))
         dice_weight = float(getattr(synthetic_cfg, 'dice_weight', 1.0))
         loss_weight = float(getattr(synthetic_cfg, 'loss_weight', 0.1))
-        loss_synthetic = bce_weight * loss_bce + dice_weight * loss_dice
+        outside_weight = float(getattr(synthetic_cfg, 'outside_suppression_weight', 0.0))
+        area_weight = float(getattr(synthetic_cfg, 'area_sparsity_weight', 0.0))
+        loss_outside = logits.new_tensor(0.0)
+        loss_area = logits.new_tensor(0.0)
+        outside_ratio = logits.new_tensor(0.0)
+        foreground_ratio = logits.new_tensor(0.0)
+        pred_area = logits.new_tensor(0.0)
+        target_area = logits.new_tensor(0.0)
+        if source_imgs is not None and (outside_weight > 0.0 or area_weight > 0.0):
+            foreground = self._foreground_mask_for_synthetic_loss(source_imgs, logits.shape[-2:], synthetic_cfg)
+            mask_threshold = float(getattr(synthetic_cfg, 'compact_mask_threshold', 0.05))
+            positive_mask = targets > mask_threshold
+            dilate_iters = int(getattr(synthetic_cfg, 'outside_mask_dilate_iters', 1))
+            protected_mask = self._dilate_binary_mask(positive_mask, dilate_iters)
+            outside_mask = foreground & ~protected_mask
+            loss_outside = self._masked_prob_mean(probs, outside_mask)
+
+            foreground_float = foreground.to(dtype=probs.dtype)
+            foreground_denom = foreground_float.sum(dim=(1, 2, 3)).clamp_min(1.0)
+            pred_area_per_sample = (probs * foreground_float).sum(dim=(1, 2, 3)) / foreground_denom
+            target_area_per_sample = (positive_mask.to(dtype=probs.dtype) * foreground_float).sum(dim=(1, 2, 3)) / foreground_denom
+            area_multiplier = float(getattr(synthetic_cfg, 'area_target_multiplier', 1.5))
+            area_slack = float(getattr(synthetic_cfg, 'area_target_slack', 0.005))
+            allowed_area = (target_area_per_sample * area_multiplier + area_slack).clamp(max=1.0)
+            loss_area = F.relu(pred_area_per_sample - allowed_area).pow(2).mean()
+
+            outside_ratio = outside_mask.float().mean().detach()
+            foreground_ratio = foreground.float().mean().detach()
+            pred_area = pred_area_per_sample.mean().detach()
+            target_area = allowed_area.mean().detach()
+
+        loss_synthetic = (
+            bce_weight * loss_bce
+            + dice_weight * loss_dice
+            + outside_weight * loss_outside
+            + area_weight * loss_area
+        )
         return {
             'loss_synthetic_local': loss_synthetic,
             'loss_synthetic_local_weighted': loss_weight * loss_synthetic,
             'loss_synthetic_bce': loss_bce.detach(),
             'loss_synthetic_dice': loss_dice.detach(),
+            'loss_synthetic_outside': loss_outside.detach(),
+            'loss_synthetic_area': loss_area.detach(),
+            'loss_synthetic_outside_weighted': (outside_weight * loss_outside).detach(),
+            'loss_synthetic_area_weighted': (area_weight * loss_area).detach(),
             'synthetic_mask_ratio': targets.detach().mean(),
+            'synthetic_outside_ratio': outside_ratio,
+            'synthetic_foreground_ratio': foreground_ratio,
+            'synthetic_pred_area': pred_area,
+            'synthetic_target_area': target_area,
         }
 
     def optimize_parameters(self):
@@ -801,7 +867,15 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
                 'loss_synthetic_local',
                 'loss_synthetic_bce',
                 'loss_synthetic_dice',
+                'loss_synthetic_outside',
+                'loss_synthetic_area',
+                'loss_synthetic_outside_weighted',
+                'loss_synthetic_area_weighted',
                 'synthetic_mask_ratio',
+                'synthetic_outside_ratio',
+                'synthetic_foreground_ratio',
+                'synthetic_pred_area',
+                'synthetic_target_area',
                 'loss_normal_topk',
                 'loss_background',
                 'loss_edge',

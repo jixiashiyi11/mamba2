@@ -568,8 +568,14 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
                     synthetic_cfg,
                     source_imgs=self.imgs,
                 )
+                synth_extra_losses = self._synthetic_adapter_aux_losses(synth_out, synth_masks)
                 self.loss_dict.update(synth_losses)
+                self.loss_dict.update(synth_extra_losses)
                 self.loss_dict['total'] = self.loss_dict['total'] + synth_losses['loss_synthetic_local_weighted']
+                if 'loss_synthetic_cssd_image_weighted' in synth_extra_losses:
+                    self.loss_dict['total'] = self.loss_dict['total'] + synth_extra_losses['loss_synthetic_cssd_image_weighted']
+                if 'loss_synthetic_semantic_gate_weighted' in synth_extra_losses:
+                    self.loss_dict['total'] = self.loss_dict['total'] + synth_extra_losses['loss_synthetic_semantic_gate_weighted']
                 self.loss_dict['loss_total'] = self.loss_dict['total']
             self.total_loss = self.loss_dict['total']
         else:
@@ -669,6 +675,36 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
             synth_01 = self._apply_spatial_synthetic_lesion(imgs_01, masks, synthetic_cfg)
         synth_imgs = (synth_01 - mean) / std
         return synth_imgs, masks
+
+    def _synthetic_adapter_aux_losses(self, synth_out, synth_masks):
+        losses = {}
+        model_kwargs = getattr(getattr(self.cfg, 'model', None), 'kwargs', {})
+        image_branch_kwargs = model_kwargs.get('image_branch_kwargs', {}) if isinstance(model_kwargs, dict) else {}
+        text_guidance_kwargs = model_kwargs.get('text_guidance_kwargs', {}) if isinstance(model_kwargs, dict) else {}
+
+        if isinstance(synth_out, dict) and 'cssd_image_score' in synth_out:
+            cssd_image_score = synth_out['cssd_image_score']
+            target = torch.ones_like(cssd_image_score)
+            loss_cssd = F.binary_cross_entropy_with_logits(cssd_image_score, target)
+            weight = float(image_branch_kwargs.get('loss_weight', 0.0))
+            losses['loss_synthetic_cssd_image'] = loss_cssd.detach()
+            losses['loss_synthetic_cssd_image_weighted'] = weight * loss_cssd
+            losses['synthetic_cssd_image_score_mean'] = cssd_image_score.detach().mean()
+
+        if isinstance(synth_out, dict) and 'semantic_gate' in synth_out:
+            semantic_gate = synth_out['semantic_gate']
+            if semantic_gate.ndim == 3:
+                semantic_gate = semantic_gate.unsqueeze(1)
+            targets = synth_masks.to(device=semantic_gate.device, dtype=semantic_gate.dtype)
+            if targets.shape[-2:] != semantic_gate.shape[-2:]:
+                targets = F.interpolate(targets, size=semantic_gate.shape[-2:], mode='nearest')
+            semantic_gate = semantic_gate.clamp(1e-6, 1.0 - 1e-6)
+            loss_sem = F.binary_cross_entropy(semantic_gate, targets)
+            weight = float(text_guidance_kwargs.get('semantic_gate_loss_weight', 0.0))
+            losses['loss_synthetic_semantic_gate'] = loss_sem.detach()
+            losses['loss_synthetic_semantic_gate_weighted'] = weight * loss_sem
+            losses['synthetic_semantic_gate_mean'] = semantic_gate.detach().mean()
+        return losses
 
     def _apply_spatial_synthetic_lesion(self, imgs_01, masks, synthetic_cfg):
         batch_size = imgs_01.shape[0]
@@ -871,11 +907,17 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
                 'loss_synthetic_area',
                 'loss_synthetic_outside_weighted',
                 'loss_synthetic_area_weighted',
+                'loss_synthetic_cssd_image',
+                'loss_synthetic_cssd_image_weighted',
+                'loss_synthetic_semantic_gate',
+                'loss_synthetic_semantic_gate_weighted',
                 'synthetic_mask_ratio',
                 'synthetic_outside_ratio',
                 'synthetic_foreground_ratio',
                 'synthetic_pred_area',
                 'synthetic_target_area',
+                'synthetic_cssd_image_score_mean',
+                'synthetic_semantic_gate_mean',
                 'loss_normal_topk',
                 'loss_background',
                 'loss_edge',
@@ -885,6 +927,12 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
                 'foreground_ratio',
                 'edge_ratio',
                 'background_ratio',
+                'loss_cssd_image_normal',
+                'loss_cssd_image_normal_weighted',
+                'loss_text_proto_reg',
+                'loss_text_proto_reg_weighted',
+                'cssd_image_score_mean',
+                'semantic_gate_mean',
             ]
             debug_vals = {
                 name: float(self.loss_dict[name].detach().cpu())

@@ -1394,6 +1394,266 @@ class MAMBAADBiomedCLIPLocalAdapter(nn.Module):
         return anomaly_map, image_score.detach()
 
 
+class BiomedCLIPLocalConvDecoder(nn.Module):
+    def __init__(self, in_dim, hidden_dims=(256, 128, 64), dropout=0.0):
+        super().__init__()
+        hidden_dims = list(hidden_dims)
+        layers = []
+        prev_dim = in_dim
+        for idx, hidden_dim in enumerate(hidden_dims):
+            layers.extend([
+                nn.Conv2d(prev_dim, hidden_dim, kernel_size=3, padding=1, bias=False),
+                nn.GroupNorm(num_groups=min(32, hidden_dim), num_channels=hidden_dim),
+                nn.GELU(),
+            ])
+            if dropout > 0:
+                layers.append(nn.Dropout2d(dropout))
+            if idx < len(hidden_dims) - 1:
+                layers.append(nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False))
+            prev_dim = hidden_dim
+        self.decoder = nn.Sequential(*layers)
+        self.head = nn.Conv2d(prev_dim, 1, kernel_size=1)
+        nn.init.normal_(self.head.weight, std=0.02)
+        nn.init.zeros_(self.head.bias)
+
+    def forward(self, tokens, spatial_shape, image_shape):
+        bsz, num_tokens, feat_dim = tokens.shape
+        height, width = spatial_shape
+        if height * width != num_tokens:
+            raise ValueError(f'Spatial shape {(height, width)} does not match token count {num_tokens}.')
+        x = tokens.transpose(1, 2).reshape(bsz, feat_dim, height, width)
+        logits = self.head(self.decoder(x))
+        if logits.shape[-2:] != image_shape:
+            logits = F.interpolate(logits, size=image_shape, mode='bilinear', align_corners=False)
+        return logits.squeeze(1)
+
+
+class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
+    def __init__(
+            self,
+            model_s,
+            biomedclip_model_name,
+            prompt_normal,
+            prompt_abnormal,
+            image_size=256,
+            local_loss_kwargs=None,
+            text_guidance_kwargs=None,
+            image_branch_kwargs=None,
+            decoder_kwargs=None,
+            input_mean=(0.485, 0.456, 0.406),
+            input_std=(0.229, 0.224, 0.225),
+            biomed_mean=(0.48145466, 0.4578275, 0.40821073),
+            biomed_std=(0.26862954, 0.26130258, 0.27577711),
+    ):
+        super().__init__(
+            model_s=model_s,
+            biomedclip_model_name=biomedclip_model_name,
+            prompt_normal=prompt_normal,
+            prompt_abnormal=prompt_abnormal,
+            image_size=image_size,
+            local_loss_kwargs=local_loss_kwargs,
+            input_mean=input_mean,
+            input_std=input_std,
+            biomed_mean=biomed_mean,
+            biomed_std=biomed_std,
+        )
+        self.text_guidance_kwargs = dict(text_guidance_kwargs or {})
+        self.image_branch_kwargs = dict(image_branch_kwargs or {})
+        self.decoder_kwargs = dict(decoder_kwargs or {})
+
+        self.loc_decoder = BiomedCLIPLocalConvDecoder(
+            self.visual_dim,
+            hidden_dims=self.decoder_kwargs.get('hidden_dims', (256, 128, 64)),
+            dropout=float(self.decoder_kwargs.get('dropout', 0.0)),
+        )
+        self.text_delta_normal = nn.Parameter(torch.zeros(self.visual_dim))
+        self.text_delta_abnormal = nn.Parameter(torch.zeros(self.visual_dim))
+        self.semantic_scale = nn.Parameter(torch.tensor(float(self.text_guidance_kwargs.get('gate_scale_init', 1.0))))
+        self.semantic_bias = nn.Parameter(torch.tensor(float(self.text_guidance_kwargs.get('gate_bias_init', 0.0))))
+        self.semantic_eta = nn.Parameter(torch.tensor(float(self.text_guidance_kwargs.get('gate_eta_init', 0.1))))
+        self.image_score_beta = float(self.image_branch_kwargs.get('image_score_beta', 0.25))
+        self.cssd_topk_ratio = float(self.image_branch_kwargs.get('topk_ratio', 0.05))
+        self.cssd_image_loss_weight = float(self.image_branch_kwargs.get('loss_weight', 0.1))
+        self.text_reg_weight = float(self.text_guidance_kwargs.get('prototype_reg_weight', 0.05))
+
+        self._set_requires_grad(self.loc_decoder, True)
+        self._set_requires_grad(self.local_adapter, True)
+        # The old linear head is kept for checkpoint compatibility but is not used by this v2 route.
+        self._set_requires_grad(self.local_head, False)
+
+    def train(self, mode=True):
+        self.training = mode
+        self.biomedclip.eval()
+        self.local_adapter.train(mode)
+        self.loc_decoder.train(mode)
+        self.local_head.eval()
+        return self
+
+    def adapter_param_norm(self):
+        total_sq = 0.0
+        total_params = 0
+        for module in [self.local_adapter, self.loc_decoder]:
+            for param in module.parameters():
+                if not param.is_floating_point():
+                    continue
+                value = param.detach().float()
+                total_sq += float(torch.sum(value * value).cpu())
+                total_params += value.numel()
+        for param in [self.text_delta_normal, self.text_delta_abnormal, self.semantic_scale, self.semantic_bias, self.semantic_eta]:
+            value = param.detach().float()
+            total_sq += float(torch.sum(value * value).cpu())
+            total_params += value.numel()
+        return math.sqrt(total_sq), total_params
+
+    def _learnable_text_pairs(self, t_norm, t_abn):
+        delta_norm = self.text_delta_normal.to(device=t_norm.device, dtype=t_norm.dtype).unsqueeze(0)
+        delta_abn = self.text_delta_abnormal.to(device=t_abn.device, dtype=t_abn.dtype).unsqueeze(0)
+        learn_norm = F.normalize(t_norm + delta_norm, p=2, dim=-1)
+        learn_abn = F.normalize(t_abn + delta_abn, p=2, dim=-1)
+        return learn_norm, learn_abn
+
+    def _text_prototype_regularization(self, t_norm, t_abn, learn_norm, learn_abn):
+        loss_norm = 1.0 - torch.sum(F.normalize(t_norm, p=2, dim=-1) * learn_norm, dim=-1)
+        loss_abn = 1.0 - torch.sum(F.normalize(t_abn, p=2, dim=-1) * learn_abn, dim=-1)
+        return (loss_norm + loss_abn).mean()
+
+    def _semantic_gate(self, tokens, t_norm, t_abn, spatial_shape, image_shape):
+        sim_normal = torch.einsum('bld,bd->bl', tokens, F.normalize(t_norm, p=2, dim=-1))
+        sim_abnormal = torch.einsum('bld,bd->bl', tokens, F.normalize(t_abn, p=2, dim=-1))
+        # Prior diagnostic showed normal-minus-abnormal is the better localization direction.
+        semantic = sim_normal - sim_abnormal
+        gate = torch.sigmoid(self.semantic_scale * semantic + self.semantic_bias)
+        height, width = spatial_shape
+        semantic_map = semantic.view(semantic.shape[0], height, width)
+        gate_map = gate.view(gate.shape[0], height, width)
+        if gate_map.shape[-2:] != image_shape:
+            semantic_map = F.interpolate(
+                semantic_map.unsqueeze(1),
+                size=image_shape,
+                mode='bilinear',
+                align_corners=False,
+            ).squeeze(1)
+            gate_map = F.interpolate(
+                gate_map.unsqueeze(1),
+                size=image_shape,
+                mode='bilinear',
+                align_corners=False,
+            ).squeeze(1)
+        return semantic_map, gate_map
+
+    def _cssd_image_branch(self, tokens, spatial_shape, image_shape, t_norm, t_abn):
+        if self.eval_adapter_mode == 'bypass':
+            refined = tokens
+        else:
+            refined = self.local_adapter(tokens, None, spatial_shape)
+        sim_normal = torch.einsum('bld,bd->bl', refined, F.normalize(t_norm, p=2, dim=-1))
+        sim_abnormal = torch.einsum('bld,bd->bl', refined, F.normalize(t_abn, p=2, dim=-1))
+        patch_scores = sim_abnormal - sim_normal
+        topk = max(1, int(patch_scores.shape[1] * self.cssd_topk_ratio))
+        cssd_image_score = patch_scores.topk(topk, dim=1).values.mean(dim=1)
+        height, width = spatial_shape
+        cssd_map = patch_scores.view(patch_scores.shape[0], height, width)
+        cssd_map = F.interpolate(
+            cssd_map.unsqueeze(1),
+            size=image_shape,
+            mode='bilinear',
+            align_corners=False,
+        ).squeeze(1)
+        with torch.no_grad():
+            delta = (refined.detach() - tokens.detach()).float()
+            raw = tokens.detach().float()
+            refined_detached = refined.detach().float()
+            self.last_adapter_debug = {
+                'adapter_feature_delta_l2': delta.pow(2).sum(dim=-1).sqrt().mean(dim=1),
+                'adapter_feature_delta_abs': delta.abs().mean(dim=(1, 2)),
+                'adapter_raw_l2': raw.pow(2).sum(dim=-1).sqrt().mean(dim=1),
+                'adapter_refined_l2': refined_detached.pow(2).sum(dim=-1).sqrt().mean(dim=1),
+            }
+        return cssd_image_score, cssd_map
+
+    def _localization_map(self, tokens, spatial_shape, image_shape, t_norm, t_abn):
+        cnn_logits = self.loc_decoder(tokens, spatial_shape, image_shape)
+        semantic_map, semantic_gate = self._semantic_gate(tokens, t_norm, t_abn, spatial_shape, image_shape)
+        if bool(self.text_guidance_kwargs.get('enable_gate', True)):
+            eta = torch.clamp(self.semantic_eta, min=0.0, max=2.0)
+            anomaly_map = cnn_logits * (1.0 + eta * semantic_gate)
+        else:
+            anomaly_map = cnn_logits
+        return anomaly_map, cnn_logits, semantic_map, semantic_gate
+
+    def _image_bce_loss(self, image_score, label):
+        target = torch.full_like(image_score, float(label))
+        return F.binary_cross_entropy_with_logits(image_score, target)
+
+    def forward(
+            self,
+            imgs,
+            cls_names=None,
+            score_cls_names=None,
+            adapter_cls_names=None,
+            return_anomaly_map=False,
+            compute_label_free=True,
+    ):
+        del adapter_cls_names
+        if score_cls_names is None:
+            score_cls_names = cls_names
+        if self.training and self.eval_adapter_mode != 'trained':
+            raise RuntimeError('eval_adapter_mode is only for test/eval; use trained mode during training.')
+
+        with torch.no_grad():
+            image_features, tokens, spatial_shape = self.biomedclip.encode_image_and_patches(imgs)
+            base_t_norm, base_t_abn = self.biomedclip.encode_text_pairs(
+                score_cls_names,
+                batch_size=imgs.shape[0],
+                device=imgs.device,
+            )
+        t_norm, t_abn = self._learnable_text_pairs(base_t_norm.detach(), base_t_abn.detach())
+        global_score = torch.sum(image_features.detach() * t_abn, dim=1) - torch.sum(image_features.detach() * t_norm, dim=1)
+        cssd_image_score, cssd_map = self._cssd_image_branch(
+            tokens.detach(),
+            spatial_shape,
+            (imgs.shape[2], imgs.shape[3]),
+            t_norm=t_norm,
+            t_abn=t_abn,
+        )
+        anomaly_map, cnn_map, semantic_map, semantic_gate = self._localization_map(
+            tokens.detach(),
+            spatial_shape,
+            (imgs.shape[2], imgs.shape[3]),
+            t_norm=t_norm,
+            t_abn=t_abn,
+        )
+        image_score = global_score + self.image_score_beta * cssd_image_score
+
+        if self.training:
+            if not compute_label_free:
+                return {
+                    'anomaly_map': anomaly_map,
+                    'image_score': image_score.detach(),
+                    'global_image_score': global_score.detach(),
+                    'cssd_image_score': cssd_image_score,
+                    'cnn_anomaly_map': cnn_map,
+                    'semantic_map': semantic_map,
+                    'semantic_gate': semantic_gate,
+                }
+            out = self._localization_losses(anomaly_map.unsqueeze(1), imgs)
+            loss_img_normal = self._image_bce_loss(cssd_image_score, 0.0)
+            loss_text_reg = self._text_prototype_regularization(base_t_norm.detach(), base_t_abn.detach(), t_norm, t_abn)
+            out['total'] = out['total'] + self.cssd_image_loss_weight * loss_img_normal + self.text_reg_weight * loss_text_reg
+            out['loss_total'] = out['total']
+            out['loss_cssd_image_normal'] = loss_img_normal
+            out['loss_cssd_image_normal_weighted'] = self.cssd_image_loss_weight * loss_img_normal
+            out['loss_text_proto_reg'] = loss_text_reg
+            out['loss_text_proto_reg_weighted'] = self.text_reg_weight * loss_text_reg
+            out['cssd_image_score_mean'] = cssd_image_score.detach().mean()
+            out['semantic_gate_mean'] = semantic_gate.detach().mean()
+            if return_anomaly_map:
+                out.update(anomaly_map=anomaly_map, image_score=image_score.detach())
+            return out
+
+        return anomaly_map, image_score.detach()
+
+
 class MAMBAADZeroShot(nn.Module):
     def __init__(self, model_t, model_s, biomedclip_model_name, prompt_normal, prompt_abnormal, image_size=256,
                  adaptive_mc_kwargs=None, class_prompt_template='A medical image of {class_name}', class_prompts=None,
@@ -1644,6 +1904,12 @@ class MAMBAADZeroShot(nn.Module):
 @MODEL.register_module
 def mambaad_biomedclip_local_adapter(pretrained=False, **kwargs):
     model = MAMBAADBiomedCLIPLocalAdapter(**kwargs)
+    return model
+
+
+@MODEL.register_module
+def mambaad_biomedclip_dual_branch_adapter(pretrained=False, **kwargs):
+    model = MAMBAADBiomedCLIPDualBranchAdapter(**kwargs)
     return model
 
 

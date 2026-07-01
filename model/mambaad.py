@@ -1428,6 +1428,89 @@ class BiomedCLIPLocalConvDecoder(nn.Module):
         return logits.squeeze(1)
 
 
+class TextGuidedLocalRelationBranch(nn.Module):
+    def __init__(
+            self,
+            in_dim,
+            hidden_dim=256,
+            dropout=0.0,
+            semantic_direction='abnormal_minus_normal',
+    ):
+        super().__init__()
+        self.semantic_direction = str(semantic_direction)
+        self.proj = nn.Sequential(
+            nn.Linear(in_dim * 3 + 2, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
+            nn.Linear(hidden_dim, in_dim),
+            nn.GELU(),
+        )
+        self.head = nn.Linear(in_dim, 1)
+        nn.init.normal_(self.head.weight, std=0.02)
+        nn.init.zeros_(self.head.bias)
+
+    def _semantic_score(self, tokens, t_norm, t_abn):
+        t_norm = F.normalize(t_norm, p=2, dim=-1)
+        t_abn = F.normalize(t_abn, p=2, dim=-1)
+        sim_normal = torch.einsum('bld,bd->bl', tokens, t_norm)
+        sim_abnormal = torch.einsum('bld,bd->bl', tokens, t_abn)
+        if self.semantic_direction in ('normal_minus_abnormal', 'normal-abnormal', 'old'):
+            return sim_normal - sim_abnormal
+        return sim_abnormal - sim_normal
+
+    def forward(self, tokens, spatial_shape, image_shape, t_norm, t_abn):
+        bsz, num_tokens, feat_dim = tokens.shape
+        height, width = spatial_shape
+        if height * width != num_tokens:
+            raise ValueError(f'Spatial shape {(height, width)} does not match token count {num_tokens}.')
+
+        semantic = self._semantic_score(tokens, t_norm, t_abn)
+        token_map = tokens.transpose(1, 2).reshape(bsz, feat_dim, height, width)
+        neighbor_map = F.avg_pool2d(token_map, kernel_size=3, stride=1, padding=1)
+        neighbor_tokens = neighbor_map.flatten(2).transpose(1, 2)
+
+        semantic_map = semantic.view(bsz, 1, height, width)
+        neighbor_semantic = F.avg_pool2d(semantic_map, kernel_size=3, stride=1, padding=1).flatten(2).squeeze(1)
+        semantic_diff = semantic - neighbor_semantic
+
+        relation_input = torch.cat(
+            [
+                tokens,
+                neighbor_tokens,
+                tokens - neighbor_tokens,
+                semantic.unsqueeze(-1),
+                semantic_diff.unsqueeze(-1),
+            ],
+            dim=-1,
+        )
+        relation_tokens = self.proj(relation_input)
+        logits = self.head(relation_tokens).squeeze(-1)
+        logit_map = logits.view(bsz, height, width)
+        semantic_map = semantic.view(bsz, height, width)
+        semantic_gate = torch.sigmoid(semantic_map)
+
+        if logit_map.shape[-2:] != image_shape:
+            logit_map = F.interpolate(
+                logit_map.unsqueeze(1),
+                size=image_shape,
+                mode='bilinear',
+                align_corners=False,
+            ).squeeze(1)
+            semantic_map = F.interpolate(
+                semantic_map.unsqueeze(1),
+                size=image_shape,
+                mode='bilinear',
+                align_corners=False,
+            ).squeeze(1)
+            semantic_gate = F.interpolate(
+                semantic_gate.unsqueeze(1),
+                size=image_shape,
+                mode='bilinear',
+                align_corners=False,
+            ).squeeze(1)
+        return logit_map, relation_tokens, semantic_map, semantic_gate
+
+
 class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
     def __init__(
             self,
@@ -1474,6 +1557,7 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
         self.image_score_beta = float(self.image_branch_kwargs.get('image_score_beta', 0.25))
         self.cssd_topk_ratio = float(self.image_branch_kwargs.get('topk_ratio', 0.05))
         self.cssd_image_loss_weight = float(self.image_branch_kwargs.get('loss_weight', 0.1))
+        self.use_cssd_image_branch = bool(self.image_branch_kwargs.get('use_cssd', True))
         self.text_reg_weight = float(self.text_guidance_kwargs.get('prototype_reg_weight', 0.05))
 
         self._set_requires_grad(self.loc_decoder, True)
@@ -1542,7 +1626,7 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
         return semantic_map, gate_map
 
     def _cssd_image_branch(self, tokens, spatial_shape, image_shape, t_norm, t_abn):
-        if self.eval_adapter_mode == 'bypass':
+        if (not self.use_cssd_image_branch) or self.eval_adapter_mode == 'bypass':
             refined = tokens
         else:
             refined = self.local_adapter(tokens, None, spatial_shape)
@@ -1652,6 +1736,404 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
             return out
 
         return anomaly_map, image_score.detach()
+
+
+class MAMBAADBiomedCLIPTGLRANoMamba(MAMBAADBiomedCLIPDualBranchAdapter):
+    def __init__(
+            self,
+            model_s,
+            biomedclip_model_name,
+            prompt_normal,
+            prompt_abnormal,
+            image_size=256,
+            local_loss_kwargs=None,
+            text_guidance_kwargs=None,
+            image_branch_kwargs=None,
+            decoder_kwargs=None,
+            relation_kwargs=None,
+            input_mean=(0.485, 0.456, 0.406),
+            input_std=(0.229, 0.224, 0.225),
+            biomed_mean=(0.48145466, 0.4578275, 0.40821073),
+            biomed_std=(0.26862954, 0.26130258, 0.27577711),
+    ):
+        image_branch_kwargs = dict(image_branch_kwargs or {})
+        image_branch_kwargs['use_cssd'] = False
+        super().__init__(
+            model_s=model_s,
+            biomedclip_model_name=biomedclip_model_name,
+            prompt_normal=prompt_normal,
+            prompt_abnormal=prompt_abnormal,
+            image_size=image_size,
+            local_loss_kwargs=local_loss_kwargs,
+            text_guidance_kwargs=text_guidance_kwargs,
+            image_branch_kwargs=image_branch_kwargs,
+            decoder_kwargs=decoder_kwargs,
+            input_mean=input_mean,
+            input_std=input_std,
+            biomed_mean=biomed_mean,
+            biomed_std=biomed_std,
+        )
+        self.relation_kwargs = dict(relation_kwargs or {})
+        self.relation_branch = TextGuidedLocalRelationBranch(
+            self.visual_dim,
+            hidden_dim=int(self.relation_kwargs.get('hidden_dim', 256)),
+            dropout=float(self.relation_kwargs.get('dropout', 0.0)),
+            semantic_direction=self.relation_kwargs.get('semantic_direction', 'abnormal_minus_normal'),
+        )
+        self.relation_eta = nn.Parameter(torch.tensor(float(self.relation_kwargs.get('gate_eta_init', 0.1))))
+
+        self._set_requires_grad(self.local_adapter, False)
+        self._set_requires_grad(self.loc_decoder, False)
+        self._set_requires_grad(self.relation_branch, True)
+
+    def train(self, mode=True):
+        self.training = mode
+        self.biomedclip.eval()
+        self.local_adapter.eval()
+        self.loc_decoder.eval()
+        self.local_head.eval()
+        self.relation_branch.train(mode)
+        return self
+
+    def adapter_param_norm(self):
+        total_sq = 0.0
+        total_params = 0
+        for module in [self.relation_branch]:
+            for param in module.parameters():
+                if not param.is_floating_point():
+                    continue
+                value = param.detach().float()
+                total_sq += float(torch.sum(value * value).cpu())
+                total_params += value.numel()
+        for param in [self.text_delta_normal, self.text_delta_abnormal, self.semantic_scale, self.semantic_bias, self.semantic_eta, self.relation_eta]:
+            value = param.detach().float()
+            total_sq += float(torch.sum(value * value).cpu())
+            total_params += value.numel()
+        return math.sqrt(total_sq), total_params
+
+    def reset_adapter_parameters(self, seed=None):
+        params = list(self.relation_branch.parameters())
+        device = params[0].device if params else torch.device('cpu')
+        devices = [device.index] if device.type == 'cuda' and device.index is not None else []
+        with torch.random.fork_rng(devices=devices, enabled=seed is not None):
+            if seed is not None:
+                torch.manual_seed(int(seed))
+                if device.type == 'cuda':
+                    torch.cuda.manual_seed_all(int(seed))
+            self._reset_module_parameters(self.relation_branch)
+
+    def _localization_map(self, tokens, spatial_shape, image_shape, t_norm, t_abn):
+        relation_logits, relation_tokens, semantic_map, semantic_gate = self.relation_branch(
+            tokens,
+            spatial_shape,
+            image_shape,
+            t_norm=t_norm,
+            t_abn=t_abn,
+        )
+        if bool(self.text_guidance_kwargs.get('enable_gate', True)):
+            eta = torch.clamp(self.relation_eta, min=0.0, max=2.0)
+            anomaly_map = relation_logits * (1.0 + eta * semantic_gate)
+        else:
+            anomaly_map = relation_logits
+        with torch.no_grad():
+            delta = (relation_tokens.detach() - tokens.detach()).float()
+            self.last_adapter_debug = {
+                'adapter_feature_delta_l2': delta.pow(2).sum(dim=-1).sqrt().mean(dim=1),
+                'adapter_feature_delta_abs': delta.abs().mean(dim=(1, 2)),
+                'adapter_raw_l2': tokens.detach().float().pow(2).sum(dim=-1).sqrt().mean(dim=1),
+                'adapter_refined_l2': relation_tokens.detach().float().pow(2).sum(dim=-1).sqrt().mean(dim=1),
+            }
+        return anomaly_map, relation_logits, semantic_map, semantic_gate
+
+
+class MAMBAADBiomedCLIPTGLRAFull(MAMBAADBiomedCLIPTGLRANoMamba):
+    def __init__(
+            self,
+            model_s,
+            biomedclip_model_name,
+            prompt_normal,
+            prompt_abnormal,
+            image_size=256,
+            local_loss_kwargs=None,
+            text_guidance_kwargs=None,
+            image_branch_kwargs=None,
+            decoder_kwargs=None,
+            relation_kwargs=None,
+            fusion_kwargs=None,
+            input_mean=(0.485, 0.456, 0.406),
+            input_std=(0.229, 0.224, 0.225),
+            biomed_mean=(0.48145466, 0.4578275, 0.40821073),
+            biomed_std=(0.26862954, 0.26130258, 0.27577711),
+    ):
+        image_branch_kwargs = dict(image_branch_kwargs or {})
+        image_branch_kwargs['use_cssd'] = True
+        super().__init__(
+            model_s=model_s,
+            biomedclip_model_name=biomedclip_model_name,
+            prompt_normal=prompt_normal,
+            prompt_abnormal=prompt_abnormal,
+            image_size=image_size,
+            local_loss_kwargs=local_loss_kwargs,
+            text_guidance_kwargs=text_guidance_kwargs,
+            image_branch_kwargs=image_branch_kwargs,
+            decoder_kwargs=decoder_kwargs,
+            relation_kwargs=relation_kwargs,
+            input_mean=input_mean,
+            input_std=input_std,
+            biomed_mean=biomed_mean,
+            biomed_std=biomed_std,
+        )
+        self.use_cssd_image_branch = True
+        self.fusion_kwargs = dict(fusion_kwargs or {})
+        fusion_hidden_dim = int(self.fusion_kwargs.get('hidden_dim', 512))
+        fusion_dropout = float(self.fusion_kwargs.get('dropout', 0.0))
+        self.global_local_fusion = nn.Sequential(
+            nn.Linear(self.visual_dim * 3 + 1, fusion_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(fusion_dropout) if fusion_dropout > 0 else nn.Identity(),
+            nn.Linear(fusion_hidden_dim, self.visual_dim),
+            nn.GELU(),
+        )
+        self.fusion_head = nn.Linear(self.visual_dim, 1)
+        self.fusion_residual_scale = nn.Parameter(torch.tensor(float(self.fusion_kwargs.get('residual_scale_init', 0.1))))
+        nn.init.normal_(self.fusion_head.weight, std=0.02)
+        nn.init.zeros_(self.fusion_head.bias)
+
+        self._set_requires_grad(self.local_adapter, True)
+        self._set_requires_grad(self.loc_decoder, False)
+        self._set_requires_grad(self.global_local_fusion, True)
+        self._set_requires_grad(self.fusion_head, True)
+
+    def train(self, mode=True):
+        self.training = mode
+        self.biomedclip.eval()
+        self.local_adapter.train(mode)
+        self.loc_decoder.eval()
+        self.local_head.eval()
+        self.relation_branch.train(mode)
+        self.global_local_fusion.train(mode)
+        self.fusion_head.train(mode)
+        return self
+
+    def adapter_param_norm(self):
+        total_sq = 0.0
+        total_params = 0
+        for module in [self.local_adapter, self.relation_branch, self.global_local_fusion, self.fusion_head]:
+            for param in module.parameters():
+                if not param.is_floating_point():
+                    continue
+                value = param.detach().float()
+                total_sq += float(torch.sum(value * value).cpu())
+                total_params += value.numel()
+        for param in [
+            self.text_delta_normal,
+            self.text_delta_abnormal,
+            self.semantic_scale,
+            self.semantic_bias,
+            self.semantic_eta,
+            self.relation_eta,
+            self.fusion_residual_scale,
+        ]:
+            value = param.detach().float()
+            total_sq += float(torch.sum(value * value).cpu())
+            total_params += value.numel()
+        return math.sqrt(total_sq), total_params
+
+    def reset_adapter_parameters(self, seed=None):
+        params = (
+            list(self.local_adapter.parameters())
+            + list(self.relation_branch.parameters())
+            + list(self.global_local_fusion.parameters())
+            + list(self.fusion_head.parameters())
+        )
+        device = params[0].device if params else torch.device('cpu')
+        devices = [device.index] if device.type == 'cuda' and device.index is not None else []
+        with torch.random.fork_rng(devices=devices, enabled=seed is not None):
+            if seed is not None:
+                torch.manual_seed(int(seed))
+                if device.type == 'cuda':
+                    torch.cuda.manual_seed_all(int(seed))
+            self._reset_module_parameters(self.local_adapter)
+            self._reset_module_parameters(self.relation_branch)
+            self._reset_module_parameters(self.global_local_fusion)
+            self.fusion_head.reset_parameters()
+            nn.init.zeros_(self.fusion_head.bias)
+
+    def _localization_map(self, tokens, spatial_shape, image_shape, t_norm, t_abn):
+        if self.eval_adapter_mode == 'bypass':
+            global_tokens = tokens
+        else:
+            global_tokens = self.local_adapter(tokens, None, spatial_shape)
+        _, relation_tokens, semantic_map, semantic_gate = self.relation_branch(
+            tokens,
+            spatial_shape,
+            image_shape,
+            t_norm=t_norm,
+            t_abn=t_abn,
+        )
+        semantic_patch = self.relation_branch._semantic_score(tokens, t_norm, t_abn).unsqueeze(-1)
+        fusion_input = torch.cat([tokens, global_tokens, relation_tokens, semantic_patch], dim=-1)
+        fusion_delta = self.global_local_fusion(fusion_input)
+        residual_scale = torch.clamp(self.fusion_residual_scale, min=0.0, max=2.0)
+        fused_tokens = tokens + residual_scale * fusion_delta
+        patch_logits = self.fusion_head(fused_tokens).squeeze(-1)
+        height, width = spatial_shape
+        fused_map = patch_logits.view(patch_logits.shape[0], height, width)
+        if fused_map.shape[-2:] != image_shape:
+            fused_map = F.interpolate(
+                fused_map.unsqueeze(1),
+                size=image_shape,
+                mode='bilinear',
+                align_corners=False,
+            ).squeeze(1)
+        if bool(self.text_guidance_kwargs.get('enable_gate', True)):
+            eta = torch.clamp(self.relation_eta, min=0.0, max=2.0)
+            anomaly_map = fused_map * (1.0 + eta * semantic_gate)
+        else:
+            anomaly_map = fused_map
+        with torch.no_grad():
+            global_delta = (global_tokens.detach() - tokens.detach()).float()
+            relation_delta = (relation_tokens.detach() - tokens.detach()).float()
+            fused_delta = (fused_tokens.detach() - tokens.detach()).float()
+            self.last_adapter_debug = {
+                'adapter_feature_delta_l2': fused_delta.pow(2).sum(dim=-1).sqrt().mean(dim=1),
+                'adapter_feature_delta_abs': fused_delta.abs().mean(dim=(1, 2)),
+                'adapter_raw_l2': tokens.detach().float().pow(2).sum(dim=-1).sqrt().mean(dim=1),
+                'adapter_refined_l2': fused_tokens.detach().float().pow(2).sum(dim=-1).sqrt().mean(dim=1),
+                'adapter_global_delta_l2': global_delta.pow(2).sum(dim=-1).sqrt().mean(dim=1),
+                'adapter_relation_delta_l2': relation_delta.pow(2).sum(dim=-1).sqrt().mean(dim=1),
+            }
+        return anomaly_map, fused_map, semantic_map, semantic_gate
+
+
+class MAMBAADBiomedCLIPCNNGlobalAuxAdapter(MAMBAADBiomedCLIPDualBranchAdapter):
+    def __init__(
+            self,
+            model_s,
+            biomedclip_model_name,
+            prompt_normal,
+            prompt_abnormal,
+            image_size=256,
+            local_loss_kwargs=None,
+            text_guidance_kwargs=None,
+            image_branch_kwargs=None,
+            decoder_kwargs=None,
+            global_aux_kwargs=None,
+            input_mean=(0.485, 0.456, 0.406),
+            input_std=(0.229, 0.224, 0.225),
+            biomed_mean=(0.48145466, 0.4578275, 0.40821073),
+            biomed_std=(0.26862954, 0.26130258, 0.27577711),
+    ):
+        image_branch_kwargs = dict(image_branch_kwargs or {})
+        image_branch_kwargs['use_cssd'] = True
+        super().__init__(
+            model_s=model_s,
+            biomedclip_model_name=biomedclip_model_name,
+            prompt_normal=prompt_normal,
+            prompt_abnormal=prompt_abnormal,
+            image_size=image_size,
+            local_loss_kwargs=local_loss_kwargs,
+            text_guidance_kwargs=text_guidance_kwargs,
+            image_branch_kwargs=image_branch_kwargs,
+            decoder_kwargs=decoder_kwargs,
+            input_mean=input_mean,
+            input_std=input_std,
+            biomed_mean=biomed_mean,
+            biomed_std=biomed_std,
+        )
+        self.global_aux_kwargs = dict(global_aux_kwargs or {})
+        self.global_gate_scale = nn.Parameter(torch.tensor(float(self.global_aux_kwargs.get('gate_scale_init', 1.0))))
+        self.global_gate_bias = nn.Parameter(torch.tensor(float(self.global_aux_kwargs.get('gate_bias_init', 0.0))))
+        self.global_eta = nn.Parameter(torch.tensor(float(self.global_aux_kwargs.get('gate_eta_init', 0.05))))
+        self._cached_global_tokens = None
+        self._cached_global_patch_scores = None
+
+    def adapter_param_norm(self):
+        total_sq, total_params = super().adapter_param_norm()
+        total_sq = total_sq * total_sq
+        for param in [self.global_gate_scale, self.global_gate_bias, self.global_eta]:
+            value = param.detach().float()
+            total_sq += float(torch.sum(value * value).cpu())
+            total_params += value.numel()
+        return math.sqrt(total_sq), total_params
+
+    def _cssd_image_branch(self, tokens, spatial_shape, image_shape, t_norm, t_abn):
+        if self.eval_adapter_mode == 'bypass':
+            refined = tokens
+        else:
+            refined = self.local_adapter(tokens, None, spatial_shape)
+        sim_normal = torch.einsum('bld,bd->bl', refined, F.normalize(t_norm, p=2, dim=-1))
+        sim_abnormal = torch.einsum('bld,bd->bl', refined, F.normalize(t_abn, p=2, dim=-1))
+        patch_scores = sim_abnormal - sim_normal
+        topk = max(1, int(patch_scores.shape[1] * self.cssd_topk_ratio))
+        cssd_image_score = patch_scores.topk(topk, dim=1).values.mean(dim=1)
+        height, width = spatial_shape
+        cssd_map = patch_scores.view(patch_scores.shape[0], height, width)
+        cssd_map = F.interpolate(
+            cssd_map.unsqueeze(1),
+            size=image_shape,
+            mode='bilinear',
+            align_corners=False,
+        ).squeeze(1)
+        self._cached_global_tokens = refined
+        self._cached_global_patch_scores = patch_scores
+        with torch.no_grad():
+            delta = (refined.detach() - tokens.detach()).float()
+            raw = tokens.detach().float()
+            refined_detached = refined.detach().float()
+            self.last_adapter_debug = {
+                'adapter_feature_delta_l2': delta.pow(2).sum(dim=-1).sqrt().mean(dim=1),
+                'adapter_feature_delta_abs': delta.abs().mean(dim=(1, 2)),
+                'adapter_raw_l2': raw.pow(2).sum(dim=-1).sqrt().mean(dim=1),
+                'adapter_refined_l2': refined_detached.pow(2).sum(dim=-1).sqrt().mean(dim=1),
+            }
+        return cssd_image_score, cssd_map
+
+    def _localization_map(self, tokens, spatial_shape, image_shape, t_norm, t_abn):
+        cnn_logits = self.loc_decoder(tokens, spatial_shape, image_shape)
+        semantic_map, semantic_gate = self._semantic_gate(tokens, t_norm, t_abn, spatial_shape, image_shape)
+
+        global_tokens = self._cached_global_tokens
+        global_patch_scores = self._cached_global_patch_scores
+        if global_tokens is None or global_patch_scores is None:
+            if self.eval_adapter_mode == 'bypass':
+                global_tokens = tokens
+            else:
+                global_tokens = self.local_adapter(tokens, None, spatial_shape)
+            sim_normal = torch.einsum('bld,bd->bl', global_tokens, F.normalize(t_norm, p=2, dim=-1))
+            sim_abnormal = torch.einsum('bld,bd->bl', global_tokens, F.normalize(t_abn, p=2, dim=-1))
+            global_patch_scores = sim_abnormal - sim_normal
+
+        height, width = spatial_shape
+        global_gate = torch.sigmoid(
+            self.global_gate_scale * global_patch_scores.view(global_patch_scores.shape[0], height, width)
+            + self.global_gate_bias
+        )
+        if global_gate.shape[-2:] != image_shape:
+            global_gate = F.interpolate(
+                global_gate.unsqueeze(1),
+                size=image_shape,
+                mode='bilinear',
+                align_corners=False,
+            ).squeeze(1)
+
+        if bool(self.text_guidance_kwargs.get('enable_gate', True)):
+            semantic_eta = torch.clamp(self.semantic_eta, min=0.0, max=2.0)
+            global_eta = torch.clamp(self.global_eta, min=0.0, max=2.0)
+            anomaly_map = cnn_logits * (1.0 + semantic_eta * semantic_gate + global_eta * global_gate)
+        else:
+            anomaly_map = cnn_logits
+
+        with torch.no_grad():
+            global_delta = (global_tokens.detach() - tokens.detach()).float()
+            raw = tokens.detach().float()
+            self.last_adapter_debug.update({
+                'adapter_global_delta_l2': global_delta.pow(2).sum(dim=-1).sqrt().mean(dim=1),
+                'adapter_global_delta_abs': global_delta.abs().mean(dim=(1, 2)),
+                'adapter_raw_l2': raw.pow(2).sum(dim=-1).sqrt().mean(dim=1),
+                'global_gate_mean': global_gate.detach().flatten(1).mean(dim=1),
+            })
+        return anomaly_map, cnn_logits, semantic_map, semantic_gate
 
 
 class MAMBAADZeroShot(nn.Module):
@@ -1910,6 +2392,24 @@ def mambaad_biomedclip_local_adapter(pretrained=False, **kwargs):
 @MODEL.register_module
 def mambaad_biomedclip_dual_branch_adapter(pretrained=False, **kwargs):
     model = MAMBAADBiomedCLIPDualBranchAdapter(**kwargs)
+    return model
+
+
+@MODEL.register_module
+def mambaad_biomedclip_tglra_no_mamba(pretrained=False, **kwargs):
+    model = MAMBAADBiomedCLIPTGLRANoMamba(**kwargs)
+    return model
+
+
+@MODEL.register_module
+def mambaad_biomedclip_tglra_full(pretrained=False, **kwargs):
+    model = MAMBAADBiomedCLIPTGLRAFull(**kwargs)
+    return model
+
+
+@MODEL.register_module
+def mambaad_biomedclip_cnn_global_aux_adapter(pretrained=False, **kwargs):
+    model = MAMBAADBiomedCLIPCNNGlobalAuxAdapter(**kwargs)
     return model
 
 

@@ -271,6 +271,10 @@ class DebugEvalHelper:
         self.vis_norm = str(getattr(cfg, 'debug_eval_vis_norm', 'both')).lower()
         self.vis_percentile_low = float(getattr(cfg, 'debug_eval_vis_percentile_low', 1.0))
         self.vis_percentile_high = float(getattr(cfg, 'debug_eval_vis_percentile_high', 99.0))
+        self.save_anomalyclip_style = bool(getattr(cfg, 'debug_eval_save_anomalyclip_style', False))
+        self.anomalyclip_style_alpha = float(getattr(cfg, 'debug_eval_anomalyclip_style_alpha', 0.5))
+        self.anomalyclip_style_size = int(getattr(cfg, 'debug_eval_anomalyclip_style_size', 512))
+        self.anomalyclip_style_draw_mask = bool(getattr(cfg, 'debug_eval_anomalyclip_style_draw_mask', True))
         base_dir = getattr(cfg, 'logdir', None) or getattr(cfg.trainer, 'checkpoint', 'runs')
         self.out_dir = os.path.join(base_dir, 'debug_eval')
         self.vis_dir = os.path.join(base_dir, 'debug_vis')
@@ -360,6 +364,9 @@ class DebugEvalHelper:
         false_positive_rows, false_positive_summary = self._build_false_positive_region_diagnostic(results)
         false_positive_path = os.path.join(self.out_dir, 'false_positive_region_diagnostic.csv')
         self._write_csv(false_positive_path, false_positive_rows)
+        localization_point_rows, localization_point_summary = self._build_localization_point_metrics(results)
+        localization_point_path = os.path.join(self.out_dir, 'localization_point_metrics.csv')
+        self._write_csv(localization_point_path, localization_point_rows)
         self._vis_percentile_bounds = self._percentile_bounds_from_results(results)
         self.save_visualizations()
         self._log_debug_summary(
@@ -370,6 +377,7 @@ class DebugEvalHelper:
             foreground_path,
             foreground_score_path,
             false_positive_path,
+            localization_point_path,
             records,
             shape_summary,
             score_sweep_metrics,
@@ -377,6 +385,7 @@ class DebugEvalHelper:
             foreground_summary,
             foreground_score_summary,
             false_positive_summary,
+            localization_point_summary,
             evaluator,
         )
 
@@ -416,6 +425,14 @@ class DebugEvalHelper:
             'adapter_feature_delta_abs',
             'adapter_raw_l2',
             'adapter_refined_l2',
+            'adapter_global_delta_l2',
+            'adapter_global_delta_abs',
+            'global_gate_mean',
+            'arcc_enabled',
+            'arcc_calibration_mean',
+            'arcc_calibration_abs_mean',
+            'arcc_modulation_mean',
+            'arcc_lambda',
         ]:
             if key in results:
                 adapter_debug[key] = np.asarray(results[key]).reshape(-1)
@@ -487,6 +504,14 @@ class DebugEvalHelper:
                 'adapter_feature_delta_abs': _safe_float(adapter_debug['adapter_feature_delta_abs'][idx]) if 'adapter_feature_delta_abs' in adapter_debug else '',
                 'adapter_raw_l2': _safe_float(adapter_debug['adapter_raw_l2'][idx]) if 'adapter_raw_l2' in adapter_debug else '',
                 'adapter_refined_l2': _safe_float(adapter_debug['adapter_refined_l2'][idx]) if 'adapter_refined_l2' in adapter_debug else '',
+                'adapter_global_delta_l2': _safe_float(adapter_debug['adapter_global_delta_l2'][idx]) if 'adapter_global_delta_l2' in adapter_debug else '',
+                'adapter_global_delta_abs': _safe_float(adapter_debug['adapter_global_delta_abs'][idx]) if 'adapter_global_delta_abs' in adapter_debug else '',
+                'global_gate_mean': _safe_float(adapter_debug['global_gate_mean'][idx]) if 'global_gate_mean' in adapter_debug else '',
+                'arcc_enabled': _safe_float(adapter_debug['arcc_enabled'][idx]) if 'arcc_enabled' in adapter_debug else '',
+                'arcc_calibration_mean': _safe_float(adapter_debug['arcc_calibration_mean'][idx]) if 'arcc_calibration_mean' in adapter_debug else '',
+                'arcc_calibration_abs_mean': _safe_float(adapter_debug['arcc_calibration_abs_mean'][idx]) if 'arcc_calibration_abs_mean' in adapter_debug else '',
+                'arcc_modulation_mean': _safe_float(adapter_debug['arcc_modulation_mean'][idx]) if 'arcc_modulation_mean' in adapter_debug else '',
+                'arcc_lambda': _safe_float(adapter_debug['arcc_lambda'][idx]) if 'arcc_lambda' in adapter_debug else '',
                 **foreground_info,
             }
             records.append(record)
@@ -847,6 +872,67 @@ class DebugEvalHelper:
         }
         return rows, summary
 
+    def _build_localization_point_metrics(self, results):
+        maps = self._squeeze_maps(results['anomaly_maps']).astype(np.float32)
+        masks = self._squeeze_maps(results['imgs_masks']).astype(np.uint8)
+        labels = results['anomalys'].astype(int).reshape(-1)
+        cls_names = results['cls_names'].astype(str)
+        rows = []
+        sample_metrics_by_organ = defaultdict(list)
+        for idx in range(len(labels)):
+            if int(labels[idx]) != 1:
+                continue
+            mask = masks[idx] > 0
+            if not mask.any():
+                continue
+            metrics = self._localization_point_metrics_for_sample(maps[idx], mask)
+            sample_metrics_by_organ[cls_names[idx]].append(metrics)
+
+        for organ in sorted(sample_metrics_by_organ.keys()):
+            organ_metrics = sample_metrics_by_organ[organ]
+            rows.append({
+                'class_name': organ,
+                'n_samples': len(organ_metrics),
+                **{key: _safe_float(value) for key, value in self._average_metric_dict(organ_metrics).items()},
+            })
+
+        all_metrics = [metric for organ_metrics in sample_metrics_by_organ.values() for metric in organ_metrics]
+        if all_metrics:
+            rows.append({
+                'class_name': 'Avg',
+                'n_samples': len(all_metrics),
+                **{key: _safe_float(value) for key, value in self._average_metric_dict(all_metrics).items()},
+            })
+        return rows, {'rows': rows, 'has_localization_point_metrics': bool(all_metrics)}
+
+    def _localization_point_metrics_for_sample(self, anomaly_map, mask):
+        flat_map = np.asarray(anomaly_map, dtype=np.float32).reshape(-1)
+        flat_mask = np.asarray(mask, dtype=bool).reshape(-1)
+        lesion_pixels = max(1, int(flat_mask.sum()))
+        max_idx = int(np.argmax(flat_map))
+        top1_mask = self._topk_binary_mask(flat_map, 0.01)
+        top5_mask = self._topk_binary_mask(flat_map, 0.05)
+        return {
+            'max_hit_rate': float(flat_mask[max_idx]),
+            'top1_hit_rate': float(np.logical_and(top1_mask, flat_mask).any()),
+            'top5_hit_rate': float(np.logical_and(top5_mask, flat_mask).any()),
+            'top1_lesion_fraction': self._topk_lesion_fraction(top1_mask, flat_mask),
+            'top5_lesion_fraction': self._topk_lesion_fraction(top5_mask, flat_mask),
+            'top1_lesion_coverage': float(np.logical_and(top1_mask, flat_mask).sum() / lesion_pixels),
+            'top5_lesion_coverage': float(np.logical_and(top5_mask, flat_mask).sum() / lesion_pixels),
+        }
+
+    def _topk_binary_mask(self, flat_values, ratio):
+        k = max(1, int(flat_values.size * float(ratio)))
+        top_idx = np.argpartition(flat_values, flat_values.size - k)[-k:]
+        out = np.zeros(flat_values.size, dtype=bool)
+        out[top_idx] = True
+        return out
+
+    def _topk_lesion_fraction(self, topk_mask, lesion_mask):
+        denom = max(1, int(topk_mask.sum()))
+        return float(np.logical_and(topk_mask, lesion_mask).sum() / denom)
+
     def _foreground_score_variants(self, maps, image_scores, foreground_maps, eroded_foreground_maps):
         current_ratio = self._current_image_score_topk_ratio()
         variants = {
@@ -962,6 +1048,7 @@ class DebugEvalHelper:
         foreground_path,
         foreground_score_path,
         false_positive_path,
+        localization_point_path,
         records,
         shape_summary,
         score_sweep_metrics,
@@ -969,6 +1056,7 @@ class DebugEvalHelper:
         foreground_summary,
         foreground_score_summary,
         false_positive_summary,
+        localization_point_summary,
         evaluator,
     ):
         label1_mask0 = [r for r in records if int(r['image_label']) == 1 and int(r['mask_sum']) == 0]
@@ -990,7 +1078,8 @@ class DebugEvalHelper:
         log_msg(
             self.logger,
             f'==> DebugEval files: {records_path} ; {score_path} ; {hist_path} ; {sweep_path} ; '
-            f'{foreground_path} ; {foreground_score_path} ; {false_positive_path} ; vis_dir={self.vis_dir}'
+            f'{foreground_path} ; {foreground_score_path} ; {false_positive_path} ; '
+            f'{localization_point_path} ; vis_dir={self.vis_dir}'
         )
         log_msg(
             self.logger,
@@ -1057,6 +1146,7 @@ class DebugEvalHelper:
         self._log_foreground_diagnostic(foreground_summary)
         self._log_foreground_score_sweep(foreground_score_summary)
         self._log_false_positive_regions(false_positive_summary)
+        self._log_localization_point_metrics(localization_point_summary)
         recommendation = self._recommendation(label1_mask0, label0_mask1, resize_issue, score_sweep_metrics)
         current_topk = self._current_image_score_topk_ratio()
         foreground_avg = foreground_summary.get('avg', {}) if foreground_summary else {}
@@ -1145,6 +1235,30 @@ class DebugEvalHelper:
             self.logger,
             '==> FalsePositiveRegionDiagnostic (normal samples, model top-k)\n'
             + tabulate.tabulate(display_rows, headers='keys', tablefmt='pipe', floatfmt='.5f', numalign='center')
+        )
+
+    def _log_localization_point_metrics(self, localization_point_summary):
+        rows = localization_point_summary.get('rows', []) if localization_point_summary else []
+        if not rows:
+            log_msg(self.logger, '==> LocalizationPointMetrics skipped: no abnormal samples with non-empty masks')
+            return
+        display_rows = []
+        for row in rows:
+            display_rows.append({
+                'Name': row['class_name'],
+                'n': row['n_samples'],
+                'max_hit': row['max_hit_rate'] * 100 if row['max_hit_rate'] != '' else np.nan,
+                'top1_hit': row['top1_hit_rate'] * 100 if row['top1_hit_rate'] != '' else np.nan,
+                'top5_hit': row['top5_hit_rate'] * 100 if row['top5_hit_rate'] != '' else np.nan,
+                'top1_frac': row['top1_lesion_fraction'] * 100 if row['top1_lesion_fraction'] != '' else np.nan,
+                'top5_frac': row['top5_lesion_fraction'] * 100 if row['top5_lesion_fraction'] != '' else np.nan,
+                'top1_cov': row['top1_lesion_coverage'] * 100 if row['top1_lesion_coverage'] != '' else np.nan,
+                'top5_cov': row['top5_lesion_coverage'] * 100 if row['top5_lesion_coverage'] != '' else np.nan,
+            })
+        log_msg(
+            self.logger,
+            '==> LocalizationPointMetrics (abnormal samples with non-empty GT masks)\n'
+            + tabulate.tabulate(display_rows, headers='keys', tablefmt='pipe', floatfmt='.2f', numalign='center')
         )
 
     def _log_score_sweep_table(self, score_sweep_metrics):
@@ -1356,6 +1470,23 @@ class DebugEvalHelper:
             f'mask{mask_sum}_score{sample["score"]:.6f}.png'
         )
         Image.fromarray(panel).save(os.path.join(out_dir, base))
+        if self.save_anomalyclip_style:
+            anomalyclip_style = self._anomalyclip_style_overlay(img, amap, mask)
+            style_base = base.replace('.png', '_anomalyclip_style.png')
+            Image.fromarray(anomalyclip_style).save(os.path.join(out_dir, style_base))
+
+    def _anomalyclip_style_overlay(self, img, anomaly_map, mask):
+        norm = _normalize_map(anomaly_map)
+        heat = (cm.jet(norm)[..., :3] * 255).astype(np.uint8)
+        alpha = min(max(self.anomalyclip_style_alpha, 0.0), 1.0)
+        overlay = ((1.0 - alpha) * img + alpha * heat).clip(0, 255).astype(np.uint8)
+        if self.anomalyclip_style_draw_mask:
+            boundary = self._mask_boundary(mask > 0)
+            overlay[boundary] = np.array([255, 255, 255], dtype=np.uint8)
+        if self.anomalyclip_style_size > 0:
+            size = (self.anomalyclip_style_size, self.anomalyclip_style_size)
+            overlay = np.asarray(Image.fromarray(overlay).resize(size, Image.BILINEAR))
+        return overlay
 
     def _denormalize_image(self, img_chw):
         img = np.asarray(img_chw, dtype=np.float32).transpose(1, 2, 0)

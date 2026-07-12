@@ -368,6 +368,14 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
             'adapter_feature_delta_abs',
             'adapter_raw_l2',
             'adapter_refined_l2',
+            'adapter_global_delta_l2',
+            'adapter_global_delta_abs',
+            'global_gate_mean',
+            'arcc_enabled',
+            'arcc_calibration_mean',
+            'arcc_calibration_abs_mean',
+            'arcc_modulation_mean',
+            'arcc_lambda',
         ]:
             value = debug.get(key)
             if value is None:
@@ -988,6 +996,7 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
             batch_size = self.imgs.shape[0]
             adapter_debug = self._get_adapter_debug_numpy(batch_size)
             for key, value in adapter_debug.items():
+                adapter_debug_results.setdefault(key, [])
                 adapter_debug_results[key].append(value)
             foreground_mask = None
             if self.debug_helper.enabled and self.debug_helper.foreground_enabled:

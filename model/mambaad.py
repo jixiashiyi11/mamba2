@@ -419,17 +419,24 @@ class LSSModule(nn.Module):
             size: int = 8,
             scan_type: str = 'scan',
             num_direction: int = 8,
+            use_selective_scan: bool = True,
+            use_deformable_pool: bool = True,
             **kwargs,
     ):
         super().__init__()
-        self.smm_blocks = nn.ModuleList([
-            HSSBlock(hidden_dim=hidden_dim, drop_path=drop_path, norm_layer=norm_layer, attn_drop_rate=attn_drop_rate,
-                     d_state=d_state, size=size, scan_type=scan_type, num_direction=num_direction, **kwargs)
-            for i in range(depth)])
+        self.use_selective_scan = bool(use_selective_scan)
+        self.use_deformable_pool = bool(use_deformable_pool)
+        self.smm_blocks = nn.ModuleList()
+        if self.use_selective_scan:
+            self.smm_blocks = nn.ModuleList([
+                HSSBlock(hidden_dim=hidden_dim, drop_path=drop_path, norm_layer=norm_layer, attn_drop_rate=attn_drop_rate,
+                         d_state=d_state, size=size, scan_type=scan_type, num_direction=num_direction, **kwargs)
+                for i in range(depth)])
 
-        self.query_norm = nn.InstanceNorm2d(hidden_dim)
-        self.deform_attn = DeformableAttnRes(channels=hidden_dim, kernel_size=3)
-        self.deform_act = nn.SiLU()
+        if self.use_deformable_pool:
+            self.query_norm = nn.InstanceNorm2d(hidden_dim)
+            self.deform_attn = DeformableAttnRes(channels=hidden_dim, kernel_size=3)
+            self.deform_act = nn.SiLU()
 
         self.apply(self._init_weights)
 
@@ -442,23 +449,30 @@ class LSSModule(nn.Module):
                 m.bias.data.zero_()
 
     def forward(self, input: torch.Tensor, c=None, pool_feat=None):
+        if not self.use_selective_scan and not self.use_deformable_pool:
+            return input
+
         out_ssm = input
 
-        for blk in self.smm_blocks:
-            out_ssm = blk(out_ssm, c)
+        if self.use_selective_scan:
+            for blk in self.smm_blocks:
+                out_ssm = blk(out_ssm, c)
 
         out_ssm_permuted = out_ssm.permute(0, 3, 1, 2).contiguous()
 
-        if pool_feat is not None:
-            v_pool = pool_feat.permute(0, 3, 1, 2).contiguous()
+        if self.use_deformable_pool:
+            if pool_feat is not None:
+                v_pool = pool_feat.permute(0, 3, 1, 2).contiguous()
+            else:
+                v_pool = input.permute(0, 3, 1, 2).contiguous()
+
+            q = self.query_norm(out_ssm_permuted)
+            deform_residual = self.deform_attn(x_query=q, x_pool=v_pool)
+            deform_residual = self.deform_act(deform_residual)
+
+            output = out_ssm_permuted + deform_residual
         else:
-            v_pool = input.permute(0, 3, 1, 2).contiguous()
-
-        q = self.query_norm(out_ssm_permuted)
-        deform_residual = self.deform_attn(x_query=q, x_pool=v_pool)
-        deform_residual = self.deform_act(deform_residual)
-
-        output = out_ssm_permuted + deform_residual
+            output = out_ssm_permuted
 
         output = output.permute(0, 2, 3, 1).contiguous()
         return output + input
@@ -905,10 +919,13 @@ class FrozenBiomedTextEncoder(nn.Module):
 
 class CSSD(nn.Module):
     def __init__(self, hidden_dim, grid_size, depths=(3, 4, 6, 3), d_state=16, drop_path_rate=0.2,
-                 attn_drop_rate=0.0, scan_type='scan', num_direction=8):
+                 attn_drop_rate=0.0, scan_type='scan', num_direction=8,
+                 use_selective_scan=True, use_deformable_pool=True):
         super().__init__()
         if not isinstance(depths, (list, tuple)) or len(depths) == 0:
             raise ValueError('`depths` must be a non-empty list or tuple.')
+        self.use_selective_scan = bool(use_selective_scan)
+        self.use_deformable_pool = bool(use_deformable_pool)
 
         stage_drop_paths = torch.linspace(0, drop_path_rate, len(depths)).tolist()
         self.stages = nn.ModuleList([
@@ -922,6 +939,8 @@ class CSSD(nn.Module):
                 size=grid_size,
                 scan_type=scan_type,
                 num_direction=num_direction,
+                use_selective_scan=self.use_selective_scan,
+                use_deformable_pool=self.use_deformable_pool,
             )
             for idx, depth in enumerate(depths)
         ])
@@ -1166,6 +1185,8 @@ class MAMBAADBiomedCLIPLocalAdapter(nn.Module):
             attn_drop_rate=model_s.get('attn_drop_rate', 0.0),
             scan_type=model_s.get('scan_type', 'scan'),
             num_direction=model_s.get('num_direction', 8),
+            use_selective_scan=model_s.get('use_selective_scan', True),
+            use_deformable_pool=model_s.get('use_deformable_pool', True),
         )
         self.local_head = nn.Linear(self.visual_dim, 1)
         nn.init.normal_(self.local_head.weight, std=0.02)
@@ -1428,6 +1449,101 @@ class BiomedCLIPLocalConvDecoder(nn.Module):
         return logits.squeeze(1)
 
 
+class ARCCCalibration(nn.Module):
+    """Anomaly-response-guided context calibration for local anomaly logits."""
+
+    def __init__(
+            self,
+            in_dim,
+            use_response=True,
+            use_foreground=True,
+            use_edge=True,
+            kernel_size=3,
+            hidden_dim=None,
+            lambda_init=0.1,
+    ):
+        super().__init__()
+        self.use_response = bool(use_response)
+        self.use_foreground = bool(use_foreground)
+        self.use_edge = bool(use_edge)
+        kernel_size = int(kernel_size)
+        if kernel_size % 2 == 0:
+            raise ValueError('ARCC deformable kernel_size must be odd.')
+        self.kernel_size = kernel_size
+        self.lambda_init = float(lambda_init)
+        extra_channels = int(self.use_response) + int(self.use_foreground) + int(self.use_edge)
+        offset_in_dim = in_dim + extra_channels
+        offset_channels = 3 * kernel_size * kernel_size
+        self.offset_head = nn.Sequential(
+            nn.Conv2d(offset_in_dim, offset_in_dim, kernel_size=3, padding=1, groups=1, bias=False),
+            nn.GELU(),
+            nn.Conv2d(offset_in_dim, offset_channels, kernel_size=3, padding=1),
+        )
+        self.deform_context = ops.DeformConv2d(
+            in_dim,
+            in_dim,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,
+            bias=True,
+        )
+        hidden_dim = int(hidden_dim or max(64, in_dim // 2))
+        self.calibration_head = nn.Sequential(
+            nn.Conv2d(in_dim, hidden_dim, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(num_groups=min(32, hidden_dim), num_channels=hidden_dim),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, 1, kernel_size=1),
+        )
+        nn.init.zeros_(self.offset_head[-1].weight)
+        nn.init.zeros_(self.offset_head[-1].bias)
+        nn.init.zeros_(self.calibration_head[-1].weight)
+        nn.init.zeros_(self.calibration_head[-1].bias)
+
+    def forward(self, feature_map, local_logits, foreground=None, edge=None, image_shape=None):
+        target_shape = feature_map.shape[-2:]
+        guidance = [feature_map]
+        if self.use_response:
+            response = local_logits.unsqueeze(1) if local_logits.ndim == 3 else local_logits
+            if response.shape[-2:] != target_shape:
+                response = F.interpolate(response, size=target_shape, mode='bilinear', align_corners=False)
+            guidance.append(response)
+        if self.use_foreground:
+            if foreground is None:
+                foreground = torch.ones(
+                    feature_map.shape[0],
+                    1,
+                    target_shape[0],
+                    target_shape[1],
+                    device=feature_map.device,
+                    dtype=feature_map.dtype,
+                )
+            elif foreground.shape[-2:] != target_shape:
+                foreground = F.interpolate(foreground.to(dtype=feature_map.dtype), size=target_shape, mode='nearest')
+            guidance.append(foreground.to(dtype=feature_map.dtype))
+        if self.use_edge:
+            if edge is None:
+                edge = torch.zeros(
+                    feature_map.shape[0],
+                    1,
+                    target_shape[0],
+                    target_shape[1],
+                    device=feature_map.device,
+                    dtype=feature_map.dtype,
+                )
+            elif edge.shape[-2:] != target_shape:
+                edge = F.interpolate(edge.to(dtype=feature_map.dtype), size=target_shape, mode='nearest')
+            guidance.append(edge.to(dtype=feature_map.dtype))
+
+        offset_mask = self.offset_head(torch.cat(guidance, dim=1))
+        offset_channels = 2 * self.kernel_size * self.kernel_size
+        offset = offset_mask[:, :offset_channels]
+        mod_mask = torch.sigmoid(offset_mask[:, offset_channels:])
+        context = self.deform_context(feature_map, offset, mod_mask)
+        calibration = self.calibration_head(context)
+        if image_shape is not None and calibration.shape[-2:] != image_shape:
+            calibration = F.interpolate(calibration, size=image_shape, mode='bilinear', align_corners=False)
+        return calibration.squeeze(1), mod_mask
+
+
 class TextGuidedLocalRelationBranch(nn.Module):
     def __init__(
             self,
@@ -1558,6 +1674,8 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
         self.cssd_topk_ratio = float(self.image_branch_kwargs.get('topk_ratio', 0.05))
         self.cssd_image_loss_weight = float(self.image_branch_kwargs.get('loss_weight', 0.1))
         self.use_cssd_image_branch = bool(self.image_branch_kwargs.get('use_cssd', True))
+        self.image_score_source = str(self.image_branch_kwargs.get('image_score_source', 'global')).lower()
+        self.map_topk_ratio = float(self.image_branch_kwargs.get('map_topk_ratio', self.cssd_topk_ratio))
         self.text_reg_weight = float(self.text_guidance_kwargs.get('prototype_reg_weight', 0.05))
 
         self._set_requires_grad(self.loc_decoder, True)
@@ -1655,7 +1773,7 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
             }
         return cssd_image_score, cssd_map
 
-    def _localization_map(self, tokens, spatial_shape, image_shape, t_norm, t_abn):
+    def _localization_map(self, tokens, spatial_shape, image_shape, t_norm, t_abn, imgs=None):
         cnn_logits = self.loc_decoder(tokens, spatial_shape, image_shape)
         semantic_map, semantic_gate = self._semantic_gate(tokens, t_norm, t_abn, spatial_shape, image_shape)
         if bool(self.text_guidance_kwargs.get('enable_gate', True)):
@@ -1664,6 +1782,33 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
         else:
             anomaly_map = cnn_logits
         return anomaly_map, cnn_logits, semantic_map, semantic_gate
+
+    def _map_topk_image_score(self, anomaly_map, imgs, ratio):
+        if anomaly_map.ndim == 3:
+            anomaly_map_4d = anomaly_map.unsqueeze(1)
+        else:
+            anomaly_map_4d = anomaly_map
+        if imgs is not None:
+            foreground, _, _, _ = self._foreground_masks(imgs, anomaly_map_4d.shape[-2:])
+        else:
+            foreground = torch.ones_like(anomaly_map_4d, dtype=torch.bool)
+        flat_map = anomaly_map_4d.flatten(1)
+        flat_fg = foreground.flatten(1).bool()
+        scores = []
+        for idx in range(flat_map.shape[0]):
+            values = flat_map[idx][flat_fg[idx]]
+            if values.numel() == 0:
+                values = flat_map[idx]
+            k = max(1, int(values.numel() * float(ratio)))
+            scores.append(values.topk(k).values.mean())
+        return torch.stack(scores, dim=0)
+
+    def _compose_image_score(self, global_score, cssd_image_score, anomaly_map, imgs):
+        if self.image_score_source == 'map_topk':
+            return self._map_topk_image_score(anomaly_map, imgs, self.map_topk_ratio)
+        if self.image_score_source == 'global_only':
+            return global_score
+        return global_score + self.image_score_beta * cssd_image_score
 
     def _image_bce_loss(self, image_score, label):
         target = torch.full_like(image_score, float(label))
@@ -1706,8 +1851,9 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
             (imgs.shape[2], imgs.shape[3]),
             t_norm=t_norm,
             t_abn=t_abn,
+            imgs=imgs,
         )
-        image_score = global_score + self.image_score_beta * cssd_image_score
+        image_score = self._compose_image_score(global_score, cssd_image_score, anomaly_map, imgs)
 
         if self.training:
             if not compute_label_free:
@@ -1822,7 +1968,7 @@ class MAMBAADBiomedCLIPTGLRANoMamba(MAMBAADBiomedCLIPDualBranchAdapter):
                     torch.cuda.manual_seed_all(int(seed))
             self._reset_module_parameters(self.relation_branch)
 
-    def _localization_map(self, tokens, spatial_shape, image_shape, t_norm, t_abn):
+    def _localization_map(self, tokens, spatial_shape, image_shape, t_norm, t_abn, imgs=None):
         relation_logits, relation_tokens, semantic_map, semantic_gate = self.relation_branch(
             tokens,
             spatial_shape,
@@ -1959,7 +2105,7 @@ class MAMBAADBiomedCLIPTGLRAFull(MAMBAADBiomedCLIPTGLRANoMamba):
             self.fusion_head.reset_parameters()
             nn.init.zeros_(self.fusion_head.bias)
 
-    def _localization_map(self, tokens, spatial_shape, image_shape, t_norm, t_abn):
+    def _localization_map(self, tokens, spatial_shape, image_shape, t_norm, t_abn, imgs=None):
         if self.eval_adapter_mode == 'bypass':
             global_tokens = tokens
         else:
@@ -2019,6 +2165,7 @@ class MAMBAADBiomedCLIPCNNGlobalAuxAdapter(MAMBAADBiomedCLIPDualBranchAdapter):
             image_branch_kwargs=None,
             decoder_kwargs=None,
             global_aux_kwargs=None,
+            arcc_kwargs=None,
             input_mean=(0.485, 0.456, 0.406),
             input_std=(0.229, 0.224, 0.225),
             biomed_mean=(0.48145466, 0.4578275, 0.40821073),
@@ -2042,20 +2189,62 @@ class MAMBAADBiomedCLIPCNNGlobalAuxAdapter(MAMBAADBiomedCLIPDualBranchAdapter):
             biomed_std=biomed_std,
         )
         self.global_aux_kwargs = dict(global_aux_kwargs or {})
+        self.arcc_kwargs = dict(arcc_kwargs or {})
         self.global_gate_scale = nn.Parameter(torch.tensor(float(self.global_aux_kwargs.get('gate_scale_init', 1.0))))
         self.global_gate_bias = nn.Parameter(torch.tensor(float(self.global_aux_kwargs.get('gate_bias_init', 0.0))))
         self.global_eta = nn.Parameter(torch.tensor(float(self.global_aux_kwargs.get('gate_eta_init', 0.05))))
+        self.use_arcc = bool(self.arcc_kwargs.get('use_arcc', False))
+        self.arcc_lambda = nn.Parameter(torch.tensor(float(self.arcc_kwargs.get('lambda_init', 0.1))))
+        if self.use_arcc:
+            self.arcc = ARCCCalibration(
+                self.visual_dim,
+                use_response=bool(self.arcc_kwargs.get('use_response', True)),
+                use_foreground=bool(self.arcc_kwargs.get('use_foreground', True)),
+                use_edge=bool(self.arcc_kwargs.get('use_edge', True)),
+                kernel_size=int(self.arcc_kwargs.get('kernel_size', 3)),
+                hidden_dim=self.arcc_kwargs.get('hidden_dim', None),
+                lambda_init=float(self.arcc_kwargs.get('lambda_init', 0.1)),
+            )
+        else:
+            self.arcc = None
         self._cached_global_tokens = None
         self._cached_global_patch_scores = None
+
+    def train(self, mode=True):
+        super().train(mode)
+        if self.arcc is not None:
+            self.arcc.train(mode)
+        return self
 
     def adapter_param_norm(self):
         total_sq, total_params = super().adapter_param_norm()
         total_sq = total_sq * total_sq
-        for param in [self.global_gate_scale, self.global_gate_bias, self.global_eta]:
+        for param in [self.global_gate_scale, self.global_gate_bias, self.global_eta, self.arcc_lambda]:
             value = param.detach().float()
             total_sq += float(torch.sum(value * value).cpu())
             total_params += value.numel()
+        if self.arcc is not None:
+            for param in self.arcc.parameters():
+                if not param.is_floating_point():
+                    continue
+                value = param.detach().float()
+                total_sq += float(torch.sum(value * value).cpu())
+                total_params += value.numel()
         return math.sqrt(total_sq), total_params
+
+    def reset_adapter_parameters(self, seed=None):
+        super().reset_adapter_parameters(seed=seed)
+        if self.arcc is None:
+            return
+        params = list(self.arcc.parameters())
+        device = params[0].device if params else torch.device('cpu')
+        devices = [device.index] if device.type == 'cuda' and device.index is not None else []
+        with torch.random.fork_rng(devices=devices, enabled=seed is not None):
+            if seed is not None:
+                torch.manual_seed(int(seed))
+                if device.type == 'cuda':
+                    torch.cuda.manual_seed_all(int(seed))
+            self._reset_module_parameters(self.arcc)
 
     def _cssd_image_branch(self, tokens, spatial_shape, image_shape, t_norm, t_abn):
         if self.eval_adapter_mode == 'bypass':
@@ -2089,7 +2278,27 @@ class MAMBAADBiomedCLIPCNNGlobalAuxAdapter(MAMBAADBiomedCLIPDualBranchAdapter):
             }
         return cssd_image_score, cssd_map
 
-    def _localization_map(self, tokens, spatial_shape, image_shape, t_norm, t_abn):
+    def _tokens_to_feature_map(self, tokens, spatial_shape):
+        height, width = spatial_shape
+        return tokens.transpose(1, 2).reshape(tokens.shape[0], tokens.shape[-1], height, width)
+
+    def _apply_arcc(self, cnn_logits, global_tokens, spatial_shape, image_shape, imgs):
+        feature_map = self._tokens_to_feature_map(global_tokens, spatial_shape)
+        foreground = edge = None
+        if imgs is not None:
+            foreground, _, edge, _ = self._foreground_masks(imgs, spatial_shape)
+        g_cal, mod_mask = self.arcc(
+            feature_map,
+            cnn_logits,
+            foreground=foreground,
+            edge=edge,
+            image_shape=image_shape,
+        )
+        arcc_lambda = torch.clamp(self.arcc_lambda, min=0.0, max=2.0)
+        anomaly_map = cnn_logits + arcc_lambda * cnn_logits * torch.tanh(g_cal)
+        return anomaly_map, g_cal, mod_mask, arcc_lambda
+
+    def _localization_map(self, tokens, spatial_shape, image_shape, t_norm, t_abn, imgs=None):
         cnn_logits = self.loc_decoder(tokens, spatial_shape, image_shape)
         semantic_map, semantic_gate = self._semantic_gate(tokens, t_norm, t_abn, spatial_shape, image_shape)
 
@@ -2117,7 +2326,18 @@ class MAMBAADBiomedCLIPCNNGlobalAuxAdapter(MAMBAADBiomedCLIPDualBranchAdapter):
                 align_corners=False,
             ).squeeze(1)
 
-        if bool(self.text_guidance_kwargs.get('enable_gate', True)):
+        g_cal = None
+        arcc_mod_mask = None
+        arcc_lambda = None
+        if self.use_arcc and self.arcc is not None:
+            anomaly_map, g_cal, arcc_mod_mask, arcc_lambda = self._apply_arcc(
+                cnn_logits,
+                global_tokens,
+                spatial_shape,
+                image_shape,
+                imgs,
+            )
+        elif bool(self.text_guidance_kwargs.get('enable_gate', True)):
             semantic_eta = torch.clamp(self.semantic_eta, min=0.0, max=2.0)
             global_eta = torch.clamp(self.global_eta, min=0.0, max=2.0)
             anomaly_map = cnn_logits * (1.0 + semantic_eta * semantic_gate + global_eta * global_gate)
@@ -2132,7 +2352,25 @@ class MAMBAADBiomedCLIPCNNGlobalAuxAdapter(MAMBAADBiomedCLIPDualBranchAdapter):
                 'adapter_global_delta_abs': global_delta.abs().mean(dim=(1, 2)),
                 'adapter_raw_l2': raw.pow(2).sum(dim=-1).sqrt().mean(dim=1),
                 'global_gate_mean': global_gate.detach().flatten(1).mean(dim=1),
+                'arcc_enabled': torch.full(
+                    (tokens.shape[0],),
+                    float(self.use_arcc),
+                    device=tokens.device,
+                    dtype=tokens.dtype,
+                ),
             })
+            if g_cal is not None:
+                self.last_adapter_debug.update({
+                    'arcc_calibration_mean': g_cal.detach().flatten(1).mean(dim=1),
+                    'arcc_calibration_abs_mean': g_cal.detach().abs().flatten(1).mean(dim=1),
+                    'arcc_modulation_mean': arcc_mod_mask.detach().flatten(1).mean(dim=1),
+                    'arcc_lambda': torch.full(
+                        (tokens.shape[0],),
+                        float(arcc_lambda.detach().cpu()),
+                        device=tokens.device,
+                        dtype=tokens.dtype,
+                    ),
+                })
         return anomaly_map, cnn_logits, semantic_map, semantic_gate
 
 
@@ -2169,6 +2407,8 @@ class MAMBAADZeroShot(nn.Module):
             attn_drop_rate=model_s.get('attn_drop_rate', 0.0),
             scan_type=model_s.get('scan_type', 'scan'),
             num_direction=model_s.get('num_direction', 8),
+            use_selective_scan=model_s.get('use_selective_scan', True),
+            use_deformable_pool=model_s.get('use_deformable_pool', True),
         )
         self.label_free_loss = AdaptiveMCLoss(**(adaptive_mc_kwargs or {}))
         self.image_score_topk_ratio = image_score_topk_ratio

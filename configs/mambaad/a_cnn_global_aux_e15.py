@@ -34,3 +34,7 @@ class cfg(dual_branch_cfg):
 
         self.debug_eval = True
         self.debug_eval_vis_per_organ = 30
+        self.debug_eval_save_anomalyclip_style = True
+        self.debug_eval_anomalyclip_style_alpha = 0.5
+        self.debug_eval_anomalyclip_style_size = 512
+        self.debug_eval_anomalyclip_style_draw_mask = True

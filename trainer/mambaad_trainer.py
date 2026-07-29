@@ -384,6 +384,28 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
                 out[key] = value.detach().cpu().float().numpy().reshape(-1)
         return out
 
+    def _prompt_grad_debug(self):
+        module = self._net_module()
+        if module is None:
+            return {}
+        local_params = [
+            getattr(module, 'local_text_delta_normal', None),
+            getattr(module, 'local_text_delta_abnormal', None),
+        ]
+        grads = [param.grad.detach() for param in local_params if param is not None and param.grad is not None]
+        local_grad_norm = 0.0
+        if grads:
+            local_grad_norm = math.sqrt(sum(float(torch.sum(grad.float() * grad.float()).cpu()) for grad in grads))
+        fixed_global_has_grad = False
+        for name, tensor in getattr(module, 'named_buffers', lambda: [])():
+            if 'fixed_global' in name and getattr(tensor, 'grad', None) is not None:
+                fixed_global_has_grad = True
+        return {
+            'local_prompt_grad_present': float(len(grads) > 0),
+            'local_prompt_grad_norm': float(local_grad_norm),
+            'fixed_global_prompt_grad_present': float(fixed_global_has_grad),
+        }
+
     def _rebuild_cross_domain_loaders(self, cfg):
         try:
             from data import get_loader
@@ -889,6 +911,7 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
             raise FloatingPointError(f'Non-finite total loss detected: {float(total_loss.detach().cpu())}')
 
         self.backward_term(total_loss, self.optim)
+        prompt_grad_debug = self._prompt_grad_debug()
 
         update_log_term(
             self.log_terms.get('total'),
@@ -939,14 +962,40 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
                 'loss_cssd_image_normal_weighted',
                 'loss_text_proto_reg',
                 'loss_text_proto_reg_weighted',
+                'loss_prompt_bank_diversity',
+                'loss_prompt_bank_diversity_weighted',
+                'loss_prompt_class_orthogonal',
+                'loss_prompt_class_orthogonal_weighted',
                 'cssd_image_score_mean',
                 'semantic_gate_mean',
+                'fixed_global_normal_norm',
+                'fixed_global_abnormal_norm',
+                'local_normal_norm',
+                'local_abnormal_norm',
+                'local_delta_normal_norm',
+                'local_delta_abnormal_norm',
+                'global_sim_normal_mean',
+                'global_sim_abnormal_mean',
+                'local_patch_sim_normal_mean',
+                'local_patch_sim_abnormal_mean',
+                'local_base_proto_cos_mean',
+                'global_score_mean',
+                'cssd_image_score_mean_debug',
+                'image_score_mean',
+                'local_prompt_bank_size',
+                'prompt_bank_entropy',
+                'prompt_bank_usage_max',
+                'prompt_bank_usage_min',
+                'fixed_global_requires_grad',
+                'local_delta_requires_grad',
+                'prompt_nonfinite',
             ]
             debug_vals = {
                 name: float(self.loss_dict[name].detach().cpu())
                 for name in debug_names
                 if name in self.loss_dict
             }
+            debug_vals.update(prompt_grad_debug)
             has_nan = any(math.isnan(val) or math.isinf(val) for val in debug_vals.values())
             mem_mb = torch.cuda.max_memory_allocated(self.device) / 1024 ** 2
             debug_msg = ' '.join([f'{name}={val:.6f}' for name, val in debug_vals.items()])

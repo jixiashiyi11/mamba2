@@ -8,6 +8,25 @@ class cfg(compact_cfg):
         self.model.name = 'mambaad_biomedclip_dual_branch_adapter'
         self.model.kwargs.update(
             text_guidance_kwargs=dict(
+                text_prompt_mode='decoupled',
+                global_prompt_mode='fixed',
+                local_prompt_mode='learnable_delta',
+                local_prompt_source='generic',
+                local_prompt_source_map=dict(
+                    brain='class',
+                    liver='generic',
+                    retinal='generic',
+                    good='generic',
+                ),
+                stop_local_prompt_image_grad=True,
+                local_prompt_normal=[
+                    'A normal local medical image patch with consistent tissue texture and no focal abnormal signal.',
+                    'A normal anatomical region with preserved local structure and no suspicious bright or dark lesion.',
+                ],
+                local_prompt_abnormal=[
+                    'An abnormal local medical image patch containing a focal lesion or abnormal tissue signal.',
+                    'A suspicious anatomical region with disrupted local structure, abnormal texture, or pathological contrast.',
+                ],
                 enable_gate=True,
                 gate_scale_init=1.0,
                 gate_bias_init=0.0,

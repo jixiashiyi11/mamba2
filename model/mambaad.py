@@ -1020,7 +1020,14 @@ class FrozenBiomedCLIPPatchEncoder(nn.Module):
             return {str(key).lower(): value for key, value in prompt_config.items()}
         raise TypeError(f'`{name}` must be a string or dict, got {type(prompt_config).__name__}.')
 
-    def _resolve_prompt(self, prompt_map, cls_name):
+    def _format_prompt(self, prompt, key):
+        if '{cls_name}' in prompt:
+            return prompt.format(cls_name=key)
+        if '{class_name}' in prompt:
+            return prompt.format(class_name=key)
+        return prompt
+
+    def _resolve_prompts(self, prompt_map, cls_name):
         key = str(cls_name).lower()
         if key in prompt_map:
             prompt = prompt_map[key]
@@ -1033,11 +1040,14 @@ class FrozenBiomedCLIPPatchEncoder(nn.Module):
         else:
             raise KeyError(f'No prompt found for class `{cls_name}`.')
 
-        if '{cls_name}' in prompt:
-            return prompt.format(cls_name=key)
-        if '{class_name}' in prompt:
-            return prompt.format(class_name=key)
-        return prompt
+        if isinstance(prompt, (list, tuple)):
+            if len(prompt) == 0:
+                raise ValueError(f'Prompt list for class `{cls_name}` must not be empty.')
+            return [self._format_prompt(str(item), key) for item in prompt]
+        return [self._format_prompt(str(prompt), key)]
+
+    def _resolve_prompt(self, prompt_map, cls_name):
+        return self._resolve_prompts(prompt_map, cls_name)[0]
 
     def _expand_cls_names(self, cls_names, batch_size):
         if cls_names is None:
@@ -1129,11 +1139,42 @@ class FrozenBiomedCLIPPatchEncoder(nn.Module):
 
     def encode_text_pairs(self, cls_names, batch_size, device):
         cls_names = self._expand_cls_names(cls_names, batch_size)
-        normal_prompts = [self._resolve_prompt(self.normal_prompt_map, name) for name in cls_names]
-        abnormal_prompts = [self._resolve_prompt(self.abnormal_prompt_map, name) for name in cls_names]
-        tokens = self.tokenizer(normal_prompts + abnormal_prompts).to(device)
+        normal_prompt_sets = [self._resolve_prompts(self.normal_prompt_map, name) for name in cls_names]
+        abnormal_prompt_sets = [self._resolve_prompts(self.abnormal_prompt_map, name) for name in cls_names]
+        return self.encode_prompt_sets(normal_prompt_sets, abnormal_prompt_sets, device=device)
+
+    def _normalize_prompt_value(self, prompt_value, name):
+        if isinstance(prompt_value, str):
+            return [prompt_value]
+        if isinstance(prompt_value, (list, tuple)):
+            if len(prompt_value) == 0:
+                raise ValueError(f'`{name}` must not be an empty list.')
+            return [str(item) for item in prompt_value]
+        raise TypeError(f'`{name}` must be a string or list, got {type(prompt_value).__name__}.')
+
+    def encode_prompt_sets(self, normal_prompt_sets, abnormal_prompt_sets, device):
+        if len(normal_prompt_sets) != len(abnormal_prompt_sets):
+            raise ValueError('Normal and abnormal prompt sets must have the same batch length.')
+        flat_prompts = []
+        slices = []
+        for prompt_set in list(normal_prompt_sets) + list(abnormal_prompt_sets):
+            start = len(flat_prompts)
+            flat_prompts.extend([str(prompt) for prompt in prompt_set])
+            slices.append((start, len(flat_prompts)))
+        tokens = self.tokenizer(flat_prompts).to(device)
         features = F.normalize(self.model.encode_text(tokens), p=2, dim=-1)
-        return features[:batch_size], features[batch_size:]
+        pooled = []
+        for start, end in slices:
+            pooled.append(F.normalize(features[start:end].mean(dim=0), p=2, dim=-1))
+        pooled = torch.stack(pooled, dim=0)
+        batch_size = len(normal_prompt_sets)
+        return pooled[:batch_size], pooled[batch_size:]
+
+    def encode_static_text_pairs(self, prompt_normal, prompt_abnormal, batch_size, device):
+        normal_prompts = self._normalize_prompt_value(prompt_normal, 'prompt_normal')
+        abnormal_prompts = self._normalize_prompt_value(prompt_abnormal, 'prompt_abnormal')
+        t_norm, t_abn = self.encode_prompt_sets([normal_prompts], [abnormal_prompts], device=device)
+        return t_norm.expand(batch_size, -1).contiguous(), t_abn.expand(batch_size, -1).contiguous()
 
     def encode_image_and_patches(self, imgs):
         biomed_imgs = self._prepare_images(imgs)
@@ -1568,8 +1609,12 @@ class TextGuidedLocalRelationBranch(nn.Module):
     def _semantic_score(self, tokens, t_norm, t_abn):
         t_norm = F.normalize(t_norm, p=2, dim=-1)
         t_abn = F.normalize(t_abn, p=2, dim=-1)
-        sim_normal = torch.einsum('bld,bd->bl', tokens, t_norm)
-        sim_abnormal = torch.einsum('bld,bd->bl', tokens, t_abn)
+        if t_norm.ndim == 3:
+            sim_normal = torch.einsum('bld,bld->bl', tokens, t_norm)
+            sim_abnormal = torch.einsum('bld,bld->bl', tokens, t_abn)
+        else:
+            sim_normal = torch.einsum('bld,bd->bl', tokens, t_norm)
+            sim_abnormal = torch.einsum('bld,bd->bl', tokens, t_abn)
         if self.semantic_direction in ('normal_minus_abnormal', 'normal-abnormal', 'old'):
             return sim_normal - sim_abnormal
         return sim_abnormal - sim_normal
@@ -1665,8 +1710,24 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
             hidden_dims=self.decoder_kwargs.get('hidden_dims', (256, 128, 64)),
             dropout=float(self.decoder_kwargs.get('dropout', 0.0)),
         )
-        self.text_delta_normal = nn.Parameter(torch.zeros(self.visual_dim))
-        self.text_delta_abnormal = nn.Parameter(torch.zeros(self.visual_dim))
+        self.local_prompt_bank_size = max(1, int(self.text_guidance_kwargs.get('num_local_prompt_banks', 1)))
+        self.local_prompt_bank_temperature = max(
+            1.0e-4,
+            float(self.text_guidance_kwargs.get('prompt_bank_temperature', 1.0)),
+        )
+        self.prompt_bank_diversity_weight = float(self.text_guidance_kwargs.get('prompt_bank_diversity_weight', 0.0))
+        self.prompt_bank_class_orthogonal_weight = float(
+            self.text_guidance_kwargs.get('prompt_bank_class_orthogonal_weight', 0.0)
+        )
+        self.local_prompt_bank_init_std = float(self.text_guidance_kwargs.get('prompt_bank_init_std', 0.0))
+        self.local_text_delta_normal = nn.Parameter(torch.zeros(self.local_prompt_bank_size, self.visual_dim))
+        self.local_text_delta_abnormal = nn.Parameter(torch.zeros(self.local_prompt_bank_size, self.visual_dim))
+        if self.local_prompt_bank_size > 1 and self.local_prompt_bank_init_std > 0:
+            nn.init.normal_(self.local_text_delta_normal, std=self.local_prompt_bank_init_std)
+            nn.init.normal_(self.local_text_delta_abnormal, std=self.local_prompt_bank_init_std)
+        self.local_prompt_router = nn.Linear(self.visual_dim, self.local_prompt_bank_size)
+        nn.init.zeros_(self.local_prompt_router.weight)
+        nn.init.zeros_(self.local_prompt_router.bias)
         self.semantic_scale = nn.Parameter(torch.tensor(float(self.text_guidance_kwargs.get('gate_scale_init', 1.0))))
         self.semantic_bias = nn.Parameter(torch.tensor(float(self.text_guidance_kwargs.get('gate_bias_init', 0.0))))
         self.semantic_eta = nn.Parameter(torch.tensor(float(self.text_guidance_kwargs.get('gate_eta_init', 0.1))))
@@ -1677,51 +1738,411 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
         self.image_score_source = str(self.image_branch_kwargs.get('image_score_source', 'global')).lower()
         self.map_topk_ratio = float(self.image_branch_kwargs.get('map_topk_ratio', self.cssd_topk_ratio))
         self.text_reg_weight = float(self.text_guidance_kwargs.get('prototype_reg_weight', 0.05))
+        self.text_prompt_mode = str(self.text_guidance_kwargs.get('text_prompt_mode', 'decoupled')).lower()
+        self.global_prompt_mode = str(self.text_guidance_kwargs.get('global_prompt_mode', 'fixed')).lower()
+        self.local_prompt_mode = str(self.text_guidance_kwargs.get('local_prompt_mode', 'learnable_delta')).lower()
+        self.local_prompt_source = str(self.text_guidance_kwargs.get('local_prompt_source', 'class')).lower()
+        self.local_prompt_source_map = {
+            str(key).lower(): str(value).lower()
+            for key, value in dict(self.text_guidance_kwargs.get('local_prompt_source_map', {})).items()
+        }
+        self.local_prompt_blend_weight = float(self.text_guidance_kwargs.get('local_prompt_blend_weight', 0.5))
+        self.stop_local_prompt_image_grad = bool(self.text_guidance_kwargs.get('stop_local_prompt_image_grad', True))
+        self.local_prompt_normal = self.text_guidance_kwargs.get(
+            'local_prompt_normal',
+            [
+                'A normal local medical image patch with consistent tissue texture and no focal abnormal signal.',
+                'A normal anatomical region with preserved local structure and no suspicious bright or dark lesion.',
+            ],
+        )
+        self.local_prompt_abnormal = self.text_guidance_kwargs.get(
+            'local_prompt_abnormal',
+            [
+                'An abnormal local medical image patch containing a focal lesion or abnormal tissue signal.',
+                'A suspicious anatomical region with disrupted local structure, abnormal texture, or pathological contrast.',
+            ],
+        )
+        self._validate_prompt_modes()
 
         self._set_requires_grad(self.loc_decoder, True)
         self._set_requires_grad(self.local_adapter, True)
         # The old linear head is kept for checkpoint compatibility but is not used by this v2 route.
         self._set_requires_grad(self.local_head, False)
+        self._configure_prompt_grad_flags()
+        self.last_prompt_debug = {}
+        self._last_prompt_bank_weights = None
+
+    def _validate_prompt_modes(self):
+        text_modes = {'decoupled', 'shared', 'legacy'}
+        global_modes = {'fixed', 'shared'}
+        local_modes = {'learnable_delta', 'fixed', 'shared'}
+        local_sources = {'class', 'generic', 'blend'}
+        if self.text_prompt_mode not in text_modes:
+            raise ValueError(f'Invalid text_prompt_mode={self.text_prompt_mode}. Expected one of {sorted(text_modes)}.')
+        if self.text_prompt_mode == 'legacy':
+            self.text_prompt_mode = 'shared'
+        if self.global_prompt_mode not in global_modes:
+            raise ValueError(f'Invalid global_prompt_mode={self.global_prompt_mode}. Expected one of {sorted(global_modes)}.')
+        if self.local_prompt_mode not in local_modes:
+            raise ValueError(f'Invalid local_prompt_mode={self.local_prompt_mode}. Expected one of {sorted(local_modes)}.')
+        if self.local_prompt_source not in local_sources:
+            raise ValueError(f'Invalid local_prompt_source={self.local_prompt_source}. Expected one of {sorted(local_sources)}.')
+        invalid_sources = {
+            key: value for key, value in self.local_prompt_source_map.items()
+            if value not in local_sources
+        }
+        if invalid_sources:
+            raise ValueError(f'Invalid local_prompt_source_map entries: {invalid_sources}. Expected one of {sorted(local_sources)}.')
+        self.local_prompt_blend_weight = max(0.0, min(1.0, self.local_prompt_blend_weight))
+
+    def _configure_prompt_grad_flags(self):
+        learnable_local = self.local_prompt_mode in ('learnable_delta', 'shared') or self.text_prompt_mode == 'shared'
+        for param in [self.local_text_delta_normal, self.local_text_delta_abnormal]:
+            param.requires_grad = bool(learnable_local)
+        self._set_requires_grad(self.local_prompt_router, bool(learnable_local and self.local_prompt_bank_size > 1))
+
+    def load_compatible_state_dict(self, state_dict, strict=True):
+        state_dict = dict(state_dict)
+        compat_messages = []
+        legacy_to_local = {
+            'text_delta_normal': 'local_text_delta_normal',
+            'text_delta_abnormal': 'local_text_delta_abnormal',
+        }
+        for old_key, new_key in legacy_to_local.items():
+            if new_key not in state_dict and old_key in state_dict:
+                state_dict[new_key] = state_dict[old_key]
+                compat_messages.append(f'mapped legacy `{old_key}` -> `{new_key}`')
+            if old_key in state_dict:
+                del state_dict[old_key]
+
+        current_state = self.state_dict()
+        for key in ['local_text_delta_normal', 'local_text_delta_abnormal']:
+            if key not in state_dict or key not in current_state:
+                continue
+            source = state_dict[key]
+            target = current_state[key]
+            if tuple(source.shape) == tuple(target.shape):
+                continue
+            if source.ndim == 1 and target.ndim == 2 and source.shape[0] == target.shape[1]:
+                state_dict[key] = source.unsqueeze(0).expand(target.shape[0], -1).clone()
+                compat_messages.append(f'expanded `{key}` from {tuple(source.shape)} to {tuple(target.shape)}')
+            elif source.ndim == 2 and target.ndim == 2 and source.shape[1] == target.shape[1]:
+                if source.shape[0] >= target.shape[0]:
+                    state_dict[key] = source[:target.shape[0]].clone()
+                else:
+                    repeat = math.ceil(float(target.shape[0]) / float(source.shape[0]))
+                    state_dict[key] = source.repeat(repeat, 1)[:target.shape[0]].clone()
+                compat_messages.append(f'resized `{key}` from {tuple(source.shape)} to {tuple(target.shape)}')
+
+        incompatible = self.load_state_dict(state_dict, strict=False)
+        allowed_missing = {
+            'local_text_delta_normal',
+            'local_text_delta_abnormal',
+            'local_prompt_router.weight',
+            'local_prompt_router.bias',
+        }
+        missing = list(incompatible.missing_keys)
+        unexpected = list(incompatible.unexpected_keys)
+        critical_missing = [key for key in missing if key not in allowed_missing]
+        critical_unexpected = [key for key in unexpected if not key.startswith('local_prompt_router.')]
+        if missing:
+            compat_messages.append(f'missing keys: {missing}')
+        if unexpected:
+            compat_messages.append(f'unexpected keys: {unexpected}')
+        if compat_messages:
+            print('==> PromptCheckpointCompat ' + '; '.join(compat_messages))
+        if strict and (critical_missing or critical_unexpected):
+            raise RuntimeError(
+                'Checkpoint is incompatible after prompt migration. '
+                f'critical_missing={critical_missing}, critical_unexpected={critical_unexpected}'
+            )
+        return incompatible
 
     def train(self, mode=True):
         self.training = mode
         self.biomedclip.eval()
         self.local_adapter.train(mode)
         self.loc_decoder.train(mode)
+        self.local_prompt_router.train(mode)
         self.local_head.eval()
         return self
+
+    def reset_adapter_parameters(self, seed=None):
+        params = (
+            list(self.local_adapter.parameters())
+            + list(self.loc_decoder.parameters())
+            + list(self.local_prompt_router.parameters())
+        )
+        device = params[0].device if params else torch.device('cpu')
+        devices = [device.index] if device.type == 'cuda' and device.index is not None else []
+        with torch.random.fork_rng(devices=devices, enabled=seed is not None):
+            if seed is not None:
+                torch.manual_seed(int(seed))
+                if device.type == 'cuda':
+                    torch.cuda.manual_seed_all(int(seed))
+            self._reset_module_parameters(self.local_adapter)
+            self._reset_module_parameters(self.loc_decoder)
+            self.local_prompt_router.reset_parameters()
+            nn.init.zeros_(self.local_prompt_router.weight)
+            nn.init.zeros_(self.local_prompt_router.bias)
+            with torch.no_grad():
+                self.local_text_delta_normal.zero_()
+                self.local_text_delta_abnormal.zero_()
+                if self.local_prompt_bank_size > 1 and self.local_prompt_bank_init_std > 0:
+                    self.local_text_delta_normal.normal_(std=self.local_prompt_bank_init_std)
+                    self.local_text_delta_abnormal.normal_(std=self.local_prompt_bank_init_std)
 
     def adapter_param_norm(self):
         total_sq = 0.0
         total_params = 0
-        for module in [self.local_adapter, self.loc_decoder]:
+        for module in [self.local_adapter, self.loc_decoder, self.local_prompt_router]:
             for param in module.parameters():
                 if not param.is_floating_point():
                     continue
                 value = param.detach().float()
                 total_sq += float(torch.sum(value * value).cpu())
                 total_params += value.numel()
-        for param in [self.text_delta_normal, self.text_delta_abnormal, self.semantic_scale, self.semantic_bias, self.semantic_eta]:
+        for param in [
+            self.local_text_delta_normal,
+            self.local_text_delta_abnormal,
+            self.semantic_scale,
+            self.semantic_bias,
+            self.semantic_eta,
+        ]:
             value = param.detach().float()
             total_sq += float(torch.sum(value * value).cpu())
             total_params += value.numel()
         return math.sqrt(total_sq), total_params
 
-    def _learnable_text_pairs(self, t_norm, t_abn):
-        delta_norm = self.text_delta_normal.to(device=t_norm.device, dtype=t_norm.dtype).unsqueeze(0)
-        delta_abn = self.text_delta_abnormal.to(device=t_abn.device, dtype=t_abn.dtype).unsqueeze(0)
-        learn_norm = F.normalize(t_norm + delta_norm, p=2, dim=-1)
-        learn_abn = F.normalize(t_abn + delta_abn, p=2, dim=-1)
+    def _learnable_text_pairs(self, t_norm, t_abn, tokens=None):
+        delta_norm = self.local_text_delta_normal.to(device=t_norm.device, dtype=t_norm.dtype)
+        delta_abn = self.local_text_delta_abnormal.to(device=t_abn.device, dtype=t_abn.dtype)
+        bank_norm = F.normalize(t_norm.unsqueeze(1) + delta_norm.unsqueeze(0), p=2, dim=-1)
+        bank_abn = F.normalize(t_abn.unsqueeze(1) + delta_abn.unsqueeze(0), p=2, dim=-1)
+        if self.local_prompt_bank_size <= 1 or tokens is None:
+            self._last_prompt_bank_weights = None
+            return bank_norm[:, 0], bank_abn[:, 0]
+        router_logits = self.local_prompt_router(tokens.to(dtype=t_norm.dtype)) / self.local_prompt_bank_temperature
+        router_weights = F.softmax(router_logits, dim=-1)
+        learn_norm = F.normalize(torch.einsum('blk,bkd->bld', router_weights, bank_norm), p=2, dim=-1)
+        learn_abn = F.normalize(torch.einsum('blk,bkd->bld', router_weights, bank_abn), p=2, dim=-1)
+        self._last_prompt_bank_weights = router_weights.detach()
         return learn_norm, learn_abn
 
+    @property
+    def text_delta_normal(self):
+        return self.local_text_delta_normal
+
+    @property
+    def text_delta_abnormal(self):
+        return self.local_text_delta_abnormal
+
+    def _fixed_text_pairs(self, cls_names, batch_size, device):
+        with torch.no_grad():
+            t_norm, t_abn = self.biomedclip.encode_text_pairs(
+                cls_names,
+                batch_size=batch_size,
+                device=device,
+            )
+        return t_norm.detach(), t_abn.detach()
+
+    def _local_sources_for_batch(self, cls_names, batch_size):
+        cls_names = self.biomedclip._expand_cls_names(cls_names, batch_size)
+        return [self.local_prompt_source_map.get(str(name).lower(), self.local_prompt_source) for name in cls_names]
+
+    def _local_base_text_pairs(self, cls_names, batch_size, device, global_base_norm=None, global_base_abn=None):
+        if self.text_prompt_mode == 'shared' or self.local_prompt_mode == 'shared':
+            if global_base_norm is not None and global_base_abn is not None:
+                return global_base_norm.detach(), global_base_abn.detach()
+            return self._fixed_text_pairs(cls_names, batch_size, device)
+
+        sources = self._local_sources_for_batch(cls_names, batch_size)
+        if len(set(sources)) == 1 and sources[0] == 'class':
+            if global_base_norm is not None and global_base_abn is not None:
+                return global_base_norm.detach(), global_base_abn.detach()
+            return self._fixed_text_pairs(cls_names, batch_size, device)
+
+        need_class = any(source in ('class', 'blend') for source in sources)
+        class_norm, class_abn = None, None
+        if need_class:
+            if global_base_norm is not None and global_base_abn is not None:
+                class_norm, class_abn = global_base_norm.detach(), global_base_abn.detach()
+            else:
+                class_norm, class_abn = self._fixed_text_pairs(cls_names, batch_size, device)
+
+        with torch.no_grad():
+            generic_norm, generic_abn = self.biomedclip.encode_static_text_pairs(
+                self.local_prompt_normal,
+                self.local_prompt_abnormal,
+                batch_size=batch_size,
+                device=device,
+            )
+        generic_norm, generic_abn = generic_norm.detach(), generic_abn.detach()
+        if len(set(sources)) == 1 and sources[0] == 'generic':
+            return generic_norm, generic_abn
+
+        local_norms = []
+        local_abns = []
+        for idx, source in enumerate(sources):
+            if source == 'class':
+                local_norms.append(class_norm[idx])
+                local_abns.append(class_abn[idx])
+            elif source == 'generic':
+                local_norms.append(generic_norm[idx])
+                local_abns.append(generic_abn[idx])
+            else:
+                class_weight = self.local_prompt_blend_weight
+                generic_weight = 1.0 - class_weight
+                local_norms.append(F.normalize(class_weight * class_norm[idx] + generic_weight * generic_norm[idx], p=2, dim=-1))
+                local_abns.append(F.normalize(class_weight * class_abn[idx] + generic_weight * generic_abn[idx], p=2, dim=-1))
+        return torch.stack(local_norms, dim=0).detach(), torch.stack(local_abns, dim=0).detach()
+
+    def _local_text_pairs(self, base_t_norm, base_t_abn, tokens=None):
+        if self.local_prompt_mode == 'fixed':
+            self._last_prompt_bank_weights = None
+            return F.normalize(base_t_norm.detach(), p=2, dim=-1), F.normalize(base_t_abn.detach(), p=2, dim=-1)
+        return self._learnable_text_pairs(base_t_norm.detach(), base_t_abn.detach(), tokens=tokens)
+
+    def _global_text_pairs(self, fixed_t_norm, fixed_t_abn, local_t_norm, local_t_abn):
+        if self.text_prompt_mode == 'shared' or self.global_prompt_mode == 'shared':
+            if local_t_norm.ndim == 3:
+                local_t_norm = F.normalize(local_t_norm.mean(dim=1), p=2, dim=-1)
+                local_t_abn = F.normalize(local_t_abn.mean(dim=1), p=2, dim=-1)
+            if self.stop_local_prompt_image_grad:
+                return local_t_norm.detach(), local_t_abn.detach()
+            return local_t_norm, local_t_abn
+        return fixed_t_norm.detach(), fixed_t_abn.detach()
+
+    def _text_similarity(self, tokens, text):
+        text = F.normalize(text, p=2, dim=-1)
+        if text.ndim == 2:
+            return torch.einsum('bld,bd->bl', tokens, text)
+        if text.ndim == 3:
+            if text.shape[:2] != tokens.shape[:2]:
+                raise ValueError(
+                    f'Patch-conditioned text shape {tuple(text.shape)} must match token batch/grid '
+                    f'{tuple(tokens.shape[:2])}.'
+                )
+            return torch.einsum('bld,bld->bl', tokens, text)
+        raise ValueError(f'Text prototypes must be [B, D] or [B, L, D], got {tuple(text.shape)}.')
+
+    def _record_prompt_debug(
+            self,
+            image_features,
+            tokens,
+            fixed_global_norm,
+            fixed_global_abn,
+            local_base_norm,
+            local_base_abn,
+            local_norm,
+            local_abn,
+            global_score,
+            cssd_image_score,
+            image_score,
+    ):
+        with torch.no_grad():
+            global_sim_normal = torch.sum(image_features.detach() * fixed_global_norm.detach(), dim=1)
+            global_sim_abnormal = torch.sum(image_features.detach() * fixed_global_abn.detach(), dim=1)
+            local_sim_normal = self._text_similarity(tokens.detach(), local_norm.detach())
+            local_sim_abnormal = self._text_similarity(tokens.detach(), local_abn.detach())
+            if local_norm.ndim == 3:
+                local_base_norm_for_cos = local_base_norm.detach().unsqueeze(1)
+                local_base_abn_for_cos = local_base_abn.detach().unsqueeze(1)
+            else:
+                local_base_norm_for_cos = local_base_norm.detach()
+                local_base_abn_for_cos = local_base_abn.detach()
+            local_base_sim = (
+                torch.sum(F.normalize(local_base_norm_for_cos, p=2, dim=-1) * F.normalize(local_norm.detach(), p=2, dim=-1), dim=-1)
+                + torch.sum(F.normalize(local_base_abn_for_cos, p=2, dim=-1) * F.normalize(local_abn.detach(), p=2, dim=-1), dim=-1)
+            ) * 0.5
+            tensors = [
+                fixed_global_norm,
+                fixed_global_abn,
+                local_norm,
+                local_abn,
+                global_score,
+                cssd_image_score,
+                image_score,
+            ]
+            nonfinite = any(not torch.isfinite(t.detach()).all().item() for t in tensors)
+            self.last_prompt_debug = {
+                'fixed_global_normal_norm': fixed_global_norm.detach().norm(dim=-1).mean(),
+                'fixed_global_abnormal_norm': fixed_global_abn.detach().norm(dim=-1).mean(),
+                'local_normal_norm': local_norm.detach().norm(dim=-1).mean(),
+                'local_abnormal_norm': local_abn.detach().norm(dim=-1).mean(),
+                'local_delta_normal_norm': self.local_text_delta_normal.detach().float().norm(),
+                'local_delta_abnormal_norm': self.local_text_delta_abnormal.detach().float().norm(),
+                'global_sim_normal_mean': global_sim_normal.mean(),
+                'global_sim_abnormal_mean': global_sim_abnormal.mean(),
+                'local_patch_sim_normal_mean': local_sim_normal.mean(),
+                'local_patch_sim_abnormal_mean': local_sim_abnormal.mean(),
+                'local_base_proto_cos_mean': local_base_sim.mean(),
+                'global_score_mean': global_score.detach().mean(),
+                'cssd_image_score_mean_debug': cssd_image_score.detach().mean(),
+                'image_score_mean': image_score.detach().mean(),
+                'local_prompt_bank_size': torch.tensor(
+                    float(self.local_prompt_bank_size),
+                    device=image_score.device,
+                    dtype=image_score.dtype,
+                ),
+                'fixed_global_requires_grad': torch.tensor(
+                    float(fixed_global_norm.requires_grad or fixed_global_abn.requires_grad),
+                    device=image_score.device,
+                    dtype=image_score.dtype,
+                ),
+                'local_delta_requires_grad': torch.tensor(
+                    float(
+                        self.local_text_delta_normal.requires_grad
+                        or self.local_text_delta_abnormal.requires_grad
+                    ),
+                    device=image_score.device,
+                    dtype=image_score.dtype,
+                ),
+                'prompt_nonfinite': torch.tensor(float(nonfinite), device=image_score.device, dtype=image_score.dtype),
+            }
+            weights = self._last_prompt_bank_weights
+            if weights is not None:
+                entropy = -(weights * weights.clamp_min(1.0e-8).log()).sum(dim=-1)
+                usage = weights.mean(dim=(0, 1))
+                self.last_prompt_debug.update({
+                    'prompt_bank_entropy': entropy.mean(),
+                    'prompt_bank_usage_max': usage.max(),
+                    'prompt_bank_usage_min': usage.min(),
+                })
+
     def _text_prototype_regularization(self, t_norm, t_abn, learn_norm, learn_abn):
+        if learn_norm.ndim == 3:
+            t_norm = t_norm.unsqueeze(1)
+            t_abn = t_abn.unsqueeze(1)
         loss_norm = 1.0 - torch.sum(F.normalize(t_norm, p=2, dim=-1) * learn_norm, dim=-1)
         loss_abn = 1.0 - torch.sum(F.normalize(t_abn, p=2, dim=-1) * learn_abn, dim=-1)
         return (loss_norm + loss_abn).mean()
 
+    def _prompt_bank_diversity_regularization(self, base_t_norm, base_t_abn):
+        if self.local_prompt_bank_size <= 1:
+            return base_t_norm.new_tensor(0.0)
+        delta_norm = self.local_text_delta_normal.to(device=base_t_norm.device, dtype=base_t_norm.dtype)
+        delta_abn = self.local_text_delta_abnormal.to(device=base_t_abn.device, dtype=base_t_abn.dtype)
+        bank_norm = F.normalize(base_t_norm.unsqueeze(1) + delta_norm.unsqueeze(0), p=2, dim=-1)
+        bank_abn = F.normalize(base_t_abn.unsqueeze(1) + delta_abn.unsqueeze(0), p=2, dim=-1)
+        eye = torch.eye(self.local_prompt_bank_size, device=base_t_norm.device, dtype=torch.bool).unsqueeze(0)
+        sim_norm = torch.matmul(bank_norm, bank_norm.transpose(1, 2)).masked_fill(eye, 0.0)
+        sim_abn = torch.matmul(bank_abn, bank_abn.transpose(1, 2)).masked_fill(eye, 0.0)
+        denom = float(self.local_prompt_bank_size * max(self.local_prompt_bank_size - 1, 1))
+        return (sim_norm.pow(2).sum(dim=(1, 2)) + sim_abn.pow(2).sum(dim=(1, 2))).mean() / (2.0 * denom)
+
+    def _prompt_bank_class_orthogonal_regularization(self, fixed_norm, fixed_abn, local_norm, local_abn):
+        if self.prompt_bank_class_orthogonal_weight <= 0:
+            return fixed_norm.new_tensor(0.0)
+        class_direction = F.normalize(fixed_abn.detach() - fixed_norm.detach(), p=2, dim=-1)
+        local_direction = F.normalize(local_abn - local_norm, p=2, dim=-1)
+        if local_direction.ndim == 3:
+            class_direction = class_direction.unsqueeze(1)
+        return torch.sum(local_direction * class_direction, dim=-1).abs().mean()
+
     def _semantic_gate(self, tokens, t_norm, t_abn, spatial_shape, image_shape):
-        sim_normal = torch.einsum('bld,bd->bl', tokens, F.normalize(t_norm, p=2, dim=-1))
-        sim_abnormal = torch.einsum('bld,bd->bl', tokens, F.normalize(t_abn, p=2, dim=-1))
+        sim_normal = self._text_similarity(tokens, t_norm)
+        sim_abnormal = self._text_similarity(tokens, t_abn)
         # Prior diagnostic showed normal-minus-abnormal is the better localization direction.
         semantic = sim_normal - sim_abnormal
         gate = torch.sigmoid(self.semantic_scale * semantic + self.semantic_bias)
@@ -1743,13 +2164,16 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
             ).squeeze(1)
         return semantic_map, gate_map
 
-    def _cssd_image_branch(self, tokens, spatial_shape, image_shape, t_norm, t_abn):
+    def _cssd_image_branch(self, tokens, spatial_shape, image_shape, t_norm, t_abn, detach_text=False):
         if (not self.use_cssd_image_branch) or self.eval_adapter_mode == 'bypass':
             refined = tokens
         else:
             refined = self.local_adapter(tokens, None, spatial_shape)
-        sim_normal = torch.einsum('bld,bd->bl', refined, F.normalize(t_norm, p=2, dim=-1))
-        sim_abnormal = torch.einsum('bld,bd->bl', refined, F.normalize(t_abn, p=2, dim=-1))
+        if detach_text:
+            t_norm = t_norm.detach()
+            t_abn = t_abn.detach()
+        sim_normal = self._text_similarity(refined, t_norm)
+        sim_abnormal = self._text_similarity(refined, t_abn)
         patch_scores = sim_abnormal - sim_normal
         topk = max(1, int(patch_scores.shape[1] * self.cssd_topk_ratio))
         cssd_image_score = patch_scores.topk(topk, dim=1).values.mean(dim=1)
@@ -1831,19 +2255,25 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
 
         with torch.no_grad():
             image_features, tokens, spatial_shape = self.biomedclip.encode_image_and_patches(imgs)
-            base_t_norm, base_t_abn = self.biomedclip.encode_text_pairs(
-                score_cls_names,
-                batch_size=imgs.shape[0],
-                device=imgs.device,
-            )
-        t_norm, t_abn = self._learnable_text_pairs(base_t_norm.detach(), base_t_abn.detach())
-        global_score = torch.sum(image_features.detach() * t_abn, dim=1) - torch.sum(image_features.detach() * t_norm, dim=1)
+        fixed_global_norm, fixed_global_abn = self._fixed_text_pairs(score_cls_names, imgs.shape[0], imgs.device)
+        local_base_norm, local_base_abn = self._local_base_text_pairs(
+            score_cls_names,
+            imgs.shape[0],
+            imgs.device,
+            global_base_norm=fixed_global_norm,
+            global_base_abn=fixed_global_abn,
+        )
+        t_norm, t_abn = self._local_text_pairs(local_base_norm, local_base_abn, tokens=tokens.detach())
+        global_t_norm, global_t_abn = self._global_text_pairs(fixed_global_norm, fixed_global_abn, t_norm, t_abn)
+        global_score = torch.sum(image_features.detach() * global_t_abn, dim=1) - torch.sum(image_features.detach() * global_t_norm, dim=1)
+        detach_local_text_for_image = bool(self.training and self.stop_local_prompt_image_grad)
         cssd_image_score, cssd_map = self._cssd_image_branch(
             tokens.detach(),
             spatial_shape,
             (imgs.shape[2], imgs.shape[3]),
             t_norm=t_norm,
             t_abn=t_abn,
+            detach_text=detach_local_text_for_image,
         )
         anomaly_map, cnn_map, semantic_map, semantic_gate = self._localization_map(
             tokens.detach(),
@@ -1854,6 +2284,19 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
             imgs=imgs,
         )
         image_score = self._compose_image_score(global_score, cssd_image_score, anomaly_map, imgs)
+        self._record_prompt_debug(
+            image_features,
+            tokens,
+            fixed_global_norm,
+            fixed_global_abn,
+            local_base_norm,
+            local_base_abn,
+            t_norm,
+            t_abn,
+            global_score,
+            cssd_image_score,
+            image_score,
+        )
 
         if self.training:
             if not compute_label_free:
@@ -1868,15 +2311,38 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
                 }
             out = self._localization_losses(anomaly_map.unsqueeze(1), imgs)
             loss_img_normal = self._image_bce_loss(cssd_image_score, 0.0)
-            loss_text_reg = self._text_prototype_regularization(base_t_norm.detach(), base_t_abn.detach(), t_norm, t_abn)
-            out['total'] = out['total'] + self.cssd_image_loss_weight * loss_img_normal + self.text_reg_weight * loss_text_reg
+            loss_text_reg = self._text_prototype_regularization(local_base_norm.detach(), local_base_abn.detach(), t_norm, t_abn)
+            loss_prompt_bank_div = self._prompt_bank_diversity_regularization(
+                local_base_norm.detach(),
+                local_base_abn.detach(),
+            )
+            loss_prompt_class_orth = self._prompt_bank_class_orthogonal_regularization(
+                fixed_global_norm.detach(),
+                fixed_global_abn.detach(),
+                t_norm,
+                t_abn,
+            )
+            out['total'] = (
+                out['total']
+                + self.cssd_image_loss_weight * loss_img_normal
+                + self.text_reg_weight * loss_text_reg
+                + self.prompt_bank_diversity_weight * loss_prompt_bank_div
+                + self.prompt_bank_class_orthogonal_weight * loss_prompt_class_orth
+            )
             out['loss_total'] = out['total']
             out['loss_cssd_image_normal'] = loss_img_normal
             out['loss_cssd_image_normal_weighted'] = self.cssd_image_loss_weight * loss_img_normal
             out['loss_text_proto_reg'] = loss_text_reg
             out['loss_text_proto_reg_weighted'] = self.text_reg_weight * loss_text_reg
+            out['loss_prompt_bank_diversity'] = loss_prompt_bank_div
+            out['loss_prompt_bank_diversity_weighted'] = self.prompt_bank_diversity_weight * loss_prompt_bank_div
+            out['loss_prompt_class_orthogonal'] = loss_prompt_class_orth
+            out['loss_prompt_class_orthogonal_weighted'] = (
+                self.prompt_bank_class_orthogonal_weight * loss_prompt_class_orth
+            )
             out['cssd_image_score_mean'] = cssd_image_score.detach().mean()
             out['semantic_gate_mean'] = semantic_gate.detach().mean()
+            out.update(self.last_prompt_debug)
             if return_anomaly_map:
                 out.update(anomaly_map=anomaly_map, image_score=image_score.detach())
             return out
@@ -1938,27 +2404,28 @@ class MAMBAADBiomedCLIPTGLRANoMamba(MAMBAADBiomedCLIPDualBranchAdapter):
         self.local_adapter.eval()
         self.loc_decoder.eval()
         self.local_head.eval()
+        self.local_prompt_router.train(mode)
         self.relation_branch.train(mode)
         return self
 
     def adapter_param_norm(self):
         total_sq = 0.0
         total_params = 0
-        for module in [self.relation_branch]:
+        for module in [self.relation_branch, self.local_prompt_router]:
             for param in module.parameters():
                 if not param.is_floating_point():
                     continue
                 value = param.detach().float()
                 total_sq += float(torch.sum(value * value).cpu())
                 total_params += value.numel()
-        for param in [self.text_delta_normal, self.text_delta_abnormal, self.semantic_scale, self.semantic_bias, self.semantic_eta, self.relation_eta]:
+        for param in [self.local_text_delta_normal, self.local_text_delta_abnormal, self.semantic_scale, self.semantic_bias, self.semantic_eta, self.relation_eta]:
             value = param.detach().float()
             total_sq += float(torch.sum(value * value).cpu())
             total_params += value.numel()
         return math.sqrt(total_sq), total_params
 
     def reset_adapter_parameters(self, seed=None):
-        params = list(self.relation_branch.parameters())
+        params = list(self.relation_branch.parameters()) + list(self.local_prompt_router.parameters())
         device = params[0].device if params else torch.device('cpu')
         devices = [device.index] if device.type == 'cuda' and device.index is not None else []
         with torch.random.fork_rng(devices=devices, enabled=seed is not None):
@@ -1967,6 +2434,15 @@ class MAMBAADBiomedCLIPTGLRANoMamba(MAMBAADBiomedCLIPDualBranchAdapter):
                 if device.type == 'cuda':
                     torch.cuda.manual_seed_all(int(seed))
             self._reset_module_parameters(self.relation_branch)
+            self.local_prompt_router.reset_parameters()
+            nn.init.zeros_(self.local_prompt_router.weight)
+            nn.init.zeros_(self.local_prompt_router.bias)
+            with torch.no_grad():
+                self.local_text_delta_normal.zero_()
+                self.local_text_delta_abnormal.zero_()
+                if self.local_prompt_bank_size > 1 and self.local_prompt_bank_init_std > 0:
+                    self.local_text_delta_normal.normal_(std=self.local_prompt_bank_init_std)
+                    self.local_text_delta_abnormal.normal_(std=self.local_prompt_bank_init_std)
 
     def _localization_map(self, tokens, spatial_shape, image_shape, t_norm, t_abn, imgs=None):
         relation_logits, relation_tokens, semantic_map, semantic_gate = self.relation_branch(
@@ -2064,7 +2540,7 @@ class MAMBAADBiomedCLIPTGLRAFull(MAMBAADBiomedCLIPTGLRANoMamba):
     def adapter_param_norm(self):
         total_sq = 0.0
         total_params = 0
-        for module in [self.local_adapter, self.relation_branch, self.global_local_fusion, self.fusion_head]:
+        for module in [self.local_adapter, self.relation_branch, self.global_local_fusion, self.fusion_head, self.local_prompt_router]:
             for param in module.parameters():
                 if not param.is_floating_point():
                     continue
@@ -2072,8 +2548,8 @@ class MAMBAADBiomedCLIPTGLRAFull(MAMBAADBiomedCLIPTGLRANoMamba):
                 total_sq += float(torch.sum(value * value).cpu())
                 total_params += value.numel()
         for param in [
-            self.text_delta_normal,
-            self.text_delta_abnormal,
+            self.local_text_delta_normal,
+            self.local_text_delta_abnormal,
             self.semantic_scale,
             self.semantic_bias,
             self.semantic_eta,
@@ -2091,6 +2567,7 @@ class MAMBAADBiomedCLIPTGLRAFull(MAMBAADBiomedCLIPTGLRANoMamba):
             + list(self.relation_branch.parameters())
             + list(self.global_local_fusion.parameters())
             + list(self.fusion_head.parameters())
+            + list(self.local_prompt_router.parameters())
         )
         device = params[0].device if params else torch.device('cpu')
         devices = [device.index] if device.type == 'cuda' and device.index is not None else []
@@ -2104,6 +2581,15 @@ class MAMBAADBiomedCLIPTGLRAFull(MAMBAADBiomedCLIPTGLRANoMamba):
             self._reset_module_parameters(self.global_local_fusion)
             self.fusion_head.reset_parameters()
             nn.init.zeros_(self.fusion_head.bias)
+            self.local_prompt_router.reset_parameters()
+            nn.init.zeros_(self.local_prompt_router.weight)
+            nn.init.zeros_(self.local_prompt_router.bias)
+            with torch.no_grad():
+                self.local_text_delta_normal.zero_()
+                self.local_text_delta_abnormal.zero_()
+                if self.local_prompt_bank_size > 1 and self.local_prompt_bank_init_std > 0:
+                    self.local_text_delta_normal.normal_(std=self.local_prompt_bank_init_std)
+                    self.local_text_delta_abnormal.normal_(std=self.local_prompt_bank_init_std)
 
     def _localization_map(self, tokens, spatial_shape, image_shape, t_norm, t_abn, imgs=None):
         if self.eval_adapter_mode == 'bypass':
@@ -2246,13 +2732,16 @@ class MAMBAADBiomedCLIPCNNGlobalAuxAdapter(MAMBAADBiomedCLIPDualBranchAdapter):
                     torch.cuda.manual_seed_all(int(seed))
             self._reset_module_parameters(self.arcc)
 
-    def _cssd_image_branch(self, tokens, spatial_shape, image_shape, t_norm, t_abn):
+    def _cssd_image_branch(self, tokens, spatial_shape, image_shape, t_norm, t_abn, detach_text=False):
         if self.eval_adapter_mode == 'bypass':
             refined = tokens
         else:
             refined = self.local_adapter(tokens, None, spatial_shape)
-        sim_normal = torch.einsum('bld,bd->bl', refined, F.normalize(t_norm, p=2, dim=-1))
-        sim_abnormal = torch.einsum('bld,bd->bl', refined, F.normalize(t_abn, p=2, dim=-1))
+        if detach_text:
+            t_norm = t_norm.detach()
+            t_abn = t_abn.detach()
+        sim_normal = self._text_similarity(refined, t_norm)
+        sim_abnormal = self._text_similarity(refined, t_abn)
         patch_scores = sim_abnormal - sim_normal
         topk = max(1, int(patch_scores.shape[1] * self.cssd_topk_ratio))
         cssd_image_score = patch_scores.topk(topk, dim=1).values.mean(dim=1)
@@ -2265,7 +2754,7 @@ class MAMBAADBiomedCLIPCNNGlobalAuxAdapter(MAMBAADBiomedCLIPDualBranchAdapter):
             align_corners=False,
         ).squeeze(1)
         self._cached_global_tokens = refined
-        self._cached_global_patch_scores = patch_scores
+        self._cached_global_patch_scores = None if detach_text else patch_scores
         with torch.no_grad():
             delta = (refined.detach() - tokens.detach()).float()
             raw = tokens.detach().float()
@@ -2304,13 +2793,14 @@ class MAMBAADBiomedCLIPCNNGlobalAuxAdapter(MAMBAADBiomedCLIPDualBranchAdapter):
 
         global_tokens = self._cached_global_tokens
         global_patch_scores = self._cached_global_patch_scores
-        if global_tokens is None or global_patch_scores is None:
+        if global_tokens is None:
             if self.eval_adapter_mode == 'bypass':
                 global_tokens = tokens
             else:
                 global_tokens = self.local_adapter(tokens, None, spatial_shape)
-            sim_normal = torch.einsum('bld,bd->bl', global_tokens, F.normalize(t_norm, p=2, dim=-1))
-            sim_abnormal = torch.einsum('bld,bd->bl', global_tokens, F.normalize(t_abn, p=2, dim=-1))
+        if global_patch_scores is None:
+            sim_normal = self._text_similarity(global_tokens, t_norm)
+            sim_abnormal = self._text_similarity(global_tokens, t_abn)
             global_patch_scores = sim_abnormal - sim_normal
 
         height, width = spatial_shape

@@ -74,7 +74,10 @@ def get_model(cfg_model):
 			# 			del state_dict['head.bias']
 			# load ckpt
 			if isinstance(model, nn.Module):
-				model.load_state_dict(state_dict, strict=strict)
+				if hasattr(model, 'load_compatible_state_dict'):
+					model.load_compatible_state_dict(state_dict, strict=strict)
+				else:
+					model.load_state_dict(state_dict, strict=strict)
 			else:
 				for sub_model_name, sub_state_dict in state_dict.items():
 					sub_model = getattr(model, sub_model_name, None)

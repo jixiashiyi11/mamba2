@@ -6,6 +6,52 @@ class cfg(dual_branch_cfg):
         super(cfg, self).__init__()
 
         self.model.name = 'mambaad_biomedclip_cnn_global_aux_adapter'
+        self.prompt_normal.update({
+            'brain': [
+                'A normal healthy brain MRI scan with symmetric hemispheres and no visible lesion or structural abnormality.',
+                'A medical image of a normal brain with preserved cerebral anatomy and no pathological finding.',
+                'A diagnostic brain MRI showing normal tissue appearance without tumor, hemorrhage, edema, or infarct.',
+            ],
+            'liver': [
+                'A normal healthy liver CT scan with homogeneous parenchyma, clear boundaries, and no focal lesion.',
+                'A medical image of a normal liver with smooth contour, uniform texture, and no visible lesion.',
+                'A diagnostic liver CT showing normal hepatic anatomy without metastasis, cyst, or cirrhotic change.',
+            ],
+            'retinal': [
+                'A normal healthy retinal fundus photograph with a clear optic disc, macula, and no visible pathological finding.',
+                'A medical image of a normal retina with preserved vessels, optic disc, and macular appearance.',
+                'A retinal fundus photograph showing normal anatomy without hemorrhage, exudate, microaneurysm, or neovascularization.',
+            ],
+            'good': [
+                'A normal healthy medical image with no visible pathological abnormality.',
+                'A medical image showing normal anatomy and no suspicious lesion.',
+                'A diagnostic medical image without visible abnormal tissue or pathological finding.',
+            ],
+        })
+        self.prompt_abnormal.update({
+            'brain': [
+                'An abnormal brain MRI scan showing a lesion, tumor, hemorrhage, edema, infarct, or other pathological structural abnormality.',
+                'A medical image of an abnormal brain with visible pathological tissue or structural distortion.',
+                'A diagnostic brain MRI showing suspicious abnormal signal, mass effect, bleeding, swelling, or ischemic change.',
+            ],
+            'liver': [
+                'An abnormal liver CT scan showing a focal lesion, metastasis, cyst, cirrhotic change, or other pathological structural abnormality.',
+                'A medical image of an abnormal liver with visible lesion, irregular texture, or pathological parenchymal change.',
+                'A diagnostic liver CT showing suspicious focal abnormality, tumor, cyst, metastasis, or cirrhotic morphology.',
+            ],
+            'retinal': [
+                'An abnormal retinal fundus photograph showing hemorrhages, exudates, microaneurysms, neovascularization, or other pathological abnormality.',
+                'A medical image of an abnormal retina with visible pathological lesions or vascular abnormalities.',
+                'A retinal fundus photograph showing suspicious hemorrhage, exudate, microaneurysm, swelling, or neovascular change.',
+            ],
+            'good': [
+                'An abnormal medical image showing a visible pathological abnormality.',
+                'A medical image containing suspicious abnormal tissue, lesion, or pathological finding.',
+                'A diagnostic medical image with visible abnormal structure, abnormal signal, or lesion.',
+            ],
+        })
+        self.model.kwargs['prompt_normal'] = self.prompt_normal
+        self.model.kwargs['prompt_abnormal'] = self.prompt_abnormal
         self.model.kwargs.update(
             text_guidance_kwargs=dict(
                 text_prompt_mode='decoupled',
@@ -20,6 +66,11 @@ class cfg(dual_branch_cfg):
                 ),
                 num_local_prompt_tokens=8,
                 prompt_token_init_std=0.02,
+                local_prompt_token_text_mode='tips_state_class',
+                local_prompt_token_state_normal='perfect',
+                local_prompt_token_state_abnormal='broken',
+                local_prompt_token_class='object',
+                local_prompt_token_template='{state} {class_name}',
                 num_local_prompt_banks=1,
                 prompt_bank_temperature=1.0,
                 prompt_bank_init_std=0.0,

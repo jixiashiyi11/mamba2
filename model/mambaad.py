@@ -1866,6 +1866,13 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
             for key, value in dict(self.text_guidance_kwargs.get('local_prompt_source_map', {})).items()
         }
         self.local_prompt_blend_weight = float(self.text_guidance_kwargs.get('local_prompt_blend_weight', 0.5))
+        self.local_prompt_token_text_mode = str(
+            self.text_guidance_kwargs.get('local_prompt_token_text_mode', 'tips_state_class')
+        ).lower()
+        self.local_prompt_token_class = str(self.text_guidance_kwargs.get('local_prompt_token_class', 'object'))
+        self.local_prompt_token_state_normal = str(self.text_guidance_kwargs.get('local_prompt_token_state_normal', 'perfect'))
+        self.local_prompt_token_state_abnormal = str(self.text_guidance_kwargs.get('local_prompt_token_state_abnormal', 'broken'))
+        self.local_prompt_token_template = str(self.text_guidance_kwargs.get('local_prompt_token_template', '{state} {class_name}'))
         self.stop_local_prompt_image_grad = bool(self.text_guidance_kwargs.get('stop_local_prompt_image_grad', True))
         self.local_prompt_normal = self.text_guidance_kwargs.get(
             'local_prompt_normal',
@@ -1896,6 +1903,7 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
         global_modes = {'fixed', 'shared'}
         local_modes = {'learnable_delta', 'learnable_token_prefix', 'fixed', 'shared'}
         local_sources = {'class', 'generic', 'blend'}
+        token_text_modes = {'tips_state_class', 'source_prompts'}
         if self.text_prompt_mode not in text_modes:
             raise ValueError(f'Invalid text_prompt_mode={self.text_prompt_mode}. Expected one of {sorted(text_modes)}.')
         if self.text_prompt_mode == 'legacy':
@@ -1906,6 +1914,11 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
             raise ValueError(f'Invalid local_prompt_mode={self.local_prompt_mode}. Expected one of {sorted(local_modes)}.')
         if self.local_prompt_source not in local_sources:
             raise ValueError(f'Invalid local_prompt_source={self.local_prompt_source}. Expected one of {sorted(local_sources)}.')
+        if self.local_prompt_token_text_mode not in token_text_modes:
+            raise ValueError(
+                f'Invalid local_prompt_token_text_mode={self.local_prompt_token_text_mode}. '
+                f'Expected one of {sorted(token_text_modes)}.'
+            )
         invalid_sources = {
             key: value for key, value in self.local_prompt_source_map.items()
             if value not in local_sources
@@ -2086,8 +2099,21 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
         cls_names = self.biomedclip._expand_cls_names(cls_names, batch_size)
         return [self.local_prompt_source_map.get(str(name).lower(), self.local_prompt_source) for name in cls_names]
 
+    def _format_local_prompt_token_text(self, state):
+        return self.local_prompt_token_template.format(
+            state=state,
+            class_name=self.local_prompt_token_class,
+            cls_name=self.local_prompt_token_class,
+            class_text=self.local_prompt_token_class,
+        )
+
     def _local_prompt_sets_for_batch(self, cls_names, batch_size):
         cls_names = self.biomedclip._expand_cls_names(cls_names, batch_size)
+        if self.local_prompt_mode == 'learnable_token_prefix' and self.local_prompt_token_text_mode == 'tips_state_class':
+            normal_prompt = self._format_local_prompt_token_text(self.local_prompt_token_state_normal)
+            abnormal_prompt = self._format_local_prompt_token_text(self.local_prompt_token_state_abnormal)
+            return [[normal_prompt] for _ in cls_names], [[abnormal_prompt] for _ in cls_names]
+
         sources = self._local_sources_for_batch(cls_names, batch_size)
         generic_normal = self.biomedclip._normalize_prompt_value(self.local_prompt_normal, 'local_prompt_normal')
         generic_abnormal = self.biomedclip._normalize_prompt_value(self.local_prompt_abnormal, 'local_prompt_abnormal')

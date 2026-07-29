@@ -392,17 +392,31 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
             getattr(module, 'local_text_delta_normal', None),
             getattr(module, 'local_text_delta_abnormal', None),
         ]
+        token_params = [
+            getattr(module, 'local_prompt_tokens_normal', None),
+            getattr(module, 'local_prompt_tokens_abnormal', None),
+        ]
         grads = [param.grad.detach() for param in local_params if param is not None and param.grad is not None]
+        token_grads = [param.grad.detach() for param in token_params if param is not None and param.grad is not None]
         local_grad_norm = 0.0
         if grads:
             local_grad_norm = math.sqrt(sum(float(torch.sum(grad.float() * grad.float()).cpu()) for grad in grads))
+        token_grad_norm = 0.0
+        if token_grads:
+            token_grad_norm = math.sqrt(
+                sum(float(torch.sum(grad.float() * grad.float()).cpu()) for grad in token_grads)
+            )
         fixed_global_has_grad = False
         for name, tensor in getattr(module, 'named_buffers', lambda: [])():
             if 'fixed_global' in name and getattr(tensor, 'grad', None) is not None:
                 fixed_global_has_grad = True
         return {
-            'local_prompt_grad_present': float(len(grads) > 0),
-            'local_prompt_grad_norm': float(local_grad_norm),
+            'local_prompt_grad_present': float(len(grads) > 0 or len(token_grads) > 0),
+            'local_prompt_grad_norm': float(math.sqrt(local_grad_norm * local_grad_norm + token_grad_norm * token_grad_norm)),
+            'local_prompt_delta_grad_present': float(len(grads) > 0),
+            'local_prompt_delta_grad_norm': float(local_grad_norm),
+            'local_prompt_token_grad_present': float(len(token_grads) > 0),
+            'local_prompt_token_grad_norm': float(token_grad_norm),
             'fixed_global_prompt_grad_present': float(fixed_global_has_grad),
         }
 

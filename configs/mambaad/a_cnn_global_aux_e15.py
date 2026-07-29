@@ -10,7 +10,7 @@ class cfg(dual_branch_cfg):
             text_guidance_kwargs=dict(
                 text_prompt_mode='decoupled',
                 global_prompt_mode='fixed',
-                local_prompt_mode='learnable_delta',
+                local_prompt_mode='learnable_token_prefix',
                 local_prompt_source='generic',
                 local_prompt_source_map=dict(
                     brain='class',
@@ -18,6 +18,8 @@ class cfg(dual_branch_cfg):
                     retinal='generic',
                     good='generic',
                 ),
+                num_local_prompt_tokens=8,
+                prompt_token_init_std=0.02,
                 num_local_prompt_banks=1,
                 prompt_bank_temperature=1.0,
                 prompt_bank_init_std=0.0,

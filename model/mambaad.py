@@ -1006,6 +1006,7 @@ class FrozenBiomedCLIPPatchEncoder(nn.Module):
         with torch.no_grad():
             sample_tokens = self.tokenizer(['A medical image']).to(next(self.model.parameters()).device)
             self.text_dim = int(self.model.encode_text(sample_tokens).shape[-1])
+            self.text_token_dim = self._infer_text_token_dim()
             image_size = getattr(self.model.visual, 'image_size', 224)
             if isinstance(image_size, (list, tuple)):
                 image_size = image_size[0]
@@ -1175,6 +1176,118 @@ class FrozenBiomedCLIPPatchEncoder(nn.Module):
         abnormal_prompts = self._normalize_prompt_value(prompt_abnormal, 'prompt_abnormal')
         t_norm, t_abn = self.encode_prompt_sets([normal_prompts], [abnormal_prompts], device=device)
         return t_norm.expand(batch_size, -1).contiguous(), t_abn.expand(batch_size, -1).contiguous()
+
+    def _get_hf_text_tower(self):
+        text_tower = getattr(self.model, 'text', None)
+        transformer = getattr(text_tower, 'transformer', None) if text_tower is not None else None
+        if transformer is not None and hasattr(transformer, 'get_input_embeddings'):
+            return text_tower, transformer
+        transformer = getattr(self.model, 'text_encoder', None)
+        if transformer is not None and hasattr(transformer, 'get_input_embeddings'):
+            return self.model, transformer
+        return None, None
+
+    def _infer_text_token_dim(self):
+        _, transformer = self._get_hf_text_tower()
+        if transformer is None:
+            return self.text_dim
+        embedding = transformer.get_input_embeddings()
+        weight = getattr(embedding, 'weight', None)
+        if weight is None or weight.ndim != 2:
+            return self.text_dim
+        return int(weight.shape[1])
+
+    def _project_hf_text_features(self, text_tower, pooled):
+        proj = getattr(text_tower, 'proj', None)
+        if proj is None or isinstance(proj, torch.nn.Identity):
+            return pooled
+        if isinstance(proj, torch.nn.Module):
+            return proj(pooled)
+        if isinstance(proj, torch.nn.Parameter) or torch.is_tensor(proj):
+            return pooled @ proj
+        raise RuntimeError(f'Unsupported BiomedCLIP text projection type: {type(proj).__name__}.')
+
+    def _pool_hf_text_features(self, text_tower, outputs, attention_mask):
+        if isinstance(outputs, (list, tuple)):
+            last_hidden_state = outputs[0]
+            pooled = outputs[1] if len(outputs) > 1 and outputs[1] is not None and outputs[1].ndim == 2 else None
+        else:
+            last_hidden_state = outputs.last_hidden_state
+            pooled = getattr(outputs, 'pooler_output', None)
+        pooler = getattr(text_tower, 'pooler', None)
+        if pooler is not None:
+            for args in ((outputs, attention_mask), (last_hidden_state, attention_mask), (last_hidden_state,)):
+                try:
+                    return pooler(*args)
+                except TypeError:
+                    continue
+        if pooled is not None:
+            return pooled
+        return last_hidden_state[:, 0]
+
+    def _encode_text_with_prompt_tokens(self, token_ids, prompt_tokens):
+        text_tower, transformer = self._get_hf_text_tower()
+        if transformer is None:
+            raise RuntimeError(
+                'TIPS-style learnable token-prefix prompts require a HuggingFace-style '
+                'BiomedCLIP text tower with `inputs_embeds` support.'
+            )
+
+        embedding = transformer.get_input_embeddings()
+        token_ids = token_ids.to(next(self.model.parameters()).device)
+        prompt_tokens = prompt_tokens.to(device=token_ids.device, dtype=embedding.weight.dtype)
+        input_embeds = embedding(token_ids)
+
+        config = getattr(transformer, 'config', None)
+        pad_token_id = int(getattr(config, 'pad_token_id', 0) or 0)
+        attention_mask = (token_ids != pad_token_id).long()
+        prompt_len = min(int(prompt_tokens.shape[0]), max(int(input_embeds.shape[1]) - 1, 0))
+        if prompt_len > 0:
+            prompt = prompt_tokens[:prompt_len].unsqueeze(0).expand(input_embeds.shape[0], -1, -1)
+            prompt_mask = attention_mask.new_ones((attention_mask.shape[0], prompt_len))
+            input_embeds = torch.cat(
+                [input_embeds[:, :1], prompt, input_embeds[:, 1:input_embeds.shape[1] - prompt_len]],
+                dim=1,
+            )
+            attention_mask = torch.cat(
+                [attention_mask[:, :1], prompt_mask, attention_mask[:, 1:attention_mask.shape[1] - prompt_len]],
+                dim=1,
+            )
+
+        try:
+            outputs = transformer(inputs_embeds=input_embeds, attention_mask=attention_mask, return_dict=True)
+        except TypeError:
+            outputs = transformer(inputs_embeds=input_embeds, attention_mask=attention_mask)
+        pooled = self._pool_hf_text_features(text_tower, outputs, attention_mask)
+        return self._project_hf_text_features(text_tower, pooled)
+
+    def encode_prompt_sets_with_prompt_tokens(self, prompt_sets, prompt_tokens, device):
+        flat_prompts = []
+        slices = []
+        for prompt_set in prompt_sets:
+            start = len(flat_prompts)
+            flat_prompts.extend([str(prompt) for prompt in prompt_set])
+            slices.append((start, len(flat_prompts)))
+        token_ids = self.tokenizer(flat_prompts).to(device)
+        features = F.normalize(self._encode_text_with_prompt_tokens(token_ids, prompt_tokens), p=2, dim=-1)
+        pooled = []
+        for start, end in slices:
+            pooled.append(F.normalize(features[start:end].mean(dim=0), p=2, dim=-1))
+        return torch.stack(pooled, dim=0)
+
+    def encode_prompt_pairs_with_prompt_tokens(
+            self,
+            normal_prompt_sets,
+            abnormal_prompt_sets,
+            normal_prompt_tokens,
+            abnormal_prompt_tokens,
+            device,
+    ):
+        if len(normal_prompt_sets) != len(abnormal_prompt_sets):
+            raise ValueError('Normal and abnormal prompt sets must have the same batch length.')
+        t_norm = self.encode_prompt_sets_with_prompt_tokens(normal_prompt_sets, normal_prompt_tokens, device)
+        t_abn = self.encode_prompt_sets_with_prompt_tokens(abnormal_prompt_sets, abnormal_prompt_tokens, device)
+        return t_norm, t_abn
 
     def encode_image_and_patches(self, imgs):
         biomed_imgs = self._prepare_images(imgs)
@@ -1728,6 +1841,12 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
         self.local_prompt_router = nn.Linear(self.visual_dim, self.local_prompt_bank_size)
         nn.init.zeros_(self.local_prompt_router.weight)
         nn.init.zeros_(self.local_prompt_router.bias)
+        self.local_prompt_token_count = max(0, int(self.text_guidance_kwargs.get('num_local_prompt_tokens', 8)))
+        self.local_prompt_token_init_std = float(self.text_guidance_kwargs.get('prompt_token_init_std', 0.02))
+        self.local_prompt_token_dim = int(getattr(self.biomedclip, 'text_token_dim', self.visual_dim))
+        self.local_prompt_tokens_normal = nn.Parameter(torch.empty(self.local_prompt_token_count, self.local_prompt_token_dim))
+        self.local_prompt_tokens_abnormal = nn.Parameter(torch.empty(self.local_prompt_token_count, self.local_prompt_token_dim))
+        self._init_local_prompt_tokens()
         self.semantic_scale = nn.Parameter(torch.tensor(float(self.text_guidance_kwargs.get('gate_scale_init', 1.0))))
         self.semantic_bias = nn.Parameter(torch.tensor(float(self.text_guidance_kwargs.get('gate_bias_init', 0.0))))
         self.semantic_eta = nn.Parameter(torch.tensor(float(self.text_guidance_kwargs.get('gate_eta_init', 0.1))))
@@ -1775,7 +1894,7 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
     def _validate_prompt_modes(self):
         text_modes = {'decoupled', 'shared', 'legacy'}
         global_modes = {'fixed', 'shared'}
-        local_modes = {'learnable_delta', 'fixed', 'shared'}
+        local_modes = {'learnable_delta', 'learnable_token_prefix', 'fixed', 'shared'}
         local_sources = {'class', 'generic', 'blend'}
         if self.text_prompt_mode not in text_modes:
             raise ValueError(f'Invalid text_prompt_mode={self.text_prompt_mode}. Expected one of {sorted(text_modes)}.')
@@ -1796,10 +1915,20 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
         self.local_prompt_blend_weight = max(0.0, min(1.0, self.local_prompt_blend_weight))
 
     def _configure_prompt_grad_flags(self):
-        learnable_local = self.local_prompt_mode in ('learnable_delta', 'shared') or self.text_prompt_mode == 'shared'
+        learnable_delta = self.local_prompt_mode in ('learnable_delta', 'shared') or self.text_prompt_mode == 'shared'
+        learnable_prefix = self.local_prompt_mode == 'learnable_token_prefix'
         for param in [self.local_text_delta_normal, self.local_text_delta_abnormal]:
-            param.requires_grad = bool(learnable_local)
-        self._set_requires_grad(self.local_prompt_router, bool(learnable_local and self.local_prompt_bank_size > 1))
+            param.requires_grad = bool(learnable_delta)
+        for param in [self.local_prompt_tokens_normal, self.local_prompt_tokens_abnormal]:
+            param.requires_grad = bool(learnable_prefix)
+        self._set_requires_grad(self.local_prompt_router, bool(learnable_delta and self.local_prompt_bank_size > 1))
+
+    def _init_local_prompt_tokens(self):
+        with torch.no_grad():
+            if self.local_prompt_token_count <= 0:
+                return
+            self.local_prompt_tokens_normal.normal_(std=self.local_prompt_token_init_std)
+            self.local_prompt_tokens_abnormal.normal_(std=self.local_prompt_token_init_std)
 
     def load_compatible_state_dict(self, state_dict, strict=True):
         state_dict = dict(state_dict)
@@ -1838,6 +1967,8 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
         allowed_missing = {
             'local_text_delta_normal',
             'local_text_delta_abnormal',
+            'local_prompt_tokens_normal',
+            'local_prompt_tokens_abnormal',
             'local_prompt_router.weight',
             'local_prompt_router.bias',
         }
@@ -1891,6 +2022,9 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
                 if self.local_prompt_bank_size > 1 and self.local_prompt_bank_init_std > 0:
                     self.local_text_delta_normal.normal_(std=self.local_prompt_bank_init_std)
                     self.local_text_delta_abnormal.normal_(std=self.local_prompt_bank_init_std)
+                if self.local_prompt_token_count > 0:
+                    self.local_prompt_tokens_normal.normal_(std=self.local_prompt_token_init_std)
+                    self.local_prompt_tokens_abnormal.normal_(std=self.local_prompt_token_init_std)
 
     def adapter_param_norm(self):
         total_sq = 0.0
@@ -1905,6 +2039,8 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
         for param in [
             self.local_text_delta_normal,
             self.local_text_delta_abnormal,
+            self.local_prompt_tokens_normal,
+            self.local_prompt_tokens_abnormal,
             self.semantic_scale,
             self.semantic_bias,
             self.semantic_eta,
@@ -1949,6 +2085,27 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
     def _local_sources_for_batch(self, cls_names, batch_size):
         cls_names = self.biomedclip._expand_cls_names(cls_names, batch_size)
         return [self.local_prompt_source_map.get(str(name).lower(), self.local_prompt_source) for name in cls_names]
+
+    def _local_prompt_sets_for_batch(self, cls_names, batch_size):
+        cls_names = self.biomedclip._expand_cls_names(cls_names, batch_size)
+        sources = self._local_sources_for_batch(cls_names, batch_size)
+        generic_normal = self.biomedclip._normalize_prompt_value(self.local_prompt_normal, 'local_prompt_normal')
+        generic_abnormal = self.biomedclip._normalize_prompt_value(self.local_prompt_abnormal, 'local_prompt_abnormal')
+        normal_sets = []
+        abnormal_sets = []
+        for name, source in zip(cls_names, sources):
+            class_normal = self.biomedclip._resolve_prompts(self.biomedclip.normal_prompt_map, name)
+            class_abnormal = self.biomedclip._resolve_prompts(self.biomedclip.abnormal_prompt_map, name)
+            if source == 'class':
+                normal_sets.append(class_normal)
+                abnormal_sets.append(class_abnormal)
+            elif source == 'generic':
+                normal_sets.append(generic_normal)
+                abnormal_sets.append(generic_abnormal)
+            else:
+                normal_sets.append(class_normal + generic_normal)
+                abnormal_sets.append(class_abnormal + generic_abnormal)
+        return normal_sets, abnormal_sets
 
     def _local_base_text_pairs(self, cls_names, batch_size, device, global_base_norm=None, global_base_abn=None):
         if self.text_prompt_mode == 'shared' or self.local_prompt_mode == 'shared':
@@ -1997,10 +2154,22 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
                 local_abns.append(F.normalize(class_weight * class_abn[idx] + generic_weight * generic_abn[idx], p=2, dim=-1))
         return torch.stack(local_norms, dim=0).detach(), torch.stack(local_abns, dim=0).detach()
 
-    def _local_text_pairs(self, base_t_norm, base_t_abn, tokens=None):
+    def _local_text_pairs(self, base_t_norm, base_t_abn, cls_names=None, batch_size=None, device=None, tokens=None):
         if self.local_prompt_mode == 'fixed':
             self._last_prompt_bank_weights = None
             return F.normalize(base_t_norm.detach(), p=2, dim=-1), F.normalize(base_t_abn.detach(), p=2, dim=-1)
+        if self.local_prompt_mode == 'learnable_token_prefix':
+            if cls_names is None or batch_size is None or device is None:
+                raise ValueError('TIPS-style local prompt tokens require cls_names, batch_size, and device.')
+            self._last_prompt_bank_weights = None
+            normal_sets, abnormal_sets = self._local_prompt_sets_for_batch(cls_names, batch_size)
+            return self.biomedclip.encode_prompt_pairs_with_prompt_tokens(
+                normal_sets,
+                abnormal_sets,
+                self.local_prompt_tokens_normal,
+                self.local_prompt_tokens_abnormal,
+                device=device,
+            )
         return self._learnable_text_pairs(base_t_norm.detach(), base_t_abn.detach(), tokens=tokens)
 
     def _global_text_pairs(self, fixed_t_norm, fixed_t_abn, local_t_norm, local_t_abn):
@@ -2072,6 +2241,8 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
                 'local_abnormal_norm': local_abn.detach().norm(dim=-1).mean(),
                 'local_delta_normal_norm': self.local_text_delta_normal.detach().float().norm(),
                 'local_delta_abnormal_norm': self.local_text_delta_abnormal.detach().float().norm(),
+                'local_prompt_tokens_normal_norm': self.local_prompt_tokens_normal.detach().float().norm(),
+                'local_prompt_tokens_abnormal_norm': self.local_prompt_tokens_abnormal.detach().float().norm(),
                 'global_sim_normal_mean': global_sim_normal.mean(),
                 'global_sim_abnormal_mean': global_sim_abnormal.mean(),
                 'local_patch_sim_normal_mean': local_sim_normal.mean(),
@@ -2085,6 +2256,16 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
                     device=image_score.device,
                     dtype=image_score.dtype,
                 ),
+                'local_prompt_token_count': torch.tensor(
+                    float(self.local_prompt_token_count),
+                    device=image_score.device,
+                    dtype=image_score.dtype,
+                ),
+                'local_prompt_token_prefix_enabled': torch.tensor(
+                    float(self.local_prompt_mode == 'learnable_token_prefix'),
+                    device=image_score.device,
+                    dtype=image_score.dtype,
+                ),
                 'fixed_global_requires_grad': torch.tensor(
                     float(fixed_global_norm.requires_grad or fixed_global_abn.requires_grad),
                     device=image_score.device,
@@ -2094,6 +2275,14 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
                     float(
                         self.local_text_delta_normal.requires_grad
                         or self.local_text_delta_abnormal.requires_grad
+                    ),
+                    device=image_score.device,
+                    dtype=image_score.dtype,
+                ),
+                'local_prompt_token_requires_grad': torch.tensor(
+                    float(
+                        self.local_prompt_tokens_normal.requires_grad
+                        or self.local_prompt_tokens_abnormal.requires_grad
                     ),
                     device=image_score.device,
                     dtype=image_score.dtype,
@@ -2263,7 +2452,14 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
             global_base_norm=fixed_global_norm,
             global_base_abn=fixed_global_abn,
         )
-        t_norm, t_abn = self._local_text_pairs(local_base_norm, local_base_abn, tokens=tokens.detach())
+        t_norm, t_abn = self._local_text_pairs(
+            local_base_norm,
+            local_base_abn,
+            cls_names=score_cls_names,
+            batch_size=imgs.shape[0],
+            device=imgs.device,
+            tokens=tokens.detach(),
+        )
         global_t_norm, global_t_abn = self._global_text_pairs(fixed_global_norm, fixed_global_abn, t_norm, t_abn)
         global_score = torch.sum(image_features.detach() * global_t_abn, dim=1) - torch.sum(image_features.detach() * global_t_norm, dim=1)
         detach_local_text_for_image = bool(self.training and self.stop_local_prompt_image_grad)
@@ -2418,7 +2614,16 @@ class MAMBAADBiomedCLIPTGLRANoMamba(MAMBAADBiomedCLIPDualBranchAdapter):
                 value = param.detach().float()
                 total_sq += float(torch.sum(value * value).cpu())
                 total_params += value.numel()
-        for param in [self.local_text_delta_normal, self.local_text_delta_abnormal, self.semantic_scale, self.semantic_bias, self.semantic_eta, self.relation_eta]:
+        for param in [
+            self.local_text_delta_normal,
+            self.local_text_delta_abnormal,
+            self.local_prompt_tokens_normal,
+            self.local_prompt_tokens_abnormal,
+            self.semantic_scale,
+            self.semantic_bias,
+            self.semantic_eta,
+            self.relation_eta,
+        ]:
             value = param.detach().float()
             total_sq += float(torch.sum(value * value).cpu())
             total_params += value.numel()
@@ -2443,6 +2648,9 @@ class MAMBAADBiomedCLIPTGLRANoMamba(MAMBAADBiomedCLIPDualBranchAdapter):
                 if self.local_prompt_bank_size > 1 and self.local_prompt_bank_init_std > 0:
                     self.local_text_delta_normal.normal_(std=self.local_prompt_bank_init_std)
                     self.local_text_delta_abnormal.normal_(std=self.local_prompt_bank_init_std)
+                if self.local_prompt_token_count > 0:
+                    self.local_prompt_tokens_normal.normal_(std=self.local_prompt_token_init_std)
+                    self.local_prompt_tokens_abnormal.normal_(std=self.local_prompt_token_init_std)
 
     def _localization_map(self, tokens, spatial_shape, image_shape, t_norm, t_abn, imgs=None):
         relation_logits, relation_tokens, semantic_map, semantic_gate = self.relation_branch(
@@ -2550,6 +2758,8 @@ class MAMBAADBiomedCLIPTGLRAFull(MAMBAADBiomedCLIPTGLRANoMamba):
         for param in [
             self.local_text_delta_normal,
             self.local_text_delta_abnormal,
+            self.local_prompt_tokens_normal,
+            self.local_prompt_tokens_abnormal,
             self.semantic_scale,
             self.semantic_bias,
             self.semantic_eta,
@@ -2590,6 +2800,9 @@ class MAMBAADBiomedCLIPTGLRAFull(MAMBAADBiomedCLIPTGLRANoMamba):
                 if self.local_prompt_bank_size > 1 and self.local_prompt_bank_init_std > 0:
                     self.local_text_delta_normal.normal_(std=self.local_prompt_bank_init_std)
                     self.local_text_delta_abnormal.normal_(std=self.local_prompt_bank_init_std)
+                if self.local_prompt_token_count > 0:
+                    self.local_prompt_tokens_normal.normal_(std=self.local_prompt_token_init_std)
+                    self.local_prompt_tokens_abnormal.normal_(std=self.local_prompt_token_init_std)
 
     def _localization_map(self, tokens, spatial_shape, image_shape, t_norm, t_abn, imgs=None):
         if self.eval_adapter_mode == 'bypass':

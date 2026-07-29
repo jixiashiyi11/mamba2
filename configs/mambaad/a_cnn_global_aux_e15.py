@@ -90,7 +90,7 @@ class cfg(dual_branch_cfg):
                 gate_bias_init=0.0,
                 gate_eta_init=0.1,
                 semantic_gate_loss_weight=0.03,
-                prototype_reg_weight=0.05,
+                prototype_reg_weight=0.0,
             ),
             image_branch_kwargs=dict(
                 topk_ratio=0.05,

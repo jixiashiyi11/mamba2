@@ -324,6 +324,29 @@ class MAMBAADTrainer(BaseTrainer):
 
 
 @TRAINER.register_module
+class MAMBAADOfficialTrainer(MAMBAADTrainer):
+    def __init__(self, cfg):
+        super(MAMBAADOfficialTrainer, self).__init__(cfg)
+
+    def forward(self):
+        self.feats_t, self.feats_s = self.net(self.imgs)
+
+    def optimize_parameters(self):
+        if self.mixup_fn is not None:
+            self.imgs, _ = self.mixup_fn(self.imgs, torch.ones(self.imgs.shape[0], device=self.imgs.device))
+        with self.amp_autocast():
+            self.forward()
+            loss_mse = self.loss_terms['pixel'](self.feats_t, self.feats_s)
+        self.backward_term(loss_mse, self.optim)
+        update_log_term(
+            self.log_terms.get('pixel'),
+            reduce_tensor(loss_mse, self.world_size).clone().detach().item(),
+            1,
+            self.master,
+        )
+
+
+@TRAINER.register_module
 class MAMBAADZeroShotTrainer(BaseTrainer):
     def __init__(self, cfg):
         super(MAMBAADZeroShotTrainer, self).__init__(cfg)
@@ -339,6 +362,8 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
             self._rebuild_cross_domain_loaders(cfg)
         self.debug_helper = DebugEvalHelper(cfg, self.logger, rank=self.rank, master=self.master)
         self._configure_eval_adapter_audit()
+        self._logged_train_source_class_mapping = False
+        self._train_source_class_counts = {}
 
     def _net_module(self):
         return self.net.module if hasattr(self.net, 'module') else self.net
@@ -538,11 +563,80 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
             raise ValueError(f'Expected 1 or {batch_size} class names, got {len(cls_name)}.')
         return [str(cls_name)] * batch_size
 
+    def _normalize_source_class_path_map(self):
+        raw_map = getattr(self.cfg, 'train_source_class_path_map', None)
+        if raw_map is None:
+            return []
+        if isinstance(raw_map, dict):
+            items = raw_map.items()
+        else:
+            items = raw_map
+
+        normalized = []
+        for class_name, keywords in items:
+            if isinstance(keywords, str):
+                keywords = [keywords]
+            keywords = [str(keyword).lower() for keyword in keywords if str(keyword)]
+            if keywords:
+                normalized.append((str(class_name), keywords))
+        return normalized
+
+    def _infer_train_source_class_name(self, img_path, fallback_cls_name):
+        path_text = str(img_path or '').replace('\\', '/').lower()
+        for class_name, keywords in self._normalize_source_class_path_map():
+            if any(keyword in path_text for keyword in keywords):
+                return class_name
+
+        alias_map = {
+            str(key).lower(): str(value)
+            for key, value in dict(getattr(self.cfg, 'train_cls_name_alias_map', {})).items()
+        }
+        fallback_key = str(fallback_cls_name).lower()
+        return alias_map.get(fallback_key, str(fallback_cls_name))
+
+    def _source_aware_train_cls_names(self, cls_names):
+        if not bool(getattr(self.cfg, 'train_source_class_from_path', False)):
+            return cls_names
+        cls_names = self._expand_cls_name_like_batch(cls_names, self.bs)
+        img_paths = self._normalize_batch_paths(self.img_path, self.bs, fill_value='')
+        source_cls_names = [
+            self._infer_train_source_class_name(img_path, cls_name)
+            for img_path, cls_name in zip(img_paths, cls_names)
+        ]
+        for source_cls_name in source_cls_names:
+            self._train_source_class_counts[source_cls_name] = (
+                self._train_source_class_counts.get(source_cls_name, 0) + 1
+            )
+        if self.master and not self._logged_train_source_class_mapping:
+            preview = [
+                f'{os.path.basename(str(img_path))}:{src_cls}'
+                for img_path, src_cls in zip(img_paths[:8], source_cls_names[:8])
+            ]
+            log_msg(self.logger, f'==> TrainSourceClassMapping {preview}')
+            self._logged_train_source_class_mapping = True
+        return source_cls_names
+
+    def _train_source_count_debug(self):
+        total = sum(self._train_source_class_counts.values())
+        if total <= 0:
+            return {}
+        expected = ['brain', 'chest_xray', 'retinal_oct', 'skin_lesion', 'good']
+        debug = {'train_source_seen_total': float(total)}
+        for class_name in expected:
+            debug[f'train_source_ratio_{class_name}'] = (
+                float(self._train_source_class_counts.get(class_name, 0)) / float(total)
+            )
+        mapped = sum(count for name, count in self._train_source_class_counts.items() if name != 'good')
+        debug['train_source_mapped_ratio'] = float(mapped) / float(total)
+        return debug
+
     def _get_model_cls_names(self):
         score_cls_names = self.cls_name
         force_cls_name = getattr(self.cfg, 'eval_force_cls_name', None)
         if not self.net.training and force_cls_name:
             score_cls_names = force_cls_name
+        if self.net.training:
+            score_cls_names = self._source_aware_train_cls_names(score_cls_names)
 
         adapter_cls_name = getattr(self.cfg, 'adapter_cls_name', None)
         if adapter_cls_name is None:
@@ -620,6 +714,8 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
                     self.loss_dict['total'] = self.loss_dict['total'] + synth_extra_losses['loss_synthetic_cssd_image_weighted']
                 if 'loss_synthetic_semantic_gate_weighted' in synth_extra_losses:
                     self.loss_dict['total'] = self.loss_dict['total'] + synth_extra_losses['loss_synthetic_semantic_gate_weighted']
+                if 'loss_synthetic_tips_semantic_weighted' in synth_extra_losses:
+                    self.loss_dict['total'] = self.loss_dict['total'] + synth_extra_losses['loss_synthetic_tips_semantic_weighted']
                 self.loss_dict['loss_total'] = self.loss_dict['total']
             self.total_loss = self.loss_dict['total']
         else:
@@ -720,6 +816,21 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
         synth_imgs = (synth_01 - mean) / std
         return synth_imgs, masks
 
+    def _tips_focal_loss(self, logits, targets, gamma=2.0):
+        loss_ce = F.cross_entropy(logits, targets, reduction='none')
+        pt = torch.exp(-loss_ce)
+        return ((1.0 - pt).pow(float(gamma)) * loss_ce).mean()
+
+    def _binary_dice_loss(self, probs, targets):
+        batch_size = targets.shape[0]
+        probs_flat = probs.reshape(batch_size, -1)
+        targets_flat = targets.reshape(batch_size, -1)
+        intersection = probs_flat * targets_flat
+        dice = (2.0 * intersection.sum(dim=1) + 1.0) / (
+            probs_flat.sum(dim=1) + targets_flat.sum(dim=1) + 1.0
+        )
+        return 1.0 - dice.mean()
+
     def _synthetic_adapter_aux_losses(self, synth_out, synth_masks):
         losses = {}
         model_kwargs = getattr(getattr(self.cfg, 'model', None), 'kwargs', {})
@@ -748,6 +859,66 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
             losses['loss_synthetic_semantic_gate'] = loss_sem.detach()
             losses['loss_synthetic_semantic_gate_weighted'] = weight * loss_sem
             losses['synthetic_semantic_gate_mean'] = semantic_gate.detach().mean()
+
+        if isinstance(synth_out, dict) and 'semantic_map' in synth_out:
+            semantic_map = synth_out['semantic_map']
+            if semantic_map.ndim == 4 and semantic_map.shape[1] == 1:
+                semantic_map = semantic_map[:, 0]
+            if semantic_map.ndim == 3:
+                semantic_map = semantic_map.unsqueeze(1)
+            targets = synth_masks.to(device=semantic_map.device, dtype=semantic_map.dtype)
+            if targets.shape[-2:] != semantic_map.shape[-2:]:
+                targets = F.interpolate(targets, size=semantic_map.shape[-2:], mode='nearest')
+
+            threshold = float(text_guidance_kwargs.get('tips_semantic_mask_threshold', 0.05))
+            hard_targets = (targets[:, 0] > threshold).long()
+            temperature = max(float(text_guidance_kwargs.get('tips_semantic_temperature', 0.1)), 1e-6)
+            logits = torch.cat([semantic_map, -semantic_map], dim=1) / temperature
+            probs = torch.softmax(logits, dim=1)
+            target_float = hard_targets.to(dtype=probs.dtype)
+
+            loss_focal = self._tips_focal_loss(
+                logits,
+                hard_targets,
+                gamma=float(text_guidance_kwargs.get('tips_semantic_focal_gamma', 2.0)),
+            )
+            loss_dice_abnormal = self._binary_dice_loss(probs[:, 1], target_float)
+            loss_dice_normal = self._binary_dice_loss(probs[:, 0], 1.0 - target_float)
+            loss_tips_sem = loss_focal + loss_dice_abnormal + loss_dice_normal
+            weight = float(text_guidance_kwargs.get('tips_semantic_loss_weight', 0.0))
+
+            abnormal_mask = hard_targets.bool().unsqueeze(1)
+            normal_mask = ~abnormal_mask
+            sem_detached = semantic_map.detach()
+            losses['loss_synthetic_tips_semantic'] = loss_tips_sem.detach()
+            losses['loss_synthetic_tips_semantic_weighted'] = weight * loss_tips_sem
+            losses['loss_synthetic_tips_focal'] = loss_focal.detach()
+            losses['loss_synthetic_tips_dice_abnormal'] = loss_dice_abnormal.detach()
+            losses['loss_synthetic_tips_dice_normal'] = loss_dice_normal.detach()
+            losses['synthetic_tips_target_ratio'] = target_float.detach().mean()
+            losses['synthetic_tips_prob_abnormal_mean'] = probs[:, 1].detach().mean()
+            losses['synthetic_tips_prob_abnormal_on_mask_mean'] = self._masked_prob_mean(
+                probs[:, 1].detach().unsqueeze(1),
+                abnormal_mask,
+            )
+            losses['synthetic_tips_prob_abnormal_off_mask_mean'] = self._masked_prob_mean(
+                probs[:, 1].detach().unsqueeze(1),
+                normal_mask,
+            )
+            losses['synthetic_tips_prob_abnormal_mask_gap'] = (
+                losses['synthetic_tips_prob_abnormal_on_mask_mean']
+                - losses['synthetic_tips_prob_abnormal_off_mask_mean']
+            )
+            losses['synthetic_tips_semantic_mean'] = sem_detached.mean()
+            losses['synthetic_tips_abnormal_semantic_mean'] = self._masked_prob_mean(sem_detached, abnormal_mask)
+            losses['synthetic_tips_normal_semantic_mean'] = self._masked_prob_mean(sem_detached, normal_mask)
+            losses['synthetic_tips_semantic_mask_gap'] = (
+                losses['synthetic_tips_normal_semantic_mean']
+                - losses['synthetic_tips_abnormal_semantic_mean']
+            )
+            losses['synthetic_tips_abnormal_win_ratio'] = (
+                (probs[:, 1].detach() > probs[:, 0].detach()).to(dtype=probs.dtype).mean()
+            )
         return losses
 
     def _apply_spatial_synthetic_lesion(self, imgs_01, masks, synthetic_cfg):
@@ -956,6 +1127,11 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
                 'loss_synthetic_cssd_image_weighted',
                 'loss_synthetic_semantic_gate',
                 'loss_synthetic_semantic_gate_weighted',
+                'loss_synthetic_tips_semantic',
+                'loss_synthetic_tips_semantic_weighted',
+                'loss_synthetic_tips_focal',
+                'loss_synthetic_tips_dice_abnormal',
+                'loss_synthetic_tips_dice_normal',
                 'synthetic_mask_ratio',
                 'synthetic_outside_ratio',
                 'synthetic_foreground_ratio',
@@ -963,6 +1139,16 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
                 'synthetic_target_area',
                 'synthetic_cssd_image_score_mean',
                 'synthetic_semantic_gate_mean',
+                'synthetic_tips_target_ratio',
+                'synthetic_tips_prob_abnormal_mean',
+                'synthetic_tips_prob_abnormal_on_mask_mean',
+                'synthetic_tips_prob_abnormal_off_mask_mean',
+                'synthetic_tips_prob_abnormal_mask_gap',
+                'synthetic_tips_semantic_mean',
+                'synthetic_tips_abnormal_semantic_mean',
+                'synthetic_tips_normal_semantic_mean',
+                'synthetic_tips_semantic_mask_gap',
+                'synthetic_tips_abnormal_win_ratio',
                 'loss_normal_topk',
                 'loss_background',
                 'loss_edge',
@@ -980,6 +1166,10 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
                 'loss_prompt_bank_diversity_weighted',
                 'loss_prompt_class_orthogonal',
                 'loss_prompt_class_orthogonal_weighted',
+                'loss_prompt_token_norm',
+                'loss_prompt_token_norm_weighted',
+                'loss_pathology_axis',
+                'loss_pathology_axis_weighted',
                 'cssd_image_score_mean',
                 'semantic_gate_mean',
                 'fixed_global_normal_norm',
@@ -992,16 +1182,56 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
                 'global_sim_abnormal_mean',
                 'local_patch_sim_normal_mean',
                 'local_patch_sim_abnormal_mean',
+                'fixed_proto_cos_mean',
+                'fixed_proto_margin_mean',
+                'local_proto_cos_mean',
+                'local_proto_margin_mean',
+                'fixed_local_normal_cos_mean',
+                'fixed_local_abnormal_cos_mean',
+                'local_patch_gap_mean',
+                'local_patch_gap_std',
+                'local_patch_gap_q95',
+                'local_patch_gap_q99',
+                'local_patch_gap_top1_mean',
+                'local_patch_gap_top5_mean',
+                'local_patch_gap_positive_mean',
+                'local_patch_gap_negative_mean',
+                'local_patch_abnormal_win_ratio',
+                'local_patch_normal_margin_mean',
+                'local_fixed_direction_cos_mean',
                 'local_base_proto_cos_mean',
                 'global_score_mean',
                 'cssd_image_score_mean_debug',
                 'image_score_mean',
+                'local_prompt_token_normal_norm_mean',
+                'local_prompt_token_normal_norm_std',
+                'local_prompt_token_abnormal_norm_mean',
+                'local_prompt_token_abnormal_norm_std',
                 'local_prompt_bank_size',
+                'local_prompt_token_count',
+                'local_prompt_token_prefix_enabled',
                 'prompt_bank_entropy',
                 'prompt_bank_usage_max',
                 'prompt_bank_usage_min',
+                'prompt_selection_enabled',
+                'prompt_selection_normal_count',
+                'prompt_selection_abnormal_count',
+                'prompt_selection_candidate_normal_count',
+                'prompt_selection_candidate_abnormal_count',
+                'prompt_selection_normal_score_mean',
+                'prompt_selection_abnormal_score_mean',
+                'prompt_selection_normal_margin_mean',
+                'prompt_selection_abnormal_margin_mean',
+                'prompt_selection_selected_cross_cos_mean',
+                'prompt_selection_selected_margin_mean',
+                'prompt_selection_all_cross_cos_mean',
+                'prompt_selection_all_margin_mean',
+                'pathology_axis_enabled',
+                'pathology_axis_cos_mean',
+                'pathology_axis_margin_mean',
                 'fixed_global_requires_grad',
                 'local_delta_requires_grad',
+                'local_prompt_token_requires_grad',
                 'prompt_nonfinite',
             ]
             debug_vals = {
@@ -1010,6 +1240,7 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
                 if name in self.loss_dict
             }
             debug_vals.update(prompt_grad_debug)
+            debug_vals.update(self._train_source_count_debug())
             has_nan = any(math.isnan(val) or math.isinf(val) for val in debug_vals.values())
             mem_mb = torch.cuda.max_memory_allocated(self.device) / 1024 ** 2
             debug_msg = ' '.join([f'{name}={val:.6f}' for name, val in debug_vals.items()])

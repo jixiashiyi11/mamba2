@@ -671,6 +671,45 @@ class MFF_OCE(nn.Module):
 
         return sv_features.contiguous()
 
+class MAMBAADOfficial(nn.Module):
+    def __init__(self, model_t, model_s):
+        super(MAMBAADOfficial, self).__init__()
+        self.net_t = get_model(model_t)
+        self.mff_oce = MFF_OCE(Bottleneck, 3)
+        self.net_s = MambaUPNet(
+            depths_decoder=model_s['depths_decoder'],
+            scan_type=model_s['scan_type'],
+            num_direction=model_s['num_direction'],
+        )
+        self.frozen_layers = ['net_t']
+
+    def freeze_layer(self, module):
+        module.eval()
+        for param in module.parameters():
+            param.requires_grad = False
+
+    def train(self, mode=True):
+        self.training = mode
+        for mname, module in self.named_children():
+            if mname in self.frozen_layers:
+                self.freeze_layer(module)
+            else:
+                module.train(mode)
+        return self
+
+    def forward(self, imgs):
+        feats_t = self.net_t(imgs)
+        feats_t = [f.detach() for f in feats_t]
+        feats_s = self.net_s(self.mff_oce(feats_t))
+        return feats_t, feats_s
+
+
+@MODEL.register_module
+def mambaad_official(pretrained=False, **kwargs):
+    model = MAMBAADOfficial(**kwargs)
+    return model
+
+
 class MAMBAAD(nn.Module):
     def __init__(
             self,
@@ -1138,11 +1177,17 @@ class FrozenBiomedCLIPPatchEncoder(nn.Module):
             return tokens @ projection
         return tokens
 
-    def encode_text_pairs(self, cls_names, batch_size, device):
+    def encode_text_pairs(self, cls_names, batch_size, device, selection_kwargs=None, return_selection_debug=False):
         cls_names = self._expand_cls_names(cls_names, batch_size)
         normal_prompt_sets = [self._resolve_prompts(self.normal_prompt_map, name) for name in cls_names]
         abnormal_prompt_sets = [self._resolve_prompts(self.abnormal_prompt_map, name) for name in cls_names]
-        return self.encode_prompt_sets(normal_prompt_sets, abnormal_prompt_sets, device=device)
+        return self.encode_prompt_sets(
+            normal_prompt_sets,
+            abnormal_prompt_sets,
+            device=device,
+            selection_kwargs=selection_kwargs,
+            return_selection_debug=return_selection_debug,
+        )
 
     def _normalize_prompt_value(self, prompt_value, name):
         if isinstance(prompt_value, str):
@@ -1153,7 +1198,62 @@ class FrozenBiomedCLIPPatchEncoder(nn.Module):
             return [str(item) for item in prompt_value]
         raise TypeError(f'`{name}` must be a string or list, got {type(prompt_value).__name__}.')
 
-    def encode_prompt_sets(self, normal_prompt_sets, abnormal_prompt_sets, device):
+    def _same_class_consistency(self, features):
+        if features.shape[0] <= 1:
+            return features.new_zeros((features.shape[0],))
+        sim = features @ features.t()
+        eye = torch.eye(features.shape[0], device=features.device, dtype=torch.bool)
+        return sim.masked_fill(eye, 0.0).sum(dim=1) / float(features.shape[0] - 1)
+
+    def _select_prompt_features(self, normal_features, abnormal_features, selection_kwargs):
+        kwargs = dict(selection_kwargs or {})
+        enabled = bool(kwargs.get('enabled', False))
+        if not enabled:
+            return (
+                F.normalize(normal_features.mean(dim=0), p=2, dim=-1),
+                F.normalize(abnormal_features.mean(dim=0), p=2, dim=-1),
+                {},
+            )
+
+        topk = int(kwargs.get('topk', 3))
+        topk_normal = max(1, min(int(kwargs.get('topk_normal', topk)), normal_features.shape[0]))
+        topk_abnormal = max(1, min(int(kwargs.get('topk_abnormal', topk)), abnormal_features.shape[0]))
+        margin_weight = float(kwargs.get('margin_weight', 1.0))
+        consistency_weight = float(kwargs.get('consistency_weight', 0.0))
+
+        cross_sim = normal_features @ abnormal_features.t()
+        normal_margin = (1.0 - cross_sim).mean(dim=1)
+        abnormal_margin = (1.0 - cross_sim).mean(dim=0)
+        normal_consistency = self._same_class_consistency(normal_features)
+        abnormal_consistency = self._same_class_consistency(abnormal_features)
+        normal_score = margin_weight * normal_margin + consistency_weight * normal_consistency
+        abnormal_score = margin_weight * abnormal_margin + consistency_weight * abnormal_consistency
+
+        normal_idx = torch.topk(normal_score, k=topk_normal).indices
+        abnormal_idx = torch.topk(abnormal_score, k=topk_abnormal).indices
+        selected_normal = normal_features.index_select(0, normal_idx)
+        selected_abnormal = abnormal_features.index_select(0, abnormal_idx)
+        t_norm = F.normalize(selected_normal.mean(dim=0), p=2, dim=-1)
+        t_abn = F.normalize(selected_abnormal.mean(dim=0), p=2, dim=-1)
+        selected_cross = selected_normal @ selected_abnormal.t()
+        debug = {
+            'prompt_selection_enabled': normal_features.new_tensor(1.0),
+            'prompt_selection_normal_count': normal_features.new_tensor(float(topk_normal)),
+            'prompt_selection_abnormal_count': normal_features.new_tensor(float(topk_abnormal)),
+            'prompt_selection_candidate_normal_count': normal_features.new_tensor(float(normal_features.shape[0])),
+            'prompt_selection_candidate_abnormal_count': abnormal_features.new_tensor(float(abnormal_features.shape[0])),
+            'prompt_selection_normal_score_mean': normal_score.index_select(0, normal_idx).mean(),
+            'prompt_selection_abnormal_score_mean': abnormal_score.index_select(0, abnormal_idx).mean(),
+            'prompt_selection_normal_margin_mean': normal_margin.index_select(0, normal_idx).mean(),
+            'prompt_selection_abnormal_margin_mean': abnormal_margin.index_select(0, abnormal_idx).mean(),
+            'prompt_selection_selected_cross_cos_mean': selected_cross.mean(),
+            'prompt_selection_selected_margin_mean': 1.0 - selected_cross.mean(),
+            'prompt_selection_all_cross_cos_mean': cross_sim.mean(),
+            'prompt_selection_all_margin_mean': 1.0 - cross_sim.mean(),
+        }
+        return t_norm, t_abn, debug
+
+    def encode_prompt_sets(self, normal_prompt_sets, abnormal_prompt_sets, device, selection_kwargs=None, return_selection_debug=False):
         if len(normal_prompt_sets) != len(abnormal_prompt_sets):
             raise ValueError('Normal and abnormal prompt sets must have the same batch length.')
         flat_prompts = []
@@ -1165,10 +1265,36 @@ class FrozenBiomedCLIPPatchEncoder(nn.Module):
         tokens = self.tokenizer(flat_prompts).to(device)
         features = F.normalize(self.model.encode_text(tokens), p=2, dim=-1)
         pooled = []
+        selection_debugs = []
         for start, end in slices:
-            pooled.append(F.normalize(features[start:end].mean(dim=0), p=2, dim=-1))
-        pooled = torch.stack(pooled, dim=0)
+            pooled.append((start, end))
         batch_size = len(normal_prompt_sets)
+        normal_pooled = []
+        abnormal_pooled = []
+        for idx in range(batch_size):
+            normal_start, normal_end = pooled[idx]
+            abnormal_start, abnormal_end = pooled[idx + batch_size]
+            t_norm, t_abn, debug = self._select_prompt_features(
+                features[normal_start:normal_end],
+                features[abnormal_start:abnormal_end],
+                selection_kwargs,
+            )
+            normal_pooled.append(t_norm)
+            abnormal_pooled.append(t_abn)
+            if debug:
+                selection_debugs.append(debug)
+        pooled = torch.cat(
+            [torch.stack(normal_pooled, dim=0), torch.stack(abnormal_pooled, dim=0)],
+            dim=0,
+        )
+        if return_selection_debug:
+            merged_debug = {}
+            if selection_debugs:
+                for key in selection_debugs[0]:
+                    merged_debug[key] = torch.stack([debug[key] for debug in selection_debugs]).mean()
+            else:
+                merged_debug['prompt_selection_enabled'] = pooled.new_tensor(0.0)
+            return pooled[:batch_size], pooled[batch_size:], merged_debug
         return pooled[:batch_size], pooled[batch_size:]
 
     def encode_static_text_pairs(self, prompt_normal, prompt_abnormal, batch_size, device):
@@ -1857,6 +1983,10 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
         self.image_score_source = str(self.image_branch_kwargs.get('image_score_source', 'global')).lower()
         self.map_topk_ratio = float(self.image_branch_kwargs.get('map_topk_ratio', self.cssd_topk_ratio))
         self.text_reg_weight = float(self.text_guidance_kwargs.get('prototype_reg_weight', 0.05))
+        self.prompt_token_norm_weight = float(self.text_guidance_kwargs.get('prompt_token_norm_weight', 0.0))
+        self.fixed_prompt_selection_kwargs = dict(self.text_guidance_kwargs.get('fixed_prompt_selection_kwargs', {}))
+        self.pathology_axis_kwargs = dict(self.text_guidance_kwargs.get('pathology_axis_kwargs', {}))
+        self.pathology_axis_loss_weight = float(self.pathology_axis_kwargs.get('loss_weight', 0.0))
         self.text_prompt_mode = str(self.text_guidance_kwargs.get('text_prompt_mode', 'decoupled')).lower()
         self.global_prompt_mode = str(self.text_guidance_kwargs.get('global_prompt_mode', 'fixed')).lower()
         self.local_prompt_mode = str(self.text_guidance_kwargs.get('local_prompt_mode', 'learnable_delta')).lower()
@@ -1897,6 +2027,9 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
         self._configure_prompt_grad_flags()
         self.last_prompt_debug = {}
         self._last_prompt_bank_weights = None
+        self._fixed_text_pair_cache = {}
+        self._last_fixed_prompt_selection_debug = {}
+        self._pathology_axis_cache = {}
 
     def _validate_prompt_modes(self):
         text_modes = {'decoupled', 'shared', 'legacy'}
@@ -2087,13 +2220,35 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
         return self.local_text_delta_abnormal
 
     def _fixed_text_pairs(self, cls_names, batch_size, device):
+        cls_names = self.biomedclip._expand_cls_names(cls_names, batch_size)
+        normal_features = []
+        abnormal_features = []
+        selection_debugs = []
         with torch.no_grad():
-            t_norm, t_abn = self.biomedclip.encode_text_pairs(
-                cls_names,
-                batch_size=batch_size,
-                device=device,
-            )
-        return t_norm.detach(), t_abn.detach()
+            for cls_name in cls_names:
+                cache_key = (str(device), str(cls_name).lower())
+                cached = self._fixed_text_pair_cache.get(cache_key)
+                if cached is None:
+                    t_norm, t_abn, selection_debug = self.biomedclip.encode_text_pairs(
+                        [cls_name],
+                        batch_size=1,
+                        device=device,
+                        selection_kwargs=self.fixed_prompt_selection_kwargs,
+                        return_selection_debug=True,
+                    )
+                    cached = (t_norm[0].detach(), t_abn[0].detach(), selection_debug)
+                    self._fixed_text_pair_cache[cache_key] = cached
+                normal_features.append(cached[0].to(device=device))
+                abnormal_features.append(cached[1].to(device=device))
+                if len(cached) > 2 and cached[2]:
+                    selection_debugs.append(cached[2])
+        self._last_fixed_prompt_selection_debug = {}
+        if selection_debugs:
+            for key in selection_debugs[0]:
+                self._last_fixed_prompt_selection_debug[key] = torch.stack([
+                    debug[key].to(device=device) for debug in selection_debugs
+                ]).mean()
+        return torch.stack(normal_features, dim=0).detach(), torch.stack(abnormal_features, dim=0).detach()
 
     def _local_sources_for_batch(self, cls_names, batch_size):
         cls_names = self.biomedclip._expand_cls_names(cls_names, batch_size)
@@ -2250,6 +2405,53 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
                 torch.sum(F.normalize(local_base_norm_for_cos, p=2, dim=-1) * F.normalize(local_norm.detach(), p=2, dim=-1), dim=-1)
                 + torch.sum(F.normalize(local_base_abn_for_cos, p=2, dim=-1) * F.normalize(local_abn.detach(), p=2, dim=-1), dim=-1)
             ) * 0.5
+            fixed_proto_cos = torch.sum(
+                F.normalize(fixed_global_norm.detach(), p=2, dim=-1)
+                * F.normalize(fixed_global_abn.detach(), p=2, dim=-1),
+                dim=-1,
+            )
+            local_proto_cos = torch.sum(
+                F.normalize(local_norm.detach(), p=2, dim=-1)
+                * F.normalize(local_abn.detach(), p=2, dim=-1),
+                dim=-1,
+            )
+            fixed_local_normal_cos = torch.sum(
+                F.normalize(fixed_global_norm.detach(), p=2, dim=-1)
+                * F.normalize(local_norm.detach() if local_norm.ndim == 2 else local_norm.detach().mean(dim=1), p=2, dim=-1),
+                dim=-1,
+            )
+            fixed_local_abnormal_cos = torch.sum(
+                F.normalize(fixed_global_abn.detach(), p=2, dim=-1)
+                * F.normalize(local_abn.detach() if local_abn.ndim == 2 else local_abn.detach().mean(dim=1), p=2, dim=-1),
+                dim=-1,
+            )
+            local_patch_gap = local_sim_abnormal - local_sim_normal
+            local_patch_normal_margin = local_sim_normal - local_sim_abnormal
+            local_patch_gap_flat = local_patch_gap.float().reshape(-1)
+            local_patch_gap_positive = local_patch_gap_flat[local_patch_gap_flat > 0]
+            local_patch_gap_negative = local_patch_gap_flat[local_patch_gap_flat <= 0]
+            local_patch_gap_top1 = local_patch_gap.topk(
+                max(1, int(local_patch_gap.shape[1] * 0.01)),
+                dim=1,
+            ).values.mean()
+            local_patch_gap_top5 = local_patch_gap.topk(
+                max(1, int(local_patch_gap.shape[1] * 0.05)),
+                dim=1,
+            ).values.mean()
+            local_direction = F.normalize(
+                (local_abn.detach() if local_abn.ndim == 2 else local_abn.detach().mean(dim=1))
+                - (local_norm.detach() if local_norm.ndim == 2 else local_norm.detach().mean(dim=1)),
+                p=2,
+                dim=-1,
+            )
+            fixed_direction = F.normalize(
+                fixed_global_abn.detach() - fixed_global_norm.detach(),
+                p=2,
+                dim=-1,
+            )
+            local_fixed_direction_cos = torch.sum(local_direction * fixed_direction, dim=-1)
+            token_norm_normal = self.local_prompt_tokens_normal.detach().float().norm(dim=-1)
+            token_norm_abnormal = self.local_prompt_tokens_abnormal.detach().float().norm(dim=-1)
             tensors = [
                 fixed_global_norm,
                 fixed_global_abn,
@@ -2273,10 +2475,39 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
                 'global_sim_abnormal_mean': global_sim_abnormal.mean(),
                 'local_patch_sim_normal_mean': local_sim_normal.mean(),
                 'local_patch_sim_abnormal_mean': local_sim_abnormal.mean(),
+                'fixed_proto_cos_mean': fixed_proto_cos.mean(),
+                'fixed_proto_margin_mean': (1.0 - fixed_proto_cos).mean(),
+                'local_proto_cos_mean': local_proto_cos.mean(),
+                'local_proto_margin_mean': (1.0 - local_proto_cos).mean(),
+                'fixed_local_normal_cos_mean': fixed_local_normal_cos.mean(),
+                'fixed_local_abnormal_cos_mean': fixed_local_abnormal_cos.mean(),
+                'local_patch_gap_mean': local_patch_gap.mean(),
+                'local_patch_gap_std': local_patch_gap.float().std(unbiased=False),
+                'local_patch_gap_q95': torch.quantile(local_patch_gap_flat, 0.95),
+                'local_patch_gap_q99': torch.quantile(local_patch_gap_flat, 0.99),
+                'local_patch_gap_top1_mean': local_patch_gap_top1,
+                'local_patch_gap_top5_mean': local_patch_gap_top5,
+                'local_patch_gap_positive_mean': (
+                    local_patch_gap_positive.mean()
+                    if local_patch_gap_positive.numel()
+                    else image_score.new_tensor(0.0)
+                ),
+                'local_patch_gap_negative_mean': (
+                    local_patch_gap_negative.mean()
+                    if local_patch_gap_negative.numel()
+                    else image_score.new_tensor(0.0)
+                ),
+                'local_patch_abnormal_win_ratio': (local_patch_gap > 0).float().mean(),
+                'local_patch_normal_margin_mean': local_patch_normal_margin.mean(),
+                'local_fixed_direction_cos_mean': local_fixed_direction_cos.mean(),
                 'local_base_proto_cos_mean': local_base_sim.mean(),
                 'global_score_mean': global_score.detach().mean(),
                 'cssd_image_score_mean_debug': cssd_image_score.detach().mean(),
                 'image_score_mean': image_score.detach().mean(),
+                'local_prompt_token_normal_norm_mean': token_norm_normal.mean() if token_norm_normal.numel() else image_score.new_tensor(0.0),
+                'local_prompt_token_normal_norm_std': token_norm_normal.std(unbiased=False) if token_norm_normal.numel() else image_score.new_tensor(0.0),
+                'local_prompt_token_abnormal_norm_mean': token_norm_abnormal.mean() if token_norm_abnormal.numel() else image_score.new_tensor(0.0),
+                'local_prompt_token_abnormal_norm_std': token_norm_abnormal.std(unbiased=False) if token_norm_abnormal.numel() else image_score.new_tensor(0.0),
                 'local_prompt_bank_size': torch.tensor(
                     float(self.local_prompt_bank_size),
                     device=image_score.device,
@@ -2324,6 +2555,8 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
                     'prompt_bank_usage_max': usage.max(),
                     'prompt_bank_usage_min': usage.min(),
                 })
+            if self._last_fixed_prompt_selection_debug:
+                self.last_prompt_debug.update(self._last_fixed_prompt_selection_debug)
 
     def _text_prototype_regularization(self, t_norm, t_abn, learn_norm, learn_abn):
         if learn_norm.ndim == 3:
@@ -2354,6 +2587,67 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
         if local_direction.ndim == 3:
             class_direction = class_direction.unsqueeze(1)
         return torch.sum(local_direction * class_direction, dim=-1).abs().mean()
+
+    def _prompt_token_norm_regularization(self):
+        if self.prompt_token_norm_weight <= 0 or self.local_prompt_token_count <= 0:
+            return self.local_prompt_tokens_normal.new_tensor(0.0)
+        normal_loss = self.local_prompt_tokens_normal.float().pow(2).mean()
+        abnormal_loss = self.local_prompt_tokens_abnormal.float().pow(2).mean()
+        return 0.5 * (normal_loss + abnormal_loss)
+
+    def _pathology_axis_text_pairs(self, batch_size, device):
+        normal_prompts = self.pathology_axis_kwargs.get(
+            'normal_prompts',
+            [
+                'A local medical region with regular tissue texture.',
+                'A local anatomical patch with preserved structure.',
+            ],
+        )
+        abnormal_prompts = self.pathology_axis_kwargs.get(
+            'abnormal_prompts',
+            [
+                'A local medical region with focal pathological tissue.',
+                'A local anatomical patch with lesion, abnormal signal, or disrupted structure.',
+            ],
+        )
+        cache_key = (
+            str(device),
+            tuple(str(prompt) for prompt in self.biomedclip._normalize_prompt_value(normal_prompts, 'pathology_axis_normal')),
+            tuple(str(prompt) for prompt in self.biomedclip._normalize_prompt_value(abnormal_prompts, 'pathology_axis_abnormal')),
+        )
+        cached = self._pathology_axis_cache.get(cache_key)
+        if cached is None:
+            with torch.no_grad():
+                axis_norm, axis_abn = self.biomedclip.encode_static_text_pairs(
+                    normal_prompts,
+                    abnormal_prompts,
+                    batch_size=1,
+                    device=device,
+                )
+            cached = (axis_norm[0].detach(), axis_abn[0].detach())
+            self._pathology_axis_cache[cache_key] = cached
+        axis_norm = cached[0].to(device=device).unsqueeze(0).expand(batch_size, -1)
+        axis_abn = cached[1].to(device=device).unsqueeze(0).expand(batch_size, -1)
+        return axis_norm.detach(), axis_abn.detach()
+
+    def _pathology_axis_regularization(self, local_norm, local_abn, batch_size, device):
+        if self.pathology_axis_loss_weight <= 0:
+            return local_norm.new_tensor(0.0), {'pathology_axis_enabled': local_norm.new_tensor(0.0)}
+        axis_norm, axis_abn = self._pathology_axis_text_pairs(batch_size, device)
+        local_direction = F.normalize(local_abn - local_norm, p=2, dim=-1)
+        if local_direction.ndim == 3:
+            local_direction = F.normalize(local_direction.mean(dim=1), p=2, dim=-1)
+        axis_direction = F.normalize(axis_abn - axis_norm, p=2, dim=-1)
+        axis_cos = torch.sum(local_direction * axis_direction, dim=-1)
+        loss_axis = (1.0 - axis_cos).mean()
+        debug = {
+            'pathology_axis_enabled': local_norm.new_tensor(1.0),
+            'pathology_axis_cos_mean': axis_cos.detach().mean(),
+            'pathology_axis_margin_mean': (
+                1.0 - torch.sum(F.normalize(axis_norm, p=2, dim=-1) * F.normalize(axis_abn, p=2, dim=-1), dim=-1)
+            ).detach().mean(),
+        }
+        return loss_axis, debug
 
     def _semantic_gate(self, tokens, t_norm, t_abn, spatial_shape, image_shape):
         sim_normal = self._text_similarity(tokens, t_norm)
@@ -2544,12 +2838,21 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
                 t_norm,
                 t_abn,
             )
+            loss_prompt_token_norm = self._prompt_token_norm_regularization()
+            loss_pathology_axis, pathology_axis_debug = self._pathology_axis_regularization(
+                t_norm,
+                t_abn,
+                imgs.shape[0],
+                imgs.device,
+            )
             out['total'] = (
                 out['total']
                 + self.cssd_image_loss_weight * loss_img_normal
                 + self.text_reg_weight * loss_text_reg
                 + self.prompt_bank_diversity_weight * loss_prompt_bank_div
                 + self.prompt_bank_class_orthogonal_weight * loss_prompt_class_orth
+                + self.prompt_token_norm_weight * loss_prompt_token_norm
+                + self.pathology_axis_loss_weight * loss_pathology_axis
             )
             out['loss_total'] = out['total']
             out['loss_cssd_image_normal'] = loss_img_normal
@@ -2562,9 +2865,14 @@ class MAMBAADBiomedCLIPDualBranchAdapter(MAMBAADBiomedCLIPLocalAdapter):
             out['loss_prompt_class_orthogonal_weighted'] = (
                 self.prompt_bank_class_orthogonal_weight * loss_prompt_class_orth
             )
+            out['loss_prompt_token_norm'] = loss_prompt_token_norm
+            out['loss_prompt_token_norm_weighted'] = self.prompt_token_norm_weight * loss_prompt_token_norm
+            out['loss_pathology_axis'] = loss_pathology_axis
+            out['loss_pathology_axis_weighted'] = self.pathology_axis_loss_weight * loss_pathology_axis
             out['cssd_image_score_mean'] = cssd_image_score.detach().mean()
             out['semantic_gate_mean'] = semantic_gate.detach().mean()
             out.update(self.last_prompt_debug)
+            out.update(pathology_axis_debug)
             if return_anomaly_map:
                 out.update(anomaly_map=anomaly_map, image_score=image_score.detach())
             return out

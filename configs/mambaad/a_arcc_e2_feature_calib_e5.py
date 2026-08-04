@@ -5,6 +5,11 @@ class cfg(base_cfg):
     def __init__(self):
         super(cfg, self).__init__()
 
+        self.batch_train = 8
+        self.batch_test_per = 8
+        self.trainer.data.batch_size = self.batch_train
+        self.trainer.data.batch_size_per_gpu_test = self.batch_test_per
+
         self.model.kwargs.update(
             arcc_kwargs=dict(
                 use_arcc=True,

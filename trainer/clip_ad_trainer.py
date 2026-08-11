@@ -1,0 +1,328 @@
+import glob
+import os
+import shutil
+import time
+
+import numpy as np
+import tabulate
+import torch
+from sklearn.metrics import average_precision_score, precision_recall_curve, roc_auc_score
+
+from . import TRAINER
+from ._base_trainer import BaseTrainer
+from util.net import get_timepc, reduce_tensor
+from util.util import able, log_msg, update_log_term
+
+
+@TRAINER.register_module
+class CLIPADTrainer(BaseTrainer):
+    def __init__(self, cfg):
+        super(CLIPADTrainer, self).__init__(cfg)
+        self.cls_names = list(self.test_loader.dataset.cls_names)
+        self._sync_metric_recorder(self.cls_names)
+        log_msg(self.logger, f"==> Source-domain train classes: {list(self.train_loader.dataset.cls_names)}")
+        log_msg(self.logger, f"==> Target-domain test classes: {self.cls_names}")
+
+    def _sync_metric_recorder(self, cls_names):
+        existing = getattr(self, "metric_recorder", {}) or {}
+        synced = {}
+        for idx, cls_name in enumerate(cls_names):
+            for metric in self.metrics:
+                key = f"{metric}_{cls_name}"
+                synced[key] = list(existing.get(key, []))
+                if idx == len(cls_names) - 1 and len(cls_names) > 1:
+                    avg_key = f"{metric}_Avg"
+                    synced[avg_key] = list(existing.get(avg_key, []))
+        self.metric_recorder = synced
+        self.cfg.trainer.metric_recorder = synced
+
+    def _expand_cls_name_like_batch(self, cls_names, batch_size):
+        if isinstance(cls_names, str):
+            return [cls_names] * batch_size
+        if isinstance(cls_names, (list, tuple)):
+            if len(cls_names) == batch_size:
+                return list(cls_names)
+            if len(cls_names) == 1:
+                return list(cls_names) * batch_size
+        return cls_names
+
+    def _get_model_cls_names(self):
+        score_cls_names = self.cls_name
+        force_cls_name = getattr(self.cfg, "eval_force_cls_name", None)
+        if not self.net.training and force_cls_name:
+            score_cls_names = force_cls_name
+        return self._expand_cls_name_like_batch(score_cls_names, self.bs)
+
+    def set_input(self, inputs):
+        self.imgs = inputs["img"].cuda()
+        self.imgs_mask = inputs["img_mask"].cuda()
+        self.cls_name = inputs["cls_name"]
+        self.anomaly = inputs["anomaly"].cuda().long().view(-1)
+        self.img_path = inputs.get("img_path") if isinstance(inputs, dict) else None
+        self.mask_path = inputs.get("mask_path") if isinstance(inputs, dict) else None
+        self.bs = self.imgs.shape[0]
+
+    def forward(self, return_loss=True):
+        score_cls_names = self._get_model_cls_names()
+        self.output = self.net(
+            self.imgs,
+            cls_names=score_cls_names,
+            masks=self.imgs_mask,
+            labels=self.anomaly,
+            return_loss=return_loss,
+        )
+        if isinstance(self.output, tuple):
+            self.anomaly_map, self.image_score = self.output
+        else:
+            self.anomaly_map = self.output["anomaly_map"]
+            self.image_score = self.output["image_score"]
+            if return_loss:
+                self.total_loss = self.output["total"]
+
+    def optimize_parameters(self):
+        with self.amp_autocast():
+            self.forward(return_loss=True)
+            total_loss = self.total_loss
+        if not torch.isfinite(total_loss):
+            raise FloatingPointError(f"Non-finite total loss: {float(total_loss.detach().cpu())}")
+        self.backward_term(total_loss, self.optim)
+        for name in [
+            "total",
+            "loss_global",
+            "loss_patch",
+            "loss_normal_topk",
+            "loss_consistency",
+            "loss_image_normal",
+            "loss_arcc_normal",
+            "loss_arcc_cal",
+            "loss_mask_bce",
+            "loss_mask_dice",
+            "loss_mask_raw_bce",
+            "loss_outside_topk",
+            "loss_image_supervised",
+            "dbg_refine_cos",
+            "dbg_refine_delta_l2",
+            "dbg_mamba_context_cos",
+            "dbg_mamba_context_delta_l2",
+            "dbg_local_delta_l2",
+            "dbg_local_delta_abs",
+            "dbg_l12_last_cos",
+            "dbg_l18_last_cos",
+            "dbg_a_raw_mean",
+            "dbg_a_raw_max",
+            "dbg_a_final_mean",
+            "dbg_a_final_max",
+            "dbg_arcc_delta_abs",
+            "dbg_arcc_delta_ratio",
+            "dbg_arcc_lambda",
+            "dbg_g_cal_abs",
+            "dbg_s_global",
+            "dbg_topk_score",
+            "dbg_topk_score_max",
+            "dbg_topk_score_top1",
+            "dbg_topk_score_top5",
+            "dbg_image_score_max",
+            "dbg_image_score_top1",
+            "dbg_image_score_top5",
+            "dbg_mamba_prior_mean",
+            "dbg_mamba_prior_max",
+        ]:
+            value = total_loss if name == "total" else self.output.get(name)
+            if value is not None:
+                update_log_term(
+                    self.log_terms.get(name),
+                    reduce_tensor(value, self.world_size).clone().detach().item(),
+                    1,
+                    self.master,
+                )
+
+    def _metric_table(self, results):
+        msg = {}
+        for idx, cls_name in enumerate(self.cls_names):
+            metric_results = self.evaluator.run(results, cls_name, self.logger)
+            msg["Name"] = msg.get("Name", [])
+            msg["Name"].append(cls_name)
+            avg_act = len(self.cls_names) > 1 and idx == len(self.cls_names) - 1
+            msg["Name"].append("Avg") if avg_act else None
+            for metric in self.metrics:
+                metric_result = metric_results[metric] * 100
+                self.metric_recorder[f"{metric}_{cls_name}"].append(metric_result)
+                max_metric = max(self.metric_recorder[f"{metric}_{cls_name}"])
+                max_metric_idx = self.metric_recorder[f"{metric}_{cls_name}"].index(max_metric) + 1
+                msg[metric] = msg.get(metric, [])
+                msg[metric].append(metric_result)
+                msg[f"{metric} (Max)"] = msg.get(f"{metric} (Max)", [])
+                msg[f"{metric} (Max)"].append(f"{max_metric:.3f} ({max_metric_idx:<3d} epoch)")
+                if avg_act:
+                    metric_result_avg = sum(msg[metric]) / len(msg[metric])
+                    self.metric_recorder[f"{metric}_Avg"].append(metric_result_avg)
+                    max_metric = max(self.metric_recorder[f"{metric}_Avg"])
+                    max_metric_idx = self.metric_recorder[f"{metric}_Avg"].index(max_metric) + 1
+                    msg[metric].append(metric_result_avg)
+                    msg[f"{metric} (Max)"].append(f"{max_metric:.3f} ({max_metric_idx:<3d} epoch)")
+        table = tabulate.tabulate(msg, headers="keys", tablefmt="pipe", floatfmt=".3f", numalign="center", stralign="center")
+        log_msg(self.logger, f"\n{table}")
+
+    def _image_score_variant_table(self, results):
+        variant_keys = [
+            ("default", "image_scores"),
+            ("max", "image_scores_max"),
+            ("top1", "image_scores_top1"),
+            ("top5", "image_scores_top5"),
+        ]
+        variant_keys = [(name, key) for name, key in variant_keys if key in results]
+        if len(variant_keys) <= 1:
+            return
+        msg = {"Name": [], "Score": [], "AUROC_sp": [], "AP_sp": [], "F1max_sp": []}
+        eps = 1e-8
+        for cls_name in self.cls_names:
+            idxes = results["cls_names"] == cls_name
+            labels = results["anomalys"][idxes].reshape(-1).astype(int)
+            for variant_name, key in variant_keys:
+                scores = results[key][idxes].reshape(-1)
+                if len(np.unique(labels)) < 2:
+                    auroc = np.nan
+                else:
+                    auroc = roc_auc_score(labels, scores) * 100
+                ap = average_precision_score(labels, scores) * 100
+                precision, recall, _ = precision_recall_curve(labels, scores)
+                f1 = (2.0 * precision * recall / (precision + recall + eps)).max() * 100
+                msg["Name"].append(cls_name)
+                msg["Score"].append(variant_name)
+                msg["AUROC_sp"].append(auroc)
+                msg["AP_sp"].append(ap)
+                msg["F1max_sp"].append(f1)
+        table = tabulate.tabulate(msg, headers="keys", tablefmt="pipe", floatfmt=".3f", numalign="center", stralign="center")
+        log_msg(self.logger, f"\n==> Image score aggregation variants\n{table}")
+
+    @torch.no_grad()
+    def test(self):
+        if self.master:
+            if os.path.exists(self.tmp_dir):
+                shutil.rmtree(self.tmp_dir)
+            os.makedirs(self.tmp_dir, exist_ok=True)
+        self.reset(isTrain=False)
+        force_cls_name = getattr(self.cfg, "eval_force_cls_name", None)
+        if self.master and force_cls_name:
+            log_msg(self.logger, f"==> EvalForceClsName score_cls_name={force_cls_name} metric_cls_names=original")
+
+        imgs_masks, anomaly_maps, image_scores, cls_names, anomalys, layer_text_maps = [], [], [], [], [], []
+        image_scores_max, image_scores_top1, image_scores_top5 = [], [], []
+        raw_anomaly_maps, arcc_cal_maps, mamba_prior_maps = [], [], []
+        img_paths, mask_paths = [], []
+        batch_idx = 0
+        test_length = self.cfg.data.test_size
+        test_loader = iter(self.test_loader)
+        while batch_idx < test_length:
+            t1 = get_timepc()
+            batch_idx += 1
+            test_data = next(test_loader)
+            self.set_input(test_data)
+            self.forward(return_loss=False)
+            self.imgs_mask[self.imgs_mask > 0.5], self.imgs_mask[self.imgs_mask <= 0.5] = 1, 0
+            imgs_masks.append(self.imgs_mask.cpu().numpy().astype(int))
+            anomaly_maps.append(self.anomaly_map.cpu().numpy())
+            image_scores.append(self.image_score.cpu().numpy())
+            if isinstance(self.output, dict) and "image_score_max" in self.output:
+                image_scores_max.append(self.output["image_score_max"].cpu().numpy())
+            if isinstance(self.output, dict) and "image_score_top1" in self.output:
+                image_scores_top1.append(self.output["image_score_top1"].cpu().numpy())
+            if isinstance(self.output, dict) and "image_score_top5" in self.output:
+                image_scores_top5.append(self.output["image_score_top5"].cpu().numpy())
+            cls_names.append(np.array(self.cls_name))
+            anomalys.append(self.anomaly.cpu().numpy().astype(int))
+            if isinstance(self.output, dict) and "layer_text_maps" in self.output:
+                layer_text_maps.append(self.output["layer_text_maps"].cpu().numpy())
+            if isinstance(self.output, dict) and "A_raw" in self.output:
+                raw_anomaly_maps.append(self.output["A_raw"].cpu().numpy())
+            if isinstance(self.output, dict) and "G_cal" in self.output:
+                arcc_cal_maps.append(self.output["G_cal"].cpu().numpy())
+            if isinstance(self.output, dict) and "mamba_global_prior" in self.output:
+                mamba_prior_maps.append(self.output["mamba_global_prior"].cpu().numpy())
+            if self.img_path is not None:
+                img_paths.append(np.array(self.img_path))
+            if self.mask_path is not None:
+                mask_paths.append(np.array(self.mask_path))
+            t2 = get_timepc()
+            update_log_term(self.log_terms.get("batch_t"), t2 - t1, 1, self.master)
+            print(f"\r{batch_idx}/{test_length}", end="") if self.master else None
+            if self.master and (batch_idx % self.cfg.logging.test_log_per == 0 or batch_idx == test_length):
+                msg = able(self.progress.get_msg(batch_idx, test_length, 0, 0, prefix="Test"), self.master, None)
+                log_msg(self.logger, msg)
+
+        results = dict(
+            imgs_masks=imgs_masks,
+            anomaly_maps=anomaly_maps,
+            image_scores=image_scores,
+            cls_names=cls_names,
+            anomalys=anomalys,
+        )
+        if img_paths:
+            results["img_paths"] = img_paths
+        if mask_paths:
+            results["mask_paths"] = mask_paths
+        if layer_text_maps:
+            results["layer_text_maps"] = layer_text_maps
+        if raw_anomaly_maps:
+            results["raw_anomaly_maps"] = raw_anomaly_maps
+        if arcc_cal_maps:
+            results["arcc_cal_maps"] = arcc_cal_maps
+        if mamba_prior_maps:
+            results["mamba_prior_maps"] = mamba_prior_maps
+        if image_scores_max:
+            results["image_scores_max"] = image_scores_max
+        if image_scores_top1:
+            results["image_scores_top1"] = image_scores_top1
+        if image_scores_top5:
+            results["image_scores_top5"] = image_scores_top5
+        if self.cfg.dist:
+            torch.save(results, f"{self.tmp_dir}/{self.rank}.pth", _use_new_zipfile_serialization=False)
+            if self.master:
+                results = dict(imgs_masks=[], anomaly_maps=[], image_scores=[], cls_names=[], anomalys=[])
+                if img_paths:
+                    results["img_paths"] = []
+                if mask_paths:
+                    results["mask_paths"] = []
+                if layer_text_maps:
+                    results["layer_text_maps"] = []
+                if raw_anomaly_maps:
+                    results["raw_anomaly_maps"] = []
+                if arcc_cal_maps:
+                    results["arcc_cal_maps"] = []
+                if mamba_prior_maps:
+                    results["mamba_prior_maps"] = []
+                if image_scores_max:
+                    results["image_scores_max"] = []
+                if image_scores_top1:
+                    results["image_scores_top1"] = []
+                if image_scores_top5:
+                    results["image_scores_top5"] = []
+                valid_results = False
+                while not valid_results:
+                    results_files = glob.glob(f"{self.tmp_dir}/*.pth")
+                    if len(results_files) != self.cfg.world_size:
+                        time.sleep(1)
+                    else:
+                        idx_result = 0
+                        while idx_result < self.cfg.world_size:
+                            try:
+                                result = torch.load(results_files[idx_result])
+                                for key, value in result.items():
+                                    results[key].extend(value)
+                                idx_result += 1
+                            except Exception:
+                                time.sleep(1)
+                        valid_results = True
+
+        if self.master:
+            results = {key: np.concatenate(value, axis=0) for key, value in results.items()}
+            net_for_stage = getattr(self.net, "module", self.net)
+            model_stage = getattr(net_for_stage, "stage", "stage1")
+            output_name = getattr(self.cfg.trainer, "output_name", "")
+            if not output_name:
+                output_name = f"clip_ad_{model_stage}_outputs.npz"
+            save_path = os.path.join(self.cfg.logdir_test, output_name)
+            np.savez_compressed(save_path, **results)
+            log_msg(self.logger, f"==> Saved CLIP AD outputs: {save_path}")
+            self._image_score_variant_table(results)
+            self._metric_table(results)

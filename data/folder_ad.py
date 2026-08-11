@@ -109,7 +109,7 @@ class MetaADDataset(Dataset):
         self.cfg_data = cfg_data
         self.train = train
         self.root = Path(cfg_data.root)
-        self.split = 'train' if train else 'test'
+        self.split = getattr(cfg_data, 'train_split', 'train') if train else getattr(cfg_data, 'test_split', 'test')
         self.loader = get_img_loader(getattr(cfg_data, 'loader_type', 'pil'))
         self.mask_loader = get_img_loader(getattr(cfg_data, 'loader_type_target', 'pil_L'))
         self.transform = _build_transform(
@@ -147,7 +147,8 @@ class MetaADDataset(Dataset):
                 continue
             for specie_dir in sorted(p for p in cls_split_dir.iterdir() if p.is_dir()):
                 specie_name = specie_dir.name
-                anomaly = 0 if self.train or specie_name == 'good' else 1
+                train_with_masks = bool(getattr(self.cfg_data, 'train_with_anomaly_masks', False))
+                anomaly = 0 if (self.train and not train_with_masks) or specie_name == 'good' else 1
                 for img_path in sorted(p for p in specie_dir.rglob('*') if p.is_file() and _is_image(p)):
                     mask_path = ''
                     if anomaly:

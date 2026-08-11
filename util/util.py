@@ -81,9 +81,14 @@ def init_checkpoint(cfg):
             )
     else:
         if cfg.master:
-            logdir_sub = cfg.trainer.logdir_sub if cfg.trainer.logdir_sub != '' else time.strftime("%Y%m%d-%H%M%S")
-            # logdir_exp = '{}_{}_{}_{}'.format(cfg.trainer.name, cfg.model.name, cfg.data.type, logdir_sub)
-            logdir_exp = f"{cfg.trainer.name}_{cfg.cfg_path.replace('.', '_')}_{logdir_sub}"
+            timestamp = time.strftime("%Y%m%d-%H%M%S")
+            if getattr(cfg.trainer, "logdir_simple", False):
+                logdir_prefix = cfg.trainer.logdir_sub if cfg.trainer.logdir_sub != '' else cfg.trainer.name
+                logdir_exp = f"{logdir_prefix}_{timestamp}"
+            else:
+                logdir_sub = cfg.trainer.logdir_sub if cfg.trainer.logdir_sub != '' else timestamp
+                # logdir_exp = '{}_{}_{}_{}'.format(cfg.trainer.name, cfg.model.name, cfg.data.type, logdir_sub)
+                logdir_exp = f"{cfg.trainer.name}_{cfg.cfg_path.replace('.', '_')}_{logdir_sub}"
             logdir = logdir_exp
             idx = 0
             while os.path.exists(logdir):

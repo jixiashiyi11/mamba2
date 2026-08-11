@@ -343,7 +343,7 @@ class HSSBlock(nn.Module):
                                    scan_type=scan_type, num_direction=num_direction, **kwargs)
         self.drop_path = DropPath(drop_path)
 
-        cond_dim = 512
+        cond_dim = hidden_dim
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(cond_dim, hidden_dim * 2, bias=True)

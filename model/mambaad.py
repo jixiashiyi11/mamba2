@@ -335,26 +335,29 @@ class HSSBlock(nn.Module):
             size: int = 8,
             scan_type='scan',
             num_direction=4,
+            use_adaln: bool = True,
             **kwargs,
     ):
         super().__init__()
+        self.use_adaln = bool(use_adaln)
         self.ln_1 = norm_layer(hidden_dim)
         self.self_attention = SS2D(d_model=hidden_dim, dropout=attn_drop_rate, d_state=d_state, size=size,
                                    scan_type=scan_type, num_direction=num_direction, **kwargs)
         self.drop_path = DropPath(drop_path)
 
-        cond_dim = hidden_dim
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(cond_dim, hidden_dim * 2, bias=True)
-        )
-        nn.init.zeros_(self.adaLN_modulation[1].weight)
-        nn.init.zeros_(self.adaLN_modulation[1].bias)
+        if self.use_adaln:
+            cond_dim = hidden_dim
+            self.adaLN_modulation = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(cond_dim, hidden_dim * 2, bias=True)
+            )
+            nn.init.zeros_(self.adaLN_modulation[1].weight)
+            nn.init.zeros_(self.adaLN_modulation[1].bias)
 
     def forward(self, input: torch.Tensor, c=None):
         x_norm = self.ln_1(input)
 
-        if c is not None:
+        if self.use_adaln and c is not None:
             gamma_c, beta_c = self.adaLN_modulation(c).chunk(2, dim=1)
             gamma_c = gamma_c.unsqueeze(1).unsqueeze(1)
             beta_c = beta_c.unsqueeze(1).unsqueeze(1)
@@ -421,16 +424,21 @@ class LSSModule(nn.Module):
             num_direction: int = 8,
             use_selective_scan: bool = True,
             use_deformable_pool: bool = True,
+            add_outer_residual: bool = True,
+            use_adaln: bool = True,
             **kwargs,
     ):
         super().__init__()
         self.use_selective_scan = bool(use_selective_scan)
         self.use_deformable_pool = bool(use_deformable_pool)
+        self.add_outer_residual = bool(add_outer_residual)
+        self.use_adaln = bool(use_adaln)
         self.smm_blocks = nn.ModuleList()
         if self.use_selective_scan:
             self.smm_blocks = nn.ModuleList([
                 HSSBlock(hidden_dim=hidden_dim, drop_path=drop_path, norm_layer=norm_layer, attn_drop_rate=attn_drop_rate,
-                         d_state=d_state, size=size, scan_type=scan_type, num_direction=num_direction, **kwargs)
+                         d_state=d_state, size=size, scan_type=scan_type, num_direction=num_direction,
+                         use_adaln=self.use_adaln, **kwargs)
                 for i in range(depth)])
 
         if self.use_deformable_pool:
@@ -475,7 +483,7 @@ class LSSModule(nn.Module):
             output = out_ssm_permuted
 
         output = output.permute(0, 2, 3, 1).contiguous()
-        return output + input
+        return output + input if self.add_outer_residual else output
 
 class LSSLayer_up(nn.Module):
     def __init__(
@@ -956,6 +964,156 @@ class FrozenBiomedTextEncoder(nn.Module):
         return t_norm, t_abn
 
 
+class DepthRMSNorm(nn.Module):
+    """RMSNorm used by depth attention without requiring a recent PyTorch build."""
+
+    def __init__(self, hidden_dim, eps=1e-6):
+        super().__init__()
+        self.eps = float(eps)
+        self.weight = nn.Parameter(torch.ones(hidden_dim))
+
+    def forward(self, x):
+        inv_rms = torch.rsqrt(x.float().pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        normalized = x * inv_rms.to(dtype=x.dtype)
+        return normalized * self.weight.to(dtype=x.dtype)
+
+
+class DepthAttentionResidual(nn.Module):
+    """Official-style single-query attention over a list of depth sources.
+
+    Every source has shape [B, H, W, D]. Sources are stacked on a new depth
+    axis N, scored by one learned pseudo-query, and mixed with a softmax over N.
+    """
+
+    def __init__(self, hidden_dim, eps=1e-6):
+        super().__init__()
+        self.hidden_dim = int(hidden_dim)
+        self.norm = DepthRMSNorm(self.hidden_dim, eps=eps)
+        self.proj = nn.Linear(self.hidden_dim, 1, bias=False)
+
+    def forward(self, sources):
+        if not isinstance(sources, (list, tuple)) or len(sources) == 0:
+            raise ValueError('DepthAttentionResidual expects at least one source tensor.')
+
+        reference_shape = sources[0].shape
+        if len(reference_shape) != 4 or reference_shape[-1] != self.hidden_dim:
+            raise ValueError(
+                f'Expected sources shaped [B, H, W, {self.hidden_dim}], got {reference_shape}.'
+            )
+        if any(source.shape != reference_shape for source in sources[1:]):
+            raise ValueError('All depth-attention sources must have the same shape.')
+
+        # Complete historical representations: [N, B, H, W, D].
+        V = torch.stack(list(sources), dim=0)
+        K = self.norm(V)
+
+        # Official AttnRes semantics: one learned pseudo-query per mixer,
+        # no input-dependent query projection and no value projection.
+        query = self.proj.weight.squeeze(0)
+        logits = torch.einsum(
+            'd, n b h w d -> n b h w',
+            query,
+            K,
+        )
+        weights = logits.softmax(dim=0)
+        mixed = torch.einsum(
+            'n b h w, n b h w d -> b h w d',
+            weights,
+            V,
+        )
+        return mixed, weights
+
+
+class PDARCSSD(nn.Module):
+    """Patch-wise Depth-Attention Residual CSSD.
+
+    LSS/Mamba remains the spatial model. Attention Residual only changes how
+    each stage retrieves complete earlier representations along network depth.
+    """
+
+    def __init__(self, hidden_dim, grid_size, depths=(1, 1, 1, 1), d_state=16, drop_path_rate=0.0,
+                 attn_drop_rate=0.0, scan_type='scan', num_direction=8,
+                 use_selective_scan=True, use_deformable_pool=False):
+        super().__init__()
+        if not isinstance(depths, (list, tuple)) or len(depths) == 0:
+            raise ValueError('`depths` must be a non-empty list or tuple.')
+        self.hidden_dim = int(hidden_dim)
+        self.grid_size = int(grid_size)
+        self.use_selective_scan = bool(use_selective_scan)
+        self.use_deformable_pool = bool(use_deformable_pool)
+
+        stage_drop_paths = torch.linspace(0, drop_path_rate, len(depths)).tolist()
+        self.stages = nn.ModuleList([
+            LSSModule(
+                hidden_dim=self.hidden_dim,
+                drop_path=stage_drop_paths[idx],
+                norm_layer=partial(nn.LayerNorm, eps=1e-6),
+                attn_drop_rate=attn_drop_rate,
+                d_state=d_state,
+                depth=depth,
+                size=self.grid_size,
+                scan_type=scan_type,
+                num_direction=num_direction,
+                use_selective_scan=self.use_selective_scan,
+                use_deformable_pool=self.use_deformable_pool,
+                add_outer_residual=False,
+                use_adaln=False,
+            )
+            for idx, depth in enumerate(depths)
+        ])
+
+        # Stage 1 has only F0 and therefore needs no learned selector. Stage i
+        # (i > 1) attends over the complete history [F0, ..., F{i-1}].
+        self.depth_mixers = nn.ModuleList([
+            DepthAttentionResidual(self.hidden_dim)
+            for _ in range(max(0, len(depths) - 1))
+        ])
+        self.final_depth_mixer = DepthAttentionResidual(self.hidden_dim)
+        self.out_norm = nn.LayerNorm(self.hidden_dim)
+
+    def forward(self, v_raw, semantic_embedding, spatial_shape, return_debug=False):
+        bsz, num_tokens, feat_dim = v_raw.shape
+        height, width = spatial_shape
+        if height != width:
+            raise ValueError(f'PDARCSSD currently expects square token grids, got {(height, width)}.')
+        if height * width != num_tokens:
+            raise ValueError(
+                f'Spatial shape {(height, width)} does not match sequence length {num_tokens}.'
+            )
+        if feat_dim != self.hidden_dim:
+            raise ValueError(f'Expected feature dim {self.hidden_dim}, got {feat_dim}.')
+
+        x0 = v_raw.view(bsz, height, width, feat_dim)
+        history = [x0]
+        stage_weights = []
+        pool_feat = None
+
+        for stage_idx, stage in enumerate(self.stages):
+            if stage_idx == 0:
+                stage_input = x0
+                weights = x0.new_ones((1, bsz, height, width))
+            else:
+                stage_input, weights = self.depth_mixers[stage_idx - 1](history)
+
+            stage_output = stage(stage_input, semantic_embedding, pool_feat)
+            history.append(stage_output)
+            stage_weights.append(weights)
+            if pool_feat is None:
+                pool_feat = stage_output
+
+        final_context, final_weights = self.final_depth_mixer(history)
+        context = self.out_norm(final_context)
+        context_tokens = context.view(bsz, num_tokens, feat_dim)
+
+        if not return_debug:
+            return context_tokens
+        return context_tokens, {
+            'depth_stage_weights': tuple(weight.permute(1, 0, 2, 3) for weight in stage_weights),
+            'depth_final_weights': final_weights.permute(1, 0, 2, 3),
+            'depth_final_context': context_tokens,
+        }
+
+
 class CSSD(nn.Module):
     def __init__(self, hidden_dim, grid_size, depths=(3, 4, 6, 3), d_state=16, drop_path_rate=0.2,
                  attn_drop_rate=0.0, scan_type='scan', num_direction=8,
@@ -980,6 +1138,8 @@ class CSSD(nn.Module):
                 num_direction=num_direction,
                 use_selective_scan=self.use_selective_scan,
                 use_deformable_pool=self.use_deformable_pool,
+                add_outer_residual=True,
+                use_adaln=True,
             )
             for idx, depth in enumerate(depths)
         ])

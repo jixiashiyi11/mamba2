@@ -37,6 +37,35 @@ def _zero_mask(size, target_transform):
     return transforms.ToTensor()(mask)
 
 
+def _binarize_mask(mask):
+    """Convert indexed, grayscale, or 0/255 masks to one binary 0/255 mask."""
+    return mask.point(lambda value: 255 if value > 0 else 0, mode='L')
+
+
+def _meta_image_paths(split_meta):
+    """Return normalized image paths used by one meta.json split."""
+    return {
+        str(item.get('img_path', '')).replace('\\', '/').strip()
+        for items in split_meta.values()
+        for item in items
+        if str(item.get('img_path', '')).strip()
+    }
+
+
+def _assert_disjoint_train_test(meta, meta_path):
+    train_paths = _meta_image_paths(meta.get('train', {}))
+    test_paths = _meta_image_paths(meta.get('test', {}))
+    overlap = sorted(train_paths & test_paths)
+    if not overlap:
+        return
+
+    examples = ', '.join(overlap[:5])
+    raise RuntimeError(
+        f'Data leakage detected in {meta_path}: {len(overlap)} image path(s) '
+        f'appear in both train and test. Examples: {examples}'
+    )
+
+
 class FolderNormalADDataset(Dataset):
     """Normal-only AD dataset for layouts like root/train/good/*.png."""
 
@@ -127,12 +156,19 @@ class MetaADDataset(Dataset):
         if meta_path.exists():
             with open(meta_path, 'r') as f:
                 meta = json.load(f)
+            if bool(getattr(self.cfg_data, 'enforce_disjoint_train_test', False)):
+                _assert_disjoint_train_test(meta, meta_path)
             split_meta = meta.get(self.split, {})
             cls_names = list(getattr(self.cfg_data, 'cls_names', []) or split_meta.keys())
             samples = []
             for cls_name in cls_names:
                 samples.extend(split_meta.get(cls_name, []))
             return samples
+        if bool(getattr(self.cfg_data, 'require_meta', False)):
+            raise FileNotFoundError(
+                f'Required dataset metadata does not exist: {meta_path}. '
+                'Refusing to fall back to directory scanning for this experiment.'
+            )
         return self._scan_mvtec_style()
 
     def _scan_mvtec_style(self):
@@ -174,6 +210,11 @@ class MetaADDataset(Dataset):
         mask_path = sample.get('mask_path', '')
         if mask_path and (self.root / mask_path).exists():
             mask = self.mask_loader(str(self.root / mask_path))
+            # VisA masks use non-zero class indices rather than only value 255.
+            # Binarize before ToTensor(), otherwise the later >0.5 threshold can
+            # erase every low-valued anomalous pixel. This is a no-op for MVTec's
+            # existing 0/255 masks.
+            mask = _binarize_mask(mask)
             mask = self.target_transform(mask) if self.target_transform is not None else transforms.ToTensor()(mask)
         else:
             mask = _zero_mask(img.size, self.target_transform)
@@ -220,8 +261,16 @@ def _make_loader(dataset, cfg, train):
 
 
 def get_loader(cfg):
-    train_dataset = _make_dataset(cfg.data, train=True)
-    test_dataset = _make_dataset(cfg.data, train=False)
+    if bool(getattr(cfg, 'clip_ad_cross_domain', False)):
+        if not hasattr(cfg, 'data_train') or not hasattr(cfg, 'data_test'):
+            raise ValueError(
+                'clip_ad_cross_domain=True requires both cfg.data_train and cfg.data_test.'
+            )
+        train_dataset = _make_dataset(cfg.data_train, train=True)
+        test_dataset = _make_dataset(cfg.data_test, train=False)
+    else:
+        train_dataset = _make_dataset(cfg.data, train=True)
+        test_dataset = _make_dataset(cfg.data, train=False)
     train_loader = _make_loader(train_dataset, cfg, train=True)
     test_loader = _make_loader(test_dataset, cfg, train=False)
     cfg.trainer.iter_full = cfg.trainer.epoch_full * len(train_loader)

@@ -16,6 +16,11 @@ from util.util import able, log_msg, update_log_term
 from util.net import get_timepc, reduce_tensor
 from optim.scheduler import get_scheduler
 from util.debug_eval import DebugEvalHelper, compute_foreground_masks_from_images
+from util.frequency_appearance_synthesis import (
+    FrequencyAwareLesionAppearanceSynthesis,
+    save_frequency_synthesis_visualization,
+)
+from util.morphology_synthetic import MorphologyAwareMaskGenerator, mask_shape_stats
 
 from ._base_trainer import BaseTrainer
 from . import TRAINER
@@ -364,6 +369,8 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
         self._configure_eval_adapter_audit()
         self._logged_train_source_class_mapping = False
         self._train_source_class_counts = {}
+        self._synthetic_mask_generator = None
+        self._frequency_synthesis_generator = None
 
     def _net_module(self):
         return self.net.module if hasattr(self.net, 'module') else self.net
@@ -725,7 +732,232 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
                 adapter_cls_names=adapter_cls_names,
             )
 
+    def _synthetic_area_ratio_range(self, synthetic_cfg):
+        value = getattr(synthetic_cfg, 'area_ratio_range', None)
+        if value is not None:
+            return tuple(value)
+        return (
+            float(getattr(synthetic_cfg, 'min_area', 0.005)),
+            float(getattr(synthetic_cfg, 'max_area', 0.08)),
+        )
+
+    def _get_synthetic_mask_generator(self, synthetic_cfg, use_prior):
+        prior_path = getattr(synthetic_cfg, 'morphology_prior_path', None) if use_prior else None
+        cache_key = (
+            bool(use_prior),
+            str(prior_path),
+            tuple(self._synthetic_area_ratio_range(synthetic_cfg)),
+            float(getattr(synthetic_cfg, 'aspect_ratio_tolerance', 0.5)),
+            int(getattr(synthetic_cfg, 'max_mask_retry', 8)),
+            float(getattr(synthetic_cfg, 'elastic_deform_prob', 0.25)),
+            float(getattr(synthetic_cfg, 'multi_component_prob', 0.2)),
+            float(getattr(synthetic_cfg, 'foreground_threshold', 5.0 / 255.0)),
+            int(getattr(synthetic_cfg, 'foreground_erode_iters', 0)),
+        )
+        cached = self._synthetic_mask_generator
+        if cached is None or cached[0] != cache_key:
+            generator = MorphologyAwareMaskGenerator(
+                use_morphology_prior=bool(use_prior),
+                morphology_prior_path=prior_path,
+                area_ratio_range=self._synthetic_area_ratio_range(synthetic_cfg),
+                aspect_ratio_tolerance=float(getattr(synthetic_cfg, 'aspect_ratio_tolerance', 0.5)),
+                max_mask_retry=int(getattr(synthetic_cfg, 'max_mask_retry', 8)),
+                elastic_deform_prob=float(getattr(synthetic_cfg, 'elastic_deform_prob', 0.25)),
+                multi_component_prob=float(getattr(synthetic_cfg, 'multi_component_prob', 0.2)),
+                foreground_threshold=float(getattr(synthetic_cfg, 'foreground_threshold', 5.0 / 255.0)),
+                foreground_erode_iters=int(getattr(synthetic_cfg, 'foreground_erode_iters', 0)),
+            )
+            self._synthetic_mask_generator = (cache_key, generator)
+            return generator
+        return cached[1]
+
+    def _get_frequency_synthesis_generator(self, synthetic_cfg):
+        cache_key = (
+            str(getattr(synthetic_cfg, 'frequency_appearance_mode', 'random_band')),
+            float(getattr(synthetic_cfg, 'frequency_boundary_sigma', 2.0)),
+            float(getattr(synthetic_cfg, 'frequency_low_strength', 0.20)),
+            float(getattr(synthetic_cfg, 'frequency_mid_strength', 0.14)),
+            float(getattr(synthetic_cfg, 'frequency_high_strength', 0.08)),
+            tuple(getattr(synthetic_cfg, 'frequency_joint_weights', (0.45, 0.35, 0.20))),
+        )
+        cached = self._frequency_synthesis_generator
+        if cached is None or cached[0] != cache_key:
+            generator = FrequencyAwareLesionAppearanceSynthesis(
+                mask_generator=None,
+                mode=cache_key[0],
+                boundary_sigma=cache_key[1],
+                low_strength=cache_key[2],
+                mid_strength=cache_key[3],
+                high_strength=cache_key[4],
+                joint_weights=cache_key[5],
+                clamp_output=True,
+                output_range=(0.0, 1.0),
+            )
+            self._frequency_synthesis_generator = (cache_key, generator)
+            return generator
+        return cached[1]
+
+    def _frequency_mode_code(self, selected_band):
+        mapping = {
+            'none': 0.0,
+            'low': 1.0,
+            'mid': 2.0,
+            'high': 3.0,
+            'joint_fusion': 4.0,
+        }
+        if isinstance(selected_band, (list, tuple)):
+            values = [mapping.get(str(item), -1.0) for item in selected_band]
+            return float(sum(values) / max(len(values), 1))
+        return mapping.get(str(selected_band), -1.0)
+
+    def _record_synthetic_generator_debug(self, synthetic_cfg, synth_imgs, synth_masks, synth_01, mode, selected_band='none'):
+        stats = mask_shape_stats(synth_masks.detach())
+        strength = 0.0
+        if mode == 'morphology_frequency':
+            strength = max(
+                float(getattr(synthetic_cfg, 'frequency_low_strength', 0.20)),
+                float(getattr(synthetic_cfg, 'frequency_mid_strength', 0.14)),
+                float(getattr(synthetic_cfg, 'frequency_high_strength', 0.08)),
+            )
+        else:
+            strength = float(getattr(synthetic_cfg, 'intensity_delta', 0.35))
+        device = synth_imgs.device
+        dtype = synth_imgs.dtype
+        gpu_mem_mb = 0.0
+        if torch.cuda.is_available() and device.type == 'cuda':
+            gpu_mem_mb = torch.cuda.max_memory_allocated(device) / 1024 ** 2
+        self.loss_dict.update({
+            'synthetic_generator_mode_code': synth_imgs.new_tensor({
+                'original': 0.0,
+                'synomaly_mask': 1.0,
+                'morphology_prior': 2.0,
+                'morphology_frequency': 3.0,
+            }.get(mode, -1.0)),
+            'synthetic_component_count': stats['component_count'].to(device=device, dtype=dtype).mean(),
+            'synthetic_selected_frequency_code': synth_imgs.new_tensor(self._frequency_mode_code(selected_band)),
+            'synthetic_perturbation_strength': synth_imgs.new_tensor(strength),
+            'synthetic_image_min': synth_01.detach().min(),
+            'synthetic_image_max': synth_01.detach().max(),
+            'synthetic_image_mean': synth_01.detach().mean(),
+            'synthetic_image_requires_grad': synth_imgs.new_tensor(float(bool(synth_imgs.requires_grad))),
+            'synthetic_gpu_mem_mb': synth_imgs.new_tensor(gpu_mem_mb),
+        })
+        if self.master and self.iter % self.cfg.logging.train_log_per == 0:
+            log_msg(
+                self.logger,
+                f'==> SyntheticGenerator mode={mode} selected_frequency={selected_band} '
+                f'mask_area_ratio={float(stats["area_ratio"].mean().detach().cpu()):.6f} '
+                f'component_count={float(stats["component_count"].float().mean().detach().cpu()):.3f} '
+                f'perturbation_strength={strength:.6f} '
+                f'image_min={float(synth_01.detach().min().cpu()):.6f} '
+                f'image_max={float(synth_01.detach().max().cpu()):.6f} '
+                f'image_mean={float(synth_01.detach().mean().cpu()):.6f}'
+            )
+
+    def _record_morphology_prior_stats(self, mask_generator, mode):
+        if mode not in ('morphology_prior', 'morphology_frequency'):
+            return
+        if not self.master or self.iter % self.cfg.logging.train_log_per != 0:
+            return
+        if not hasattr(mask_generator, 'stats_report'):
+            return
+        report = mask_generator.stats_report()
+
+        def _mean_field(section, key, default=0.0):
+            values = report.get(section, {}).get(key, default)
+            if torch.is_tensor(values):
+                values = values.detach().cpu().flatten().tolist()
+            if not isinstance(values, (list, tuple)):
+                values = [values]
+            values = [float(value) for value in values if math.isfinite(float(value))]
+            return sum(values) / max(len(values), 1)
+
+        log_msg(
+            self.logger,
+            '==> MorphologyPriorStats '
+            f'target_area={_mean_field("target", "area_ratio"):.6f} '
+            f'initial_area={_mean_field("initial", "area_ratio"):.6f} '
+            f'final_area={_mean_field("final", "area_ratio"):.6f} '
+            f'target_aspect={_mean_field("target", "aspect_ratio", 1.0):.3f} '
+            f'final_aspect={_mean_field("final", "aspect_ratio", 1.0):.3f} '
+            f'target_components={_mean_field("target", "component_count", 1.0):.3f} '
+            f'final_components={_mean_field("final", "component_count", 1.0):.3f} '
+            f'area_abs_error={_mean_field("error", "area_ratio_abs"):.6f} '
+            f'aspect_abs_error={_mean_field("error", "aspect_ratio_abs"):.6f}'
+        )
+
+    def _validate_synthetic_batch(self, imgs, synth_imgs, synth_masks, synth_01):
+        if synth_imgs.shape != imgs.shape:
+            raise RuntimeError(f'synthetic image shape {tuple(synth_imgs.shape)} does not match input {tuple(imgs.shape)}')
+        expected_mask_shape = (imgs.shape[0], 1, imgs.shape[2], imgs.shape[3])
+        if tuple(synth_masks.shape) != expected_mask_shape:
+            raise RuntimeError(f'synthetic mask shape {tuple(synth_masks.shape)} does not match expected {expected_mask_shape}')
+        if not torch.isfinite(synth_imgs).all() or not torch.isfinite(synth_masks).all() or not torch.isfinite(synth_01).all():
+            raise FloatingPointError('Non-finite value detected in synthetic generator output.')
+        if float(synth_01.detach().min().cpu()) < -1e-4 or float(synth_01.detach().max().cpu()) > 1.0 + 1e-4:
+            raise ValueError(
+                f'synthetic image [0,1] range violated: '
+                f'min={float(synth_01.detach().min().cpu()):.6f} max={float(synth_01.detach().max().cpu()):.6f}'
+            )
+
     def _make_synthetic_local_anomaly_batch(self, synthetic_cfg):
+        mode = str(getattr(synthetic_cfg, 'synthetic_generator_mode', 'original')).lower()
+        if mode == 'original':
+            synth_imgs, synth_masks = self._make_original_synthetic_local_anomaly_batch(synthetic_cfg)
+            mean = self.imgs.new_tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+            std = self.imgs.new_tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+            synth_01 = (synth_imgs * std + mean).clamp(0.0, 1.0)
+            self._validate_synthetic_batch(self.imgs, synth_imgs, synth_masks, synth_01)
+            self._record_synthetic_generator_debug(synthetic_cfg, synth_imgs, synth_masks, synth_01, mode)
+            return synth_imgs, synth_masks
+
+        if mode not in ('synomaly_mask', 'morphology_prior', 'morphology_frequency'):
+            raise ValueError(
+                'synthetic_generator_mode must be one of '
+                '`original`, `synomaly_mask`, `morphology_prior`, `morphology_frequency`, '
+                f'got `{mode}`.'
+            )
+
+        imgs = self.imgs
+        mean = imgs.new_tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        std = imgs.new_tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        imgs_01 = (imgs * std + mean).clamp(0.0, 1.0)
+        use_prior = mode in ('morphology_prior', 'morphology_frequency')
+        mask_generator = self._get_synthetic_mask_generator(synthetic_cfg, use_prior=use_prior)
+        masks = mask_generator(imgs_01)
+        if masks.ndim == 3:
+            masks = masks.unsqueeze(1)
+        masks = masks.to(device=imgs.device, dtype=imgs.dtype).clamp(0.0, 1.0)
+        self._record_morphology_prior_stats(mask_generator, mode)
+
+        selected_band = 'none'
+        if mode == 'morphology_frequency':
+            frequency_generator = self._get_frequency_synthesis_generator(synthetic_cfg)
+            frequency_out = frequency_generator(
+                imgs_01,
+                synthetic_mask=masks,
+                mode=str(getattr(synthetic_cfg, 'frequency_appearance_mode', 'random_band')).lower(),
+                return_bands=True,
+            )
+            synth_01 = frequency_out['synthetic_image'].clamp(0.0, 1.0)
+            selected_band = frequency_out.get('selected_band', 'none')
+            vis_dir = getattr(synthetic_cfg, 'frequency_vis_dir', None)
+            if vis_dir and self.master and self.iter % self.cfg.logging.train_log_per == 0:
+                save_frequency_synthesis_visualization(
+                    frequency_out,
+                    vis_dir,
+                    prefix=f'iter{self.iter:06d}',
+                    max_items=int(getattr(synthetic_cfg, 'frequency_vis_max_items', 4)),
+                )
+        else:
+            synth_01 = self._apply_spatial_synthetic_lesion(imgs_01, masks, synthetic_cfg)
+
+        synth_imgs = (synth_01 - mean) / std
+        self._validate_synthetic_batch(imgs, synth_imgs, masks, synth_01)
+        self._record_synthetic_generator_debug(synthetic_cfg, synth_imgs, masks, synth_01, mode, selected_band)
+        return synth_imgs, masks
+
+    def _make_original_synthetic_local_anomaly_batch(self, synthetic_cfg):
         imgs = self.imgs
         batch_size, _, height, width = imgs.shape
         device = imgs.device
@@ -1133,6 +1365,15 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
                 'loss_synthetic_tips_dice_abnormal',
                 'loss_synthetic_tips_dice_normal',
                 'synthetic_mask_ratio',
+                'synthetic_generator_mode_code',
+                'synthetic_component_count',
+                'synthetic_selected_frequency_code',
+                'synthetic_perturbation_strength',
+                'synthetic_image_min',
+                'synthetic_image_max',
+                'synthetic_image_mean',
+                'synthetic_image_requires_grad',
+                'synthetic_gpu_mem_mb',
                 'synthetic_outside_ratio',
                 'synthetic_foreground_ratio',
                 'synthetic_pred_area',
@@ -1242,7 +1483,10 @@ class MAMBAADZeroShotTrainer(BaseTrainer):
             debug_vals.update(prompt_grad_debug)
             debug_vals.update(self._train_source_count_debug())
             has_nan = any(math.isnan(val) or math.isinf(val) for val in debug_vals.values())
-            mem_mb = torch.cuda.max_memory_allocated(self.device) / 1024 ** 2
+            mem_mb = 0.0
+            if torch.cuda.is_available():
+                mem_device = self.device if getattr(self.device, 'type', None) == 'cuda' else None
+                mem_mb = torch.cuda.max_memory_allocated(mem_device) / 1024 ** 2
             debug_msg = ' '.join([f'{name}={val:.6f}' for name, val in debug_vals.items()])
             log_msg(self.logger, f'==> LossDebug {debug_msg} has_nan={has_nan} max_mem_mb={mem_mb:.1f}')
 

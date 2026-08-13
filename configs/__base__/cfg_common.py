@@ -80,6 +80,23 @@ class cfg_common(Namespace):
 		self.synthetic_local_anomaly.compact_mask_threshold = 0.05
 		self.synthetic_local_anomaly.area_target_multiplier = 1.5
 		self.synthetic_local_anomaly.area_target_slack = 0.005
+		self.synthetic_local_anomaly.synthetic_generator_mode = 'original'
+		self.synthetic_local_anomaly.use_morphology_prior = False
+		self.synthetic_local_anomaly.morphology_prior_path = 'assets/morphology_prior.json'
+		self.synthetic_local_anomaly.area_ratio_range = (0.005, 0.08)
+		self.synthetic_local_anomaly.aspect_ratio_tolerance = 0.5
+		self.synthetic_local_anomaly.max_mask_retry = 8
+		self.synthetic_local_anomaly.elastic_deform_prob = 0.25
+		self.synthetic_local_anomaly.multi_component_prob = 0.2
+		self.synthetic_local_anomaly.use_frequency_appearance = False
+		self.synthetic_local_anomaly.frequency_appearance_mode = 'random_band'
+		self.synthetic_local_anomaly.frequency_boundary_sigma = 2.0
+		self.synthetic_local_anomaly.frequency_low_strength = 0.20
+		self.synthetic_local_anomaly.frequency_mid_strength = 0.14
+		self.synthetic_local_anomaly.frequency_high_strength = 0.08
+		self.synthetic_local_anomaly.frequency_joint_weights = (0.45, 0.35, 0.20)
+		self.synthetic_local_anomaly.frequency_vis_dir = None
+		self.synthetic_local_anomaly.frequency_vis_max_items = 4
 
 		# ==> optim
 		self.optim = Namespace()

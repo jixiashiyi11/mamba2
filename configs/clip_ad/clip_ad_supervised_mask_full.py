@@ -11,6 +11,8 @@ class cfg(base_cfg):
         self.weight_decay = 1e-4
         self.data.meta = "meta_supervised.json"
         self.data.train_with_anomaly_masks = True
+        # Never silently train on an image that is also present in test.
+        self.data.enforce_disjoint_train_test = True
         self.model.kwargs.update(
             stage="stage2b",
             patch_layer=24,

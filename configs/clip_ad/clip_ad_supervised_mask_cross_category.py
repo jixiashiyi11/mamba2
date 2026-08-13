@@ -11,6 +11,7 @@ class cfg(base_cfg):
             "meta_cross_category_screw.json",
         )
         self.data.cls_names = []
+        self.data.enforce_disjoint_train_test = True
         self.trainer.logdir_sub = os.environ.get(
             "CLIP_AD_RUN_TAG",
             "clipad",

@@ -1,0 +1,8 @@
+from configs.mambaad.a_cnn_global_aux_frequency_dual_role_e15 import cfg as dual_role_cfg
+
+
+class cfg(dual_role_cfg):
+    def __init__(self):
+        super(cfg, self).__init__()
+        self.synthetic_local_anomaly.frequency_dual_role_force_mode = 'high_fg_defect'
+        self.synthetic_local_anomaly.suppress_loss_weight = 0.0

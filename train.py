@@ -66,7 +66,9 @@ def apply_cli_overrides(cfg, args):
     if args.epochs is not None:
         cfg.epoch_full = args.epochs
         cfg.trainer.epoch_full = args.epochs
-        cfg.trainer.scheduler_kwargs["decay_epochs"] = int(args.epochs * 0.8)
+        # A one-epoch smoke test previously produced decay_epochs=0, which
+        # makes timm StepLRScheduler divide by zero in `t // decay_t`.
+        cfg.trainer.scheduler_kwargs["decay_epochs"] = max(1, int(args.epochs * 0.8))
         if args.test_start_epoch is None:
             cfg.trainer.test_start_epoch = args.epochs
         if args.test_every is None:

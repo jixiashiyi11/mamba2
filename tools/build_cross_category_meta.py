@@ -19,6 +19,15 @@ def _class_names(meta):
     return sorted(set(meta.get("train", {}).keys()) | set(meta.get("test", {}).keys()))
 
 
+def _image_paths(split_meta):
+    return {
+        str(item.get("img_path", "")).replace("\\", "/").strip()
+        for items in split_meta.values()
+        for item in items
+        if str(item.get("img_path", "")).strip()
+    }
+
+
 def build_cross_category_meta(input_path, output_path, target_classes, source_classes=None):
     with open(input_path, "r") as f:
         meta = json.load(f)
@@ -64,6 +73,13 @@ def build_cross_category_meta(input_path, output_path, target_classes, source_cl
         for cls_name in target_classes
     }
 
+    path_overlap = sorted(_image_paths(train_meta) & _image_paths(test_meta))
+    if path_overlap:
+        raise RuntimeError(
+            f"Cross-category split is not disjoint: {len(path_overlap)} image path(s) "
+            f"appear in both train and test. Examples: {path_overlap[:5]}"
+        )
+
     out = deepcopy(meta)
     out["train"] = train_meta
     out["test"] = test_meta
@@ -73,6 +89,7 @@ def build_cross_category_meta(input_path, output_path, target_classes, source_cl
         "source_normal_train_samples": source_normal,
         "source_abnormal_mask_samples": source_abnormal,
         "target_test_samples": sum(len(items) for items in test_meta.values()),
+        "train_test_path_overlap": 0,
     }
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -91,6 +108,7 @@ def build_cross_category_meta(input_path, output_path, target_classes, source_cl
     print(f"train abnormal/mask samples: {train_abnormal}")
     print(f"test samples: {test_count}")
     print(f"test abnormal/mask samples: {test_abnormal}")
+    print("train/test image path overlap: 0")
 
 
 def main():

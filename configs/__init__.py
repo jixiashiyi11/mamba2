@@ -4,6 +4,25 @@ from ast import literal_eval
 from util.net import get_timepc
 
 
+def _contains_key(container, key):
+	if isinstance(container, dict):
+		return key in container
+	return hasattr(container, key)
+
+
+def _get_key(container, key):
+	if isinstance(container, dict):
+		return container[key]
+	return getattr(container, key)
+
+
+def _set_key(container, key, value):
+	if isinstance(container, dict):
+		container[key] = value
+	else:
+		setattr(container, key, value)
+
+
 def get_cfg(opt_terminal):
 	opt_terminal.cfg_path = opt_terminal.cfg_path.split('.')[0].replace('/', '.')
 	dataset_lib = importlib.import_module(opt_terminal.cfg_path)
@@ -24,7 +43,7 @@ def get_cfg(opt_terminal):
 	cfg.command = f'python3 -m torch.distributed.launch --nproc_per_node=$nproc_per_node --nnodes=$nnodes --node_rank=$node_rank --master_addr=$master_addr --master_port=$master_port --use_env run.py -c {cfg.cfg_path} -m {cfg.mode} --sleep {cfg.sleep} --memory {cfg.memory} --dist_url {cfg.dist_url} --logger_rank {cfg.logger_rank} {" ".join(cfg.opts)}'
 	for opt in cfg.opts:
 		cfg_ghost = cfg
-		ks, v = opt.split('=')
+		ks, v = opt.split('=', 1)
 		ks = ks.split('.')
 		try:
 			v = literal_eval(v)
@@ -32,14 +51,11 @@ def get_cfg(opt_terminal):
 			v = v
 		for i, k in enumerate(ks):
 			if i == len(ks) - 1:
-				if isinstance(cfg_ghost, dict):
-					cfg_ghost[k] = v
-				else:
-					cfg_ghost.__setattr__(k, v)
+				_set_key(cfg_ghost, k, v)
 			else:
-				if k not in cfg_ghost:
-					cfg_ghost.__setattr__(k, Namespace())
-				cfg_ghost = cfg_ghost.__dict__[k]
+				if not _contains_key(cfg_ghost, k):
+					_set_key(cfg_ghost, k, Namespace())
+				cfg_ghost = _get_key(cfg_ghost, k)
 	cfg.task_start_time = get_timepc()
 	return cfg
 

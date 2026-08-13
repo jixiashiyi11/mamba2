@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -230,13 +232,21 @@ class MambaResponseContext(nn.Module):
         use_selective_scan=True,
         use_deformable_pool=False,
         context_scale=1.0,
+        cssd_type="standard",
     ):
         super().__init__()
-        from model.mambaad import CSSD
+        from model.mambaad import CSSD, PDARCSSD
 
         self.context_scale = float(context_scale)
+        self.cssd_type = str(cssd_type).lower()
+        if self.cssd_type not in ("standard", "cssd", "pdar", "pdar_cssd"):
+            raise ValueError(
+                f"Unsupported cssd_type={cssd_type}. Expected standard, cssd, pdar, or pdar_cssd."
+            )
+        self.use_pdar_cssd = self.cssd_type in ("pdar", "pdar_cssd")
         self.input_norm = nn.LayerNorm(dim)
-        self.cssd = CSSD(
+        cssd_cls = PDARCSSD if self.use_pdar_cssd else CSSD
+        self.cssd = cssd_cls(
             hidden_dim=dim,
             grid_size=grid_size,
             depths=depths,
@@ -259,11 +269,41 @@ class MambaResponseContext(nn.Module):
 
         x = self.input_norm(tokens)
         semantic_embedding = F.normalize(tokens.mean(dim=1), dim=-1)
-        context = self.cssd(x, semantic_embedding, spatial_shape)
+        cssd_debug = {}
+        if self.use_pdar_cssd:
+            context, cssd_debug = self.cssd(
+                x,
+                semantic_embedding,
+                spatial_shape,
+                return_debug=True,
+            )
+        else:
+            context = self.cssd(x, semantic_embedding, spatial_shape)
         context = self.out_norm(context)
         context_tokens = F.normalize(tokens + self.context_scale * (context - tokens), dim=-1)
-        context_map = context_tokens.transpose(1, 2).reshape(bsz, dim, height, width)
-        global_prior = self.prior_head(context_map)
-        return context_tokens, {
-            "mamba_global_prior": global_prior.squeeze(1),
+
+        # The auxiliary head supervises the complete AttnRes-fused context, while
+        # the multi-channel context_tokens remain the features entering ARCC.
+        aux_tokens = cssd_debug.get("depth_final_context", context_tokens)
+        aux_map = aux_tokens.transpose(1, 2).reshape(bsz, dim, height, width)
+        context_logits = self.prior_head(aux_map).squeeze(1)
+        debug = {
+            "mamba_context_logits": context_logits,
+            # Backward-compatible name used by existing visualization code.
+            "mamba_global_prior": context_logits,
         }
+        if self.use_pdar_cssd:
+            final_weights = cssd_debug["depth_final_weights"]
+            weights_float = final_weights.float().clamp_min(1e-8)
+            entropy = -(weights_float * weights_float.log()).sum(dim=1)
+            if final_weights.shape[1] > 1:
+                entropy = entropy / math.log(final_weights.shape[1])
+            debug.update(
+                {
+                    "mamba_depth_weights": final_weights,
+                    "mamba_depth_weight_mean": final_weights.mean(dim=(0, 2, 3)),
+                    "dbg_mamba_depth_entropy": entropy.mean(),
+                    "dbg_mamba_depth_max_weight": final_weights.amax(dim=1).mean(),
+                }
+            )
+        return context_tokens, debug

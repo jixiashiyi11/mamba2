@@ -42,6 +42,13 @@ def _squeeze_maps(array):
     return array
 
 
+def _ensure_channel(array):
+    array = np.asarray(array)
+    if array.ndim == 3:
+        return array[:, None]
+    return array
+
+
 def _resize_maps_to_masks(maps, masks):
     if maps.shape[-2:] == masks.shape[-2:]:
         return maps
@@ -125,6 +132,10 @@ def evaluate(args):
     for optional_key in ['img_paths', 'mask_paths', 'raw_positive_pixels', 'foreground_masks']:
         if optional_key in data:
             results[optional_key] = data[optional_key]
+    results['imgs_masks'] = _ensure_channel(results['imgs_masks']).astype(np.uint8)
+    results['anomaly_maps'] = _squeeze_maps(results['anomaly_maps']).astype(np.float32)
+    if 'foreground_masks' in results:
+        results['foreground_masks'] = _ensure_channel(results['foreground_masks']).astype(np.uint8)
 
     evaluator = Evaluator(metrics=METRICS, max_step_aupro=args.max_step_aupro)
     cls_names = list(data['class_names'].astype(str)) if 'class_names' in data else sorted(set(results['cls_names'].tolist()))

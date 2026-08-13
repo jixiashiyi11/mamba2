@@ -17,11 +17,53 @@ from util.util import able, log_msg, update_log_term
 @TRAINER.register_module
 class CLIPADTrainer(BaseTrainer):
     def __init__(self, cfg):
+        cross_domain = hasattr(cfg, "data_train") and hasattr(cfg, "data_test")
+        if cross_domain:
+            # Let data.get_loader construct the source-train and target-test
+            # loaders correctly during BaseTrainer initialization. This also
+            # keeps the train/test lengths printed by log_cfg truthful.
+            cfg.clip_ad_cross_domain = True
         super(CLIPADTrainer, self).__init__(cfg)
+        if cross_domain:
+            self._assert_cross_domain_disjoint()
+            log_msg(
+                self.logger,
+                "==> Cross-domain mode: "
+                f"source train root={cfg.data_train.root}, meta={cfg.data_train.meta}, "
+                f"samples={self.train_loader.dataset.length}, batches={len(self.train_loader)}; "
+                f"target test root={cfg.data_test.root}, meta={cfg.data_test.meta}, "
+                f"samples={self.test_loader.dataset.length}, batches={len(self.test_loader)}",
+            )
         self.cls_names = list(self.test_loader.dataset.cls_names)
         self._sync_metric_recorder(self.cls_names)
         log_msg(self.logger, f"==> Source-domain train classes: {list(self.train_loader.dataset.cls_names)}")
         log_msg(self.logger, f"==> Target-domain test classes: {self.cls_names}")
+
+    @staticmethod
+    def _dataset_image_paths(dataset):
+        root = os.path.realpath(str(dataset.root))
+        return {
+            os.path.realpath(os.path.join(root, str(sample["img_path"])))
+            for sample in dataset.samples
+            if str(sample.get("img_path", "")).strip()
+        }
+
+    def _assert_cross_domain_disjoint(self):
+        source_paths = self._dataset_image_paths(self.train_loader.dataset)
+        target_paths = self._dataset_image_paths(self.test_loader.dataset)
+        overlap = sorted(source_paths & target_paths)
+        if overlap:
+            examples = ", ".join(overlap[:5])
+            raise RuntimeError(
+                "Cross-domain data leakage detected: "
+                f"{len(overlap)} image(s) occur in both source train and target test. "
+                f"Examples: {examples}"
+            )
+        log_msg(
+            self.logger,
+            "==> Cross-domain leakage check passed: "
+            f"source_train={len(source_paths)}, target_test={len(target_paths)}, overlap=0",
+        )
 
     def _sync_metric_recorder(self, cls_names):
         existing = getattr(self, "metric_recorder", {}) or {}
@@ -100,6 +142,9 @@ class CLIPADTrainer(BaseTrainer):
             "loss_mask_raw_bce",
             "loss_outside_topk",
             "loss_image_supervised",
+            "loss_mamba_context_bce",
+            "loss_mamba_context_dice",
+            "loss_mamba_context_outside_topk",
             "dbg_refine_cos",
             "dbg_refine_delta_l2",
             "dbg_mamba_context_cos",
@@ -126,11 +171,24 @@ class CLIPADTrainer(BaseTrainer):
             "dbg_image_score_top5",
             "dbg_mamba_prior_mean",
             "dbg_mamba_prior_max",
+            "dbg_mamba_prior_mask_in",
+            "dbg_mamba_prior_mask_out",
+            "dbg_mamba_prior_gap",
+            "dbg_mamba_prior_normal_topk",
+            "dbg_mamba_prior_abnormal_topk",
+            "dbg_mamba_depth_entropy",
+            "dbg_mamba_depth_max_weight",
+            "dbg_mamba_depth_w_f0",
+            "dbg_mamba_depth_w_f1",
+            "dbg_mamba_depth_w_f2",
+            "dbg_mamba_depth_w_f3",
+            "dbg_mamba_depth_w_f4",
         ]:
             value = total_loss if name == "total" else self.output.get(name)
-            if value is not None:
+            log_term = self.log_terms.get(name)
+            if value is not None and log_term is not None:
                 update_log_term(
-                    self.log_terms.get(name),
+                    log_term,
                     reduce_tensor(value, self.world_size).clone().detach().item(),
                     1,
                     self.master,

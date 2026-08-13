@@ -78,6 +78,10 @@ class CLIPNormalityAD(nn.Module):
         supervised_outside_topk_weight=0.0,
         supervised_outside_topk_ratio=0.01,
         supervised_score_temperature=1.0,
+        mamba_context_bce_weight=0.0,
+        mamba_context_dice_weight=0.0,
+        mamba_context_outside_topk_weight=0.0,
+        mamba_context_outside_topk_ratio=0.01,
         loss_topk_ratio=0.01,
         surgery_until_layer=None,
         normal_templates=None,
@@ -191,6 +195,10 @@ class CLIPNormalityAD(nn.Module):
         self.supervised_outside_topk_weight = float(supervised_outside_topk_weight)
         self.supervised_outside_topk_ratio = supervised_outside_topk_ratio
         self.supervised_score_temperature = max(float(supervised_score_temperature), 1e-6)
+        self.mamba_context_bce_weight = float(mamba_context_bce_weight)
+        self.mamba_context_dice_weight = float(mamba_context_dice_weight)
+        self.mamba_context_outside_topk_weight = float(mamba_context_outside_topk_weight)
+        self.mamba_context_outside_topk_ratio = mamba_context_outside_topk_ratio
         self.loss_topk_ratio = loss_topk_ratio
         self.margin = margin
         self.image_score_topk_ratio = image_score_topk_ratio
@@ -421,7 +429,7 @@ class CLIPNormalityAD(nn.Module):
         loss_mask_raw_bce = F.binary_cross_entropy_with_logits(raw_logits, targets)
         return loss_mask_bce, loss_mask_dice, loss_mask_raw_bce
 
-    def _outside_topk_loss(self, anomaly_map, masks):
+    def _outside_topk_loss_with_ratio(self, anomaly_map, masks, topk_ratio):
         targets = masks.to(device=anomaly_map.device, dtype=anomaly_map.dtype)
         if targets.ndim == 4:
             targets = targets.squeeze(1)
@@ -439,15 +447,39 @@ class CLIPNormalityAD(nn.Module):
             selected = scores[outside_mask]
             if selected.numel() == 0:
                 continue
-            if self.supervised_outside_topk_ratio is None:
+            if topk_ratio is None:
                 selected = selected.max().view(1)
             else:
-                topk = max(1, int(selected.numel() * float(self.supervised_outside_topk_ratio)))
+                topk = max(1, int(selected.numel() * float(topk_ratio)))
                 selected = selected.topk(topk).values
             losses.append(F.softplus(selected + self.margin).mean())
         if not losses:
             return anomaly_map.new_zeros(())
         return torch.stack(losses).mean()
+
+    def _outside_topk_loss(self, anomaly_map, masks):
+        return self._outside_topk_loss_with_ratio(
+            anomaly_map,
+            masks,
+            self.supervised_outside_topk_ratio,
+        )
+
+    def _mamba_context_losses(self, context_logits, masks):
+        targets = masks.to(device=context_logits.device, dtype=context_logits.dtype)
+        if targets.ndim == 3:
+            targets = targets.unsqueeze(1)
+        if targets.shape[-2:] != context_logits.shape[-2:]:
+            targets = F.interpolate(targets, size=context_logits.shape[-2:], mode="nearest")
+        targets = targets.clamp(0.0, 1.0)
+        logits = context_logits.unsqueeze(1) / self.supervised_score_temperature
+        loss_bce = F.binary_cross_entropy_with_logits(logits, targets)
+        loss_dice = self._dice_loss(logits, targets)
+        loss_outside = self._outside_topk_loss_with_ratio(
+            context_logits,
+            targets,
+            self.mamba_context_outside_topk_ratio,
+        )
+        return loss_bce, loss_dice, loss_outside
 
     def _adapter_losses(
         self,
@@ -497,6 +529,9 @@ class CLIPNormalityAD(nn.Module):
         loss_mask_dice = image_score.new_zeros(())
         loss_mask_raw_bce = image_score.new_zeros(())
         loss_outside_topk = image_score.new_zeros(())
+        loss_mamba_context_bce = image_score.new_zeros(())
+        loss_mamba_context_dice = image_score.new_zeros(())
+        loss_mamba_context_outside_topk = image_score.new_zeros(())
         if self.use_supervised_masks and masks is not None and anomaly_map is not None and raw_anomaly_map is not None:
             loss_mask_bce, loss_mask_dice, loss_mask_raw_bce = self._supervised_mask_losses(
                 anomaly_map,
@@ -505,6 +540,22 @@ class CLIPNormalityAD(nn.Module):
             )
             if self.supervised_outside_topk_weight > 0:
                 loss_outside_topk = self._outside_topk_loss(anomaly_map, masks)
+        if (
+            self.use_supervised_masks
+            and masks is not None
+            and arcc_debug is not None
+            and "mamba_context_logits" in arcc_debug
+            and (
+                self.mamba_context_bce_weight > 0
+                or self.mamba_context_dice_weight > 0
+                or self.mamba_context_outside_topk_weight > 0
+            )
+        ):
+            (
+                loss_mamba_context_bce,
+                loss_mamba_context_dice,
+                loss_mamba_context_outside_topk,
+            ) = self._mamba_context_losses(arcc_debug["mamba_context_logits"], masks)
         total = (
             self.loss_normal_topk_weight * loss_normal_topk
             + self.loss_consistency_weight * loss_consistency
@@ -516,6 +567,9 @@ class CLIPNormalityAD(nn.Module):
             + self.supervised_raw_bce_weight * loss_mask_raw_bce
             + self.supervised_outside_topk_weight * loss_outside_topk
             + self.supervised_image_weight * loss_image_supervised
+            + self.mamba_context_bce_weight * loss_mamba_context_bce
+            + self.mamba_context_dice_weight * loss_mamba_context_dice
+            + self.mamba_context_outside_topk_weight * loss_mamba_context_outside_topk
         )
         return {
             "loss_normal_topk": loss_normal_topk,
@@ -528,6 +582,9 @@ class CLIPNormalityAD(nn.Module):
             "loss_mask_raw_bce": loss_mask_raw_bce,
             "loss_outside_topk": loss_outside_topk,
             "loss_image_supervised": loss_image_supervised,
+            "loss_mamba_context_bce": loss_mamba_context_bce,
+            "loss_mamba_context_dice": loss_mamba_context_dice,
+            "loss_mamba_context_outside_topk": loss_mamba_context_outside_topk,
             "loss_patch": loss_normal_topk,
             "total": total,
             "loss_total": total,
@@ -547,6 +604,8 @@ class CLIPNormalityAD(nn.Module):
         arcc_debug,
         topk_score,
         image_score_variants,
+        masks=None,
+        labels=None,
     ):
         with torch.no_grad():
             eps = 1e-6
@@ -594,8 +653,38 @@ class CLIPNormalityAD(nn.Module):
                 debug["dbg_arcc_lambda"] = arcc_debug["arcc_lambda"].detach()
                 debug["dbg_g_cal_abs"] = arcc_debug["G_cal"].detach().abs().mean()
                 if "mamba_global_prior" in arcc_debug:
-                    debug["dbg_mamba_prior_mean"] = arcc_debug["mamba_global_prior"].detach().mean()
-                    debug["dbg_mamba_prior_max"] = arcc_debug["mamba_global_prior"].detach().amax()
+                    prior = arcc_debug["mamba_global_prior"].detach()
+                    debug["dbg_mamba_prior_mean"] = prior.mean()
+                    debug["dbg_mamba_prior_max"] = prior.amax()
+                    prior_topk = prior.flatten(1).topk(
+                        max(1, int(prior[0].numel() * 0.01)), dim=1
+                    ).values.mean(dim=1)
+                    if labels is not None:
+                        label_values = labels.to(device=prior.device).view(-1)
+                        normal = prior_topk[label_values == 0]
+                        abnormal = prior_topk[label_values != 0]
+                        if normal.numel() > 0:
+                            debug["dbg_mamba_prior_normal_topk"] = normal.mean()
+                        if abnormal.numel() > 0:
+                            debug["dbg_mamba_prior_abnormal_topk"] = abnormal.mean()
+                    if masks is not None:
+                        target = masks.to(device=prior.device, dtype=prior.dtype)
+                        if target.ndim == 4:
+                            target = target.squeeze(1)
+                        if target.shape[-2:] != prior.shape[-2:]:
+                            target = F.interpolate(
+                                target.unsqueeze(1), size=prior.shape[-2:], mode="nearest"
+                            ).squeeze(1)
+                        inside = prior[target > 0.5]
+                        outside = prior[target <= 0.5]
+                        inside_mean = inside.mean() if inside.numel() > 0 else prior.new_zeros(())
+                        outside_mean = outside.mean() if outside.numel() > 0 else prior.new_zeros(())
+                        debug["dbg_mamba_prior_mask_in"] = inside_mean
+                        debug["dbg_mamba_prior_mask_out"] = outside_mean
+                        debug["dbg_mamba_prior_gap"] = inside_mean - outside_mean
+                if "mamba_depth_weight_mean" in arcc_debug:
+                    for idx, weight in enumerate(arcc_debug["mamba_depth_weight_mean"].detach()):
+                        debug[f"dbg_mamba_depth_w_f{idx}"] = weight
             else:
                 debug["dbg_arcc_lambda"] = raw_anomaly_map.new_zeros(())
                 debug["dbg_g_cal_abs"] = raw_anomaly_map.new_zeros(())
@@ -695,6 +784,8 @@ class CLIPNormalityAD(nn.Module):
                 arcc_debug,
                 topk_score,
                 image_score_variants,
+                masks=masks,
+                labels=labels,
             )
         )
         if arcc_debug is not None:

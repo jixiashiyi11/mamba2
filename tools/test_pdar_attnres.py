@@ -39,7 +39,7 @@ def run_test(batch_size, grid_size, hidden_dim, device):
     assert raw_weights.shape == (5, batch_size, grid_size, grid_size)
     _check_weight_sum("raw final mixer", raw_weights, depth_dim=0)
 
-    # Use the real LSSModule deformable branch. Selective scan is disabled so
+    # Exercise the restored original CNN branch. Selective scan is disabled so
     # this wiring/gradient test does not depend on the CUDA selective-scan op.
     pdar = PDARCSSD(
         hidden_dim=hidden_dim,
@@ -51,10 +51,12 @@ def run_test(batch_size, grid_size, hidden_dim, device):
         scan_type="scan",
         num_direction=8,
         use_selective_scan=False,
-        use_deformable_pool=True,
+        use_cnn_branch=True,
+        use_deformable_pool=False,
     ).to(device)
     assert all(stage.add_outer_residual is False for stage in pdar.stages)
     assert all(stage.use_adaln is False for stage in pdar.stages)
+    assert all(stage.use_cnn_branch is True for stage in pdar.stages)
 
     tokens = torch.randn(batch_size, token_count, hidden_dim, device=device, requires_grad=True)
     semantic = torch.randn(batch_size, hidden_dim, device=device)
@@ -96,6 +98,11 @@ def run_test(batch_size, grid_size, hidden_dim, device):
         _assert_finite(f"LSS grad {idx}", grad)
     if sum(grad.detach().abs().sum().item() for grad in lss_grads) == 0:
         raise AssertionError("All LSS gradients are exactly zero.")
+    for stage_idx, stage in enumerate(pdar.stages, start=1):
+        _assert_nonzero_finite(
+            f"stage {stage_idx} CNN fusion grad",
+            stage.finalconv11.weight.grad,
+        )
     print(f"query gradients: OK ({len(pdar.depth_mixers) + 1} mixers)")
     print(f"LSS gradients: OK ({len(lss_grads)} tensors)")
 
@@ -110,10 +117,12 @@ def run_test(batch_size, grid_size, hidden_dim, device):
         scan_type="scan",
         num_direction=8,
         use_selective_scan=False,
-        use_deformable_pool=True,
+        use_cnn_branch=True,
+        use_deformable_pool=False,
     ).to(device)
     assert all(stage.add_outer_residual is True for stage in baseline.stages)
     assert all(stage.use_adaln is True for stage in baseline.stages)
+    assert all(stage.use_cnn_branch is True for stage in baseline.stages)
     with torch.no_grad():
         baseline_output = baseline(tokens.detach(), semantic, (grid_size, grid_size))
     assert baseline_output.shape == (batch_size, token_count, hidden_dim)

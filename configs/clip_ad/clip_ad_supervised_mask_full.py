@@ -27,6 +27,7 @@ class cfg(base_cfg):
             adapter_semantic="patch_mean",
             use_mamba_context=True,
             mamba_context_kwargs=dict(
+                cssd_type="pdar",
                 depths=(1, 1, 1, 1),
                 d_state=16,
                 drop_path_rate=0.0,
@@ -34,6 +35,7 @@ class cfg(base_cfg):
                 scan_type="scan",
                 num_direction=8,
                 use_selective_scan=True,
+                use_cnn_branch=True,
                 use_deformable_pool=False,
                 context_scale=0.1,
             ),

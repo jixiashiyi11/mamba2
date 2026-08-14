@@ -15,8 +15,8 @@ DepthAttentionResidual 和 PDARCSSD。
 
 注意：
     1. 注意力只沿“网络深度 N”做 Softmax，不在空间 H/W 上做注意力。
-    2. LSS/Mamba 仍然负责空间全局建模。
-    3. 该文件复用项目已有的 LSSModule；LSSModule 内部包含 HSS/SSM。
+    2. LSS 中的 HSS/Mamba 负责长程建模，5x5/7x7 CNN 负责局部建模。
+    3. PDAR 保存的是 HSS 与 CNN 融合后的完整 LSS 输出，不是纯 HSS 输出。
 """
 
 from functools import partial
@@ -125,6 +125,7 @@ class PDARLSSForReview(nn.Module):
         scan_type: str = "scan",
         num_direction: int = 8,
         use_selective_scan: bool = True,
+        use_cnn_branch: bool = True,
         use_deformable_pool: bool = False,
     ):
         super().__init__()
@@ -144,6 +145,8 @@ class PDARLSSForReview(nn.Module):
                 scan_type=scan_type,
                 num_direction=num_direction,
                 use_selective_scan=use_selective_scan,
+                # 原版 MambaAD LSS：HSS 与 5x5/7x7 CNN 并行后融合。
+                use_cnn_branch=use_cnn_branch,
                 use_deformable_pool=use_deformable_pool,
                 # 防止历史 F 被 LSS stage 再机械加一次。
                 add_outer_residual=False,
@@ -184,7 +187,8 @@ class PDARLSSForReview(nn.Module):
                 # Stage 4: history=[F0,F1,F2,F3]，N=4，输出 H4。
                 stage_input, alpha = self.depth_mixers[stage_index - 1](history)
 
-            # Stage 1 输出 F1，依此类推。
+            # LSS 内部先融合 HSS、5x5 CNN 和 7x7 CNN；因此写入 history
+            # 的 F1/F2/... 都是完整 LSS 表示，而不是单独的 HSS 表示。
             stage_output = lss_stage(stage_input, semantic_embedding, pool_feat)
             history.append(stage_output)
             stage_weights.append(alpha)
@@ -222,5 +226,6 @@ A2. alpha = softmax(scores, dim=0)，dim=0 是历史深度 N；
 
 Q3. PDAR 改了什么？
 A3. 改的是 LSS stage 之间的信息传递：从“只传上一层”改为
-    “每个 patch 自适应融合全部历史层”；LSS/HSS/SSM 仍负责空间建模。
+    “每个 patch 自适应融合全部历史层”；每个历史 Fn 已经包含
+    HSS 长程信息与 5x5/7x7 CNN 局部信息。
 """

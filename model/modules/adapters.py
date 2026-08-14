@@ -37,6 +37,7 @@ class CSSDPatchAdapter(nn.Module):
         scan_type="scan",
         num_direction=8,
         use_selective_scan=True,
+        use_cnn_branch=True,
         use_deformable_pool=True,
         adapter_scale=0.1,
     ):
@@ -54,6 +55,7 @@ class CSSDPatchAdapter(nn.Module):
             scan_type=scan_type,
             num_direction=num_direction,
             use_selective_scan=use_selective_scan,
+            use_cnn_branch=use_cnn_branch,
             use_deformable_pool=use_deformable_pool,
         )
 
@@ -76,6 +78,7 @@ class LocalGlobalPatchAdapter(nn.Module):
         scan_type="scan",
         num_direction=8,
         use_selective_scan=True,
+        use_cnn_branch=True,
         use_deformable_pool=False,
         adapter_scale=0.1,
         local_kernel_size=3,
@@ -118,6 +121,7 @@ class LocalGlobalPatchAdapter(nn.Module):
             scan_type=scan_type,
             num_direction=num_direction,
             use_selective_scan=use_selective_scan,
+            use_cnn_branch=use_cnn_branch,
             use_deformable_pool=use_deformable_pool,
         )
         self.fusion_norm = nn.LayerNorm(dim)
@@ -217,7 +221,7 @@ class MultiLayerLocalPatchAdapter(nn.Module):
 
 
 class MambaResponseContext(nn.Module):
-    """Build global context from CLIP's final patch tokens, without text input."""
+    """Build PDAR + HSS/CNN context from CLIP's final patch tokens by default."""
 
     def __init__(
         self,
@@ -230,9 +234,10 @@ class MambaResponseContext(nn.Module):
         scan_type="scan",
         num_direction=8,
         use_selective_scan=True,
+        use_cnn_branch=True,
         use_deformable_pool=False,
         context_scale=1.0,
-        cssd_type="standard",
+        cssd_type="pdar",
     ):
         super().__init__()
         from model.mambaad import CSSD, PDARCSSD
@@ -256,6 +261,7 @@ class MambaResponseContext(nn.Module):
             scan_type=scan_type,
             num_direction=num_direction,
             use_selective_scan=use_selective_scan,
+            use_cnn_branch=use_cnn_branch,
             use_deformable_pool=use_deformable_pool,
         )
         self.out_norm = nn.LayerNorm(dim)

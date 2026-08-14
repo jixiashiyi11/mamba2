@@ -40,7 +40,10 @@ def get_cfg(opt_terminal):
 			continue
 		cfg.__setattr__(key, val)
 	
-	cfg.command = f'python3 -m torch.distributed.launch --nproc_per_node=$nproc_per_node --nnodes=$nnodes --node_rank=$node_rank --master_addr=$master_addr --master_port=$master_port --use_env run.py -c {cfg.cfg_path} -m {cfg.mode} --sleep {cfg.sleep} --memory {cfg.memory} --dist_url {cfg.dist_url} --logger_rank {cfg.logger_rank} {" ".join(cfg.opts)}'
+	cssd_type_arg = ''
+	if getattr(opt_terminal, 'cssd_type', None) is not None:
+		cssd_type_arg = f' --cssd_type {opt_terminal.cssd_type}'
+	cfg.command = f'python3 -m torch.distributed.launch --nproc_per_node=$nproc_per_node --nnodes=$nnodes --node_rank=$node_rank --master_addr=$master_addr --master_port=$master_port --use_env run.py -c {cfg.cfg_path} -m {cfg.mode}{cssd_type_arg} --sleep {cfg.sleep} --memory {cfg.memory} --dist_url {cfg.dist_url} --logger_rank {cfg.logger_rank} {" ".join(cfg.opts)}'
 	for opt in cfg.opts:
 		cfg_ghost = cfg
 		ks, v = opt.split('=', 1)
@@ -56,6 +59,11 @@ def get_cfg(opt_terminal):
 				if not _contains_key(cfg_ghost, k):
 					_set_key(cfg_ghost, k, Namespace())
 				cfg_ghost = _get_key(cfg_ghost, k)
+	cssd_type = getattr(opt_terminal, 'cssd_type', None)
+	if cssd_type is not None:
+		mamba_context_kwargs = dict(cfg.model.kwargs.get('mamba_context_kwargs', {}))
+		mamba_context_kwargs['cssd_type'] = cssd_type
+		cfg.model.kwargs['mamba_context_kwargs'] = mamba_context_kwargs
 	cfg.task_start_time = get_timepc()
 	return cfg
 

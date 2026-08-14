@@ -165,7 +165,11 @@ def main():
     parser = argparse.ArgumentParser(
         description="Build an ADer-style meta.json from the official VisA 1cls split."
     )
-    parser.add_argument("--root", default="data/visa", help="VisA dataset root.")
+    parser.add_argument(
+        "--root",
+        default="data",
+        help="VisA root containing split_csv/1cls.csv and the CSV image paths.",
+    )
     parser.add_argument(
         "--split-csv",
         default="split_csv/1cls.csv",
@@ -173,7 +177,7 @@ def main():
     )
     parser.add_argument(
         "--output",
-        default="meta.json",
+        default="visa_meta.json",
         help="Output path, absolute or relative to --root.",
     )
     args = parser.parse_args()

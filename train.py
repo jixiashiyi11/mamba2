@@ -32,6 +32,13 @@ def parse_args():
         choices=["train", "test"],
         help="Run training or only test a checkpoint.",
     )
+    parser.add_argument(
+        "--cssd_type",
+        type=str,
+        default=None,
+        choices=["pdar", "cssd"],
+        help="Select PDAR or sequential CSSD; omit to keep the config default.",
+    )
 
     # training
     parser.add_argument("--epochs", type=int, default=None, help="Override training epochs.")
@@ -109,6 +116,9 @@ def print_args_summary(cfg):
     log_msg(cfg.logger, f"==> Epochs: {cfg.trainer.epoch_full}")
     log_msg(cfg.logger, f"==> Batch size: {cfg.trainer.data.batch_size}")
     log_msg(cfg.logger, f"==> LR: {cfg.optim.lr}")
+    mamba_context_kwargs = cfg.model.kwargs.get("mamba_context_kwargs", {})
+    if mamba_context_kwargs:
+        log_msg(cfg.logger, f"==> CSSD type: {mamba_context_kwargs.get('cssd_type', 'pdar')}")
 
 
 @torch.no_grad()

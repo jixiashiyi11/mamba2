@@ -423,6 +423,7 @@ class LSSModule(nn.Module):
             scan_type: str = 'scan',
             num_direction: int = 8,
             use_selective_scan: bool = True,
+            use_cnn_branch: bool = True,
             use_deformable_pool: bool = True,
             add_outer_residual: bool = True,
             use_adaln: bool = True,
@@ -430,6 +431,7 @@ class LSSModule(nn.Module):
     ):
         super().__init__()
         self.use_selective_scan = bool(use_selective_scan)
+        self.use_cnn_branch = bool(use_cnn_branch)
         self.use_deformable_pool = bool(use_deformable_pool)
         self.add_outer_residual = bool(add_outer_residual)
         self.use_adaln = bool(use_adaln)
@@ -440,6 +442,57 @@ class LSSModule(nn.Module):
                          d_state=d_state, size=size, scan_type=scan_type, num_direction=num_direction,
                          use_adaln=self.use_adaln, **kwargs)
                 for i in range(depth)])
+
+        # Original MambaAD LSS local branch. The same stage input is processed
+        # by 5x5 and 7x7 depth-wise convolutions in parallel with the HSS path.
+        if self.use_cnn_branch:
+            self.conv1b7 = nn.Sequential(
+                nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1, stride=1),
+                nn.InstanceNorm2d(hidden_dim),
+                nn.SiLU(),
+            )
+            self.conv1a7 = nn.Sequential(
+                nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1, stride=1),
+                nn.InstanceNorm2d(hidden_dim),
+                nn.SiLU(),
+            )
+            self.conv1b5 = nn.Sequential(
+                nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1, stride=1),
+                nn.InstanceNorm2d(hidden_dim),
+                nn.SiLU(),
+            )
+            self.conv1a5 = nn.Sequential(
+                nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1, stride=1),
+                nn.InstanceNorm2d(hidden_dim),
+                nn.SiLU(),
+            )
+            self.conv55 = nn.Sequential(
+                nn.Conv2d(
+                    hidden_dim,
+                    hidden_dim,
+                    kernel_size=5,
+                    stride=1,
+                    padding=2,
+                    bias=False,
+                    groups=hidden_dim,
+                ),
+                nn.InstanceNorm2d(hidden_dim),
+                nn.SiLU(),
+            )
+            self.conv77 = nn.Sequential(
+                nn.Conv2d(
+                    hidden_dim,
+                    hidden_dim,
+                    kernel_size=7,
+                    stride=1,
+                    padding=3,
+                    bias=False,
+                    groups=hidden_dim,
+                ),
+                nn.InstanceNorm2d(hidden_dim),
+                nn.SiLU(),
+            )
+            self.finalconv11 = nn.Conv2d(hidden_dim * 3, hidden_dim, kernel_size=1, stride=1)
 
         if self.use_deformable_pool:
             self.query_norm = nn.InstanceNorm2d(hidden_dim)
@@ -457,7 +510,7 @@ class LSSModule(nn.Module):
                 m.bias.data.zero_()
 
     def forward(self, input: torch.Tensor, c=None, pool_feat=None):
-        if not self.use_selective_scan and not self.use_deformable_pool:
+        if not self.use_selective_scan and not self.use_cnn_branch and not self.use_deformable_pool:
             return input
 
         out_ssm = input
@@ -468,19 +521,28 @@ class LSSModule(nn.Module):
 
         out_ssm_permuted = out_ssm.permute(0, 3, 1, 2).contiguous()
 
+        # Official LSS fusion: HSS, 5x5 CNN and 7x7 CNN all receive the same
+        # stage input, then a 1x1 convolution mixes their concatenated channels.
+        if self.use_cnn_branch:
+            input_conv = input.permute(0, 3, 1, 2).contiguous()
+            out_77 = self.conv1a7(self.conv77(self.conv1b7(input_conv)))
+            out_55 = self.conv1a5(self.conv55(self.conv1b5(input_conv)))
+            output = torch.cat((out_ssm_permuted, out_55, out_77), dim=1)
+            output = self.finalconv11(output)
+        else:
+            output = out_ssm_permuted
+
         if self.use_deformable_pool:
             if pool_feat is not None:
                 v_pool = pool_feat.permute(0, 3, 1, 2).contiguous()
             else:
                 v_pool = input.permute(0, 3, 1, 2).contiguous()
 
-            q = self.query_norm(out_ssm_permuted)
+            q = self.query_norm(output)
             deform_residual = self.deform_attn(x_query=q, x_pool=v_pool)
             deform_residual = self.deform_act(deform_residual)
 
-            output = out_ssm_permuted + deform_residual
-        else:
-            output = out_ssm_permuted
+            output = output + deform_residual
 
         output = output.permute(0, 2, 3, 1).contiguous()
         return output + input if self.add_outer_residual else output
@@ -1027,19 +1089,21 @@ class DepthAttentionResidual(nn.Module):
 class PDARCSSD(nn.Module):
     """Patch-wise Depth-Attention Residual CSSD.
 
-    LSS/Mamba remains the spatial model. Attention Residual only changes how
-    each stage retrieves complete earlier representations along network depth.
+    LSS keeps the original parallel HSS/Mamba and multi-kernel CNN paths.
+    Attention Residual only changes how each stage retrieves complete earlier
+    LSS representations along network depth.
     """
 
     def __init__(self, hidden_dim, grid_size, depths=(1, 1, 1, 1), d_state=16, drop_path_rate=0.0,
                  attn_drop_rate=0.0, scan_type='scan', num_direction=8,
-                 use_selective_scan=True, use_deformable_pool=False):
+                 use_selective_scan=True, use_cnn_branch=True, use_deformable_pool=False):
         super().__init__()
         if not isinstance(depths, (list, tuple)) or len(depths) == 0:
             raise ValueError('`depths` must be a non-empty list or tuple.')
         self.hidden_dim = int(hidden_dim)
         self.grid_size = int(grid_size)
         self.use_selective_scan = bool(use_selective_scan)
+        self.use_cnn_branch = bool(use_cnn_branch)
         self.use_deformable_pool = bool(use_deformable_pool)
 
         stage_drop_paths = torch.linspace(0, drop_path_rate, len(depths)).tolist()
@@ -1055,6 +1119,7 @@ class PDARCSSD(nn.Module):
                 scan_type=scan_type,
                 num_direction=num_direction,
                 use_selective_scan=self.use_selective_scan,
+                use_cnn_branch=self.use_cnn_branch,
                 use_deformable_pool=self.use_deformable_pool,
                 add_outer_residual=False,
                 use_adaln=False,
@@ -1117,11 +1182,12 @@ class PDARCSSD(nn.Module):
 class CSSD(nn.Module):
     def __init__(self, hidden_dim, grid_size, depths=(3, 4, 6, 3), d_state=16, drop_path_rate=0.2,
                  attn_drop_rate=0.0, scan_type='scan', num_direction=8,
-                 use_selective_scan=True, use_deformable_pool=True):
+                 use_selective_scan=True, use_cnn_branch=True, use_deformable_pool=True):
         super().__init__()
         if not isinstance(depths, (list, tuple)) or len(depths) == 0:
             raise ValueError('`depths` must be a non-empty list or tuple.')
         self.use_selective_scan = bool(use_selective_scan)
+        self.use_cnn_branch = bool(use_cnn_branch)
         self.use_deformable_pool = bool(use_deformable_pool)
 
         stage_drop_paths = torch.linspace(0, drop_path_rate, len(depths)).tolist()
@@ -1137,6 +1203,7 @@ class CSSD(nn.Module):
                 scan_type=scan_type,
                 num_direction=num_direction,
                 use_selective_scan=self.use_selective_scan,
+                use_cnn_branch=self.use_cnn_branch,
                 use_deformable_pool=self.use_deformable_pool,
                 add_outer_residual=True,
                 use_adaln=True,

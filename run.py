@@ -13,6 +13,7 @@ def main():
 	# parser.add_argument('-c', '--cfg_path', default='configs/invad_mvtec_debug.py')
 	parser.add_argument('-c', '--cfg_path', default='configs/vitad_mvtec_debug.py')
 	parser.add_argument('-m', '--mode', default='train', choices=['train', 'test'])
+	parser.add_argument('--cssd_type', default=None, choices=['pdar', 'cssd'])
 	parser.add_argument('--sleep', type=int, default=-1)
 	parser.add_argument('--memory', type=int, default=-1)
 	parser.add_argument('--dist_url', default='env://', type=str, help='url used to set up distributed training')

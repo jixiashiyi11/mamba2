@@ -26,8 +26,10 @@ class cfg(base_cfg):
         # Target domain: VisA is evaluation-only. No VisA training batch is used.
         self.data_test = copy.deepcopy(self.data)
         self.data_test.type = "DefaultAD"
-        self.data_test.root = "data/visa"
-        self.data_test.meta = "meta.json"
+        # The downloaded VisA layout on the training server has
+        # data/split_csv/1cls.csv and data/visa_meta.json at the shared data root.
+        self.data_test.root = "data"
+        self.data_test.meta = "visa_meta.json"
         self.data_test.require_meta = True
         self.data_test.cls_names = [
             "pcb1", "pcb2", "pcb3", "pcb4",
@@ -41,9 +43,18 @@ class cfg(base_cfg):
         self.data = copy.deepcopy(self.data_train)
 
         # Preserve the exact supervised-loss weights used in the recent PDAR
-        # experiment, and use max-pixel image-score aggregation.
+        # experiment, use max-pixel image-score aggregation, and make the
+        # complete PDAR-LSS structure explicit in this cross-domain config.
+        mamba_context_kwargs = dict(self.model.kwargs["mamba_context_kwargs"])
+        mamba_context_kwargs.update(
+            cssd_type="pdar",
+            use_selective_scan=True,
+            use_cnn_branch=True,
+            use_deformable_pool=False,
+        )
         self.model.kwargs.update(
             image_score_topk_ratio=None,
+            mamba_context_kwargs=mamba_context_kwargs,
             supervised_mask_bce_weight=1.5,
             supervised_mask_dice_weight=2.0,
             supervised_outside_topk_weight=0.1,

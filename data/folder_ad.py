@@ -42,6 +42,27 @@ def _binarize_mask(mask):
     return mask.point(lambda value: 255 if value > 0 else 0, mode='L')
 
 
+def _transform_binary_mask(mask, target_transform, preserve_tiny=False):
+    """Transform a binary mask and keep tiny positives from vanishing.
+
+    Bilinear downsampling can turn a very small 255-valued component into only
+    fractional tensor values below 0.5. The usual evaluation threshold then
+    erases that component. We first use the normal 0.5 threshold and only fall
+    back to the transform's positive support when an originally non-empty mask
+    would otherwise become completely empty.
+    """
+    original_has_positive = mask.getbbox() is not None
+    transformed = (
+        target_transform(mask)
+        if target_transform is not None
+        else transforms.ToTensor()(mask)
+    )
+    binary = (transformed > 0.5).to(dtype=transformed.dtype)
+    if preserve_tiny and original_has_positive and not bool(binary.any()):
+        binary = (transformed > 0).to(dtype=transformed.dtype)
+    return binary
+
+
 def _meta_image_paths(split_meta):
     """Return normalized image paths used by one meta.json split."""
     return {
@@ -145,6 +166,10 @@ class MetaADDataset(Dataset):
             getattr(cfg_data, 'train_transforms' if train else 'test_transforms', None)
         )
         self.target_transform = _build_transform(getattr(cfg_data, 'target_transforms', None))
+        self.preserve_tiny_masks = bool(getattr(cfg_data, 'preserve_tiny_masks', False))
+        self.require_nonempty_anomaly_mask = bool(
+            getattr(cfg_data, 'require_nonempty_anomaly_mask', False)
+        )
         self.samples = self._load_samples()
         self.cls_names = list(getattr(cfg_data, 'cls_names', []) or sorted({s['cls_name'] for s in self.samples}))
         self.length = len(self.samples)
@@ -215,9 +240,27 @@ class MetaADDataset(Dataset):
             # erase every low-valued anomalous pixel. This is a no-op for MVTec's
             # existing 0/255 masks.
             mask = _binarize_mask(mask)
-            mask = self.target_transform(mask) if self.target_transform is not None else transforms.ToTensor()(mask)
+            mask = _transform_binary_mask(
+                mask,
+                self.target_transform,
+                preserve_tiny=self.preserve_tiny_masks,
+            )
         else:
+            if int(sample.get('anomaly', 0)) and self.require_nonempty_anomaly_mask:
+                raise FileNotFoundError(
+                    f"Anomalous sample requires an existing mask: image={sample['img_path']}, "
+                    f"mask={mask_path!r}, root={self.root}"
+                )
             mask = _zero_mask(img.size, self.target_transform)
+        if (
+            int(sample.get('anomaly', 0))
+            and self.require_nonempty_anomaly_mask
+            and not bool((mask > 0.5).any())
+        ):
+            raise RuntimeError(
+                f"Anomalous mask became empty after preprocessing: image={sample['img_path']}, "
+                f"mask={mask_path}, preserve_tiny_masks={self.preserve_tiny_masks}"
+            )
         if self.transform is not None:
             img = self.transform(img)
         return {

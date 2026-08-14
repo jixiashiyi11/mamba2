@@ -300,6 +300,7 @@ class MambaResponseContext(nn.Module):
         }
         if self.use_pdar_cssd:
             final_weights = cssd_debug["depth_final_weights"]
+            stage_weights = cssd_debug["depth_stage_weights"]
             weights_float = final_weights.float().clamp_min(1e-8)
             entropy = -(weights_float * weights_float.log()).sum(dim=1)
             if final_weights.shape[1] > 1:
@@ -308,8 +309,18 @@ class MambaResponseContext(nn.Module):
                 {
                     "mamba_depth_weights": final_weights,
                     "mamba_depth_weight_mean": final_weights.mean(dim=(0, 2, 3)),
+                    # Per-image spatial means. Stage i has i historical sources:
+                    # stage 1 -> F0, stage 2 -> F0/F1, ..., final -> F0/.../F4.
+                    "mamba_depth_stage_weight_means": tuple(
+                        weight.mean(dim=(2, 3)) for weight in stage_weights
+                    ),
+                    "mamba_depth_final_weight_means": final_weights.mean(dim=(2, 3)),
                     "dbg_mamba_depth_entropy": entropy.mean(),
                     "dbg_mamba_depth_max_weight": final_weights.amax(dim=1).mean(),
                 }
             )
+            if not self.training:
+                # The trainer summarizes these maps immediately and only saves the
+                # small regional means. Training does not retain these extra tensors.
+                debug["mamba_depth_stage_weights"] = tuple(stage_weights)
         return context_tokens, debug

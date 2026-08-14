@@ -6,6 +6,7 @@ import time
 import numpy as np
 import tabulate
 import torch
+import torch.nn.functional as F
 from sklearn.metrics import average_precision_score, precision_recall_curve, roc_auc_score
 
 from . import TRAINER
@@ -77,6 +78,71 @@ class CLIPADTrainer(BaseTrainer):
                     synced[avg_key] = list(existing.get(avg_key, []))
         self.metric_recorder = synced
         self.cfg.trainer.metric_recorder = synced
+
+    @staticmethod
+    def _pdar_region_means(weights, masks, labels):
+        """Return equal-per-image PDAR depth means for three patch regions."""
+        weights = weights.detach().float()
+        masks = masks.detach().float()
+        if masks.ndim == 3:
+            masks = masks.unsqueeze(1)
+        # A 24x24 token is considered anomalous when any source-mask pixel in
+        # its receptive bin is positive. Max pooling avoids losing tiny defects
+        # during the 336x336 -> 24x24 reduction.
+        masks = F.adaptive_max_pool2d(masks, output_size=weights.shape[-2:])[:, 0] > 0.5
+        labels = labels.detach().reshape(-1).to(device=weights.device) != 0
+
+        batch_size, num_sources = weights.shape[:2]
+        nan = float("nan")
+        normal_means = weights.new_full((batch_size, num_sources), nan)
+        mask_in_means = weights.new_full((batch_size, num_sources), nan)
+        mask_out_means = weights.new_full((batch_size, num_sources), nan)
+
+        spatial_means = weights.mean(dim=(2, 3))
+        normal_rows = ~labels
+        normal_means[normal_rows] = spatial_means[normal_rows]
+
+        for region_mask, destination in (
+            (masks, mask_in_means),
+            (~masks, mask_out_means),
+        ):
+            pixel_count = region_mask.sum(dim=(1, 2))
+            valid_rows = labels & (pixel_count > 0)
+            weighted_sum = (weights * region_mask.unsqueeze(1)).sum(dim=(2, 3))
+            region_means = weighted_sum / pixel_count.clamp_min(1).unsqueeze(1)
+            destination[valid_rows] = region_means[valid_rows]
+
+        return {
+            "normal": normal_means.cpu().numpy(),
+            "mask_in": mask_in_means.cpu().numpy(),
+            "mask_out": mask_out_means.cpu().numpy(),
+        }
+
+    def _pdar_region_table(self, results):
+        rows = []
+        block_names = [f"stage{idx}" for idx in range(1, 5)] + ["final"]
+        for block_name in block_names:
+            for region_name in ("normal", "mask_in", "mask_out"):
+                key = f"mamba_depth_{block_name}_{region_name}_means"
+                if key not in results:
+                    continue
+                values = np.asarray(results[key], dtype=np.float64)
+                valid = np.isfinite(values).all(axis=1)
+                if not np.any(valid):
+                    continue
+                means = values[valid].mean(axis=0)
+                source_values = [f"{value:.6f}" for value in means]
+                source_values.extend([""] * (5 - len(source_values)))
+                rows.append([block_name, region_name, int(valid.sum()), *source_values])
+        if rows:
+            table = tabulate.tabulate(
+                rows,
+                headers=["Block", "Region", "Images", "F0", "F1", "F2", "F3", "F4"],
+                tablefmt="pipe",
+                stralign="center",
+                numalign="center",
+            )
+            log_msg(self.logger, "==> PDAR patch-region depth weights\n" + table)
 
     def _expand_cls_name_like_batch(self, cls_names, batch_size):
         if isinstance(cls_names, str):
@@ -160,7 +226,19 @@ class CLIPADTrainer(BaseTrainer):
             "dbg_arcc_delta_abs",
             "dbg_arcc_delta_ratio",
             "dbg_arcc_lambda",
+            "dbg_arcc_lambda_learned",
             "dbg_g_cal_abs",
+            "dbg_mask_bce_normal",
+            "dbg_mask_bce_abnormal",
+            "dbg_mask_dice_positive",
+            "dbg_normal_prob_mean",
+            "dbg_normal_fg_ratio",
+            "dbg_arcc_normal_max_gain",
+            "dbg_raw_mask_gap",
+            "dbg_final_mask_gap",
+            "dbg_batch_normal_count",
+            "dbg_batch_abnormal_count",
+            "dbg_batch_positive_mask_count",
             "dbg_s_global",
             "dbg_topk_score",
             "dbg_topk_score_max",
@@ -183,6 +261,16 @@ class CLIPADTrainer(BaseTrainer):
             "dbg_mamba_depth_w_f2",
             "dbg_mamba_depth_w_f3",
             "dbg_mamba_depth_w_f4",
+            "dbg_mamba_s1_w_f0",
+            "dbg_mamba_s2_w_f0",
+            "dbg_mamba_s2_w_f1",
+            "dbg_mamba_s3_w_f0",
+            "dbg_mamba_s3_w_f1",
+            "dbg_mamba_s3_w_f2",
+            "dbg_mamba_s4_w_f0",
+            "dbg_mamba_s4_w_f1",
+            "dbg_mamba_s4_w_f2",
+            "dbg_mamba_s4_w_f3",
         ]:
             value = total_loss if name == "total" else self.output.get(name)
             log_term = self.log_terms.get(name)
@@ -267,6 +355,20 @@ class CLIPADTrainer(BaseTrainer):
         imgs_masks, anomaly_maps, image_scores, cls_names, anomalys, layer_text_maps = [], [], [], [], [], []
         image_scores_max, image_scores_top1, image_scores_top5 = [], [], []
         raw_anomaly_maps, arcc_cal_maps, mamba_prior_maps = [], [], []
+        mamba_depth_stage_means = {}
+        mamba_depth_region_means = {}
+        diagnostic_specs = {
+            "dbg_mask_bce_normal": "dbg_batch_normal_count",
+            "dbg_mask_bce_abnormal": "dbg_batch_abnormal_count",
+            "dbg_mask_dice_positive": "dbg_batch_positive_mask_count",
+            "dbg_normal_prob_mean": "dbg_batch_normal_count",
+            "dbg_normal_fg_ratio": "dbg_batch_normal_count",
+            "dbg_arcc_normal_max_gain": "dbg_batch_normal_count",
+            "dbg_raw_mask_gap": "dbg_batch_positive_mask_count",
+            "dbg_final_mask_gap": "dbg_batch_positive_mask_count",
+        }
+        diagnostic_sums = {key: 0.0 for key in diagnostic_specs}
+        diagnostic_counts = {key: 0.0 for key in diagnostic_specs}
         img_paths, mask_paths = [], []
         batch_idx = 0
         test_length = self.cfg.data.test_size
@@ -277,6 +379,15 @@ class CLIPADTrainer(BaseTrainer):
             test_data = next(test_loader)
             self.set_input(test_data)
             self.forward(return_loss=False)
+            if isinstance(self.output, dict):
+                for key, count_key in diagnostic_specs.items():
+                    value = self.output.get(key)
+                    count = self.output.get(count_key)
+                    if value is None or count is None:
+                        continue
+                    count_value = float(count.detach().cpu())
+                    diagnostic_sums[key] += float(value.detach().cpu()) * count_value
+                    diagnostic_counts[key] += count_value
             self.imgs_mask[self.imgs_mask > 0.5], self.imgs_mask[self.imgs_mask <= 0.5] = 1, 0
             imgs_masks.append(self.imgs_mask.cpu().numpy().astype(int))
             anomaly_maps.append(self.anomaly_map.cpu().numpy())
@@ -297,6 +408,31 @@ class CLIPADTrainer(BaseTrainer):
                 arcc_cal_maps.append(self.output["G_cal"].cpu().numpy())
             if isinstance(self.output, dict) and "mamba_global_prior" in self.output:
                 mamba_prior_maps.append(self.output["mamba_global_prior"].cpu().numpy())
+            if isinstance(self.output, dict) and "mamba_depth_stage_weight_means" in self.output:
+                for stage_idx, stage_means in enumerate(
+                    self.output["mamba_depth_stage_weight_means"], start=1
+                ):
+                    key = f"mamba_depth_stage{stage_idx}_means"
+                    mamba_depth_stage_means.setdefault(key, []).append(stage_means.cpu().numpy())
+            if isinstance(self.output, dict) and "mamba_depth_final_weight_means" in self.output:
+                mamba_depth_stage_means.setdefault("mamba_depth_final_means", []).append(
+                    self.output["mamba_depth_final_weight_means"].cpu().numpy()
+                )
+            if isinstance(self.output, dict) and "mamba_depth_stage_weights" in self.output:
+                depth_blocks = [
+                    (f"stage{stage_idx}", stage_weights)
+                    for stage_idx, stage_weights in enumerate(
+                        self.output["mamba_depth_stage_weights"], start=1
+                    )
+                ]
+                depth_blocks.append(("final", self.output["mamba_depth_weights"]))
+                for block_name, weights in depth_blocks:
+                    region_means = self._pdar_region_means(
+                        weights, self.imgs_mask, self.anomaly
+                    )
+                    for region_name, values in region_means.items():
+                        key = f"mamba_depth_{block_name}_{region_name}_means"
+                        mamba_depth_region_means.setdefault(key, []).append(values)
             if self.img_path is not None:
                 img_paths.append(np.array(self.img_path))
             if self.mask_path is not None:
@@ -307,6 +443,35 @@ class CLIPADTrainer(BaseTrainer):
             if self.master and (batch_idx % self.cfg.logging.test_log_per == 0 or batch_idx == test_length):
                 msg = able(self.progress.get_msg(batch_idx, test_length, 0, 0, prefix="Test"), self.master, None)
                 log_msg(self.logger, msg)
+
+        diagnostic_pairs = torch.tensor(
+            [
+                value
+                for key in diagnostic_specs
+                for value in (diagnostic_sums[key], diagnostic_counts[key])
+            ],
+            device=self.imgs.device,
+            dtype=torch.float64,
+        )
+        if self.cfg.dist:
+            torch.distributed.all_reduce(diagnostic_pairs, op=torch.distributed.ReduceOp.SUM)
+        if self.master:
+            diagnostic_rows = []
+            pair_values = diagnostic_pairs.cpu().numpy().reshape(-1, 2)
+            for (key, _), (weighted_sum, count) in zip(
+                diagnostic_specs.items(),
+                pair_values,
+            ):
+                mean = weighted_sum / count if count > 0 else float("nan")
+                diagnostic_rows.append([key, f"{mean:.6f}", int(count)])
+            diagnostic_table = tabulate.tabulate(
+                diagnostic_rows,
+                headers=["Diagnostic", "Mean", "Images"],
+                tablefmt="pipe",
+                stralign="left",
+                numalign="right",
+            )
+            log_msg(self.logger, "==> Mask/ARCC diagnostic summary\n" + diagnostic_table)
 
         results = dict(
             imgs_masks=imgs_masks,
@@ -327,6 +492,10 @@ class CLIPADTrainer(BaseTrainer):
             results["arcc_cal_maps"] = arcc_cal_maps
         if mamba_prior_maps:
             results["mamba_prior_maps"] = mamba_prior_maps
+        for key, values in mamba_depth_stage_means.items():
+            results[key] = values
+        for key, values in mamba_depth_region_means.items():
+            results[key] = values
         if image_scores_max:
             results["image_scores_max"] = image_scores_max
         if image_scores_top1:
@@ -349,6 +518,10 @@ class CLIPADTrainer(BaseTrainer):
                     results["arcc_cal_maps"] = []
                 if mamba_prior_maps:
                     results["mamba_prior_maps"] = []
+                for key in mamba_depth_stage_means:
+                    results[key] = []
+                for key in mamba_depth_region_means:
+                    results[key] = []
                 if image_scores_max:
                     results["image_scores_max"] = []
                 if image_scores_top1:
@@ -382,5 +555,6 @@ class CLIPADTrainer(BaseTrainer):
             save_path = os.path.join(self.cfg.logdir_test, output_name)
             np.savez_compressed(save_path, **results)
             log_msg(self.logger, f"==> Saved CLIP AD outputs: {save_path}")
+            self._pdar_region_table(results)
             self._image_score_variant_table(results)
             self._metric_table(results)

@@ -21,5 +21,15 @@ class cfg(base_cfg):
                 dict(name="dbg_mamba_depth_w_f2", fmt=":>5.3f", add_name="avg"),
                 dict(name="dbg_mamba_depth_w_f3", fmt=":>5.3f", add_name="avg"),
                 dict(name="dbg_mamba_depth_w_f4", fmt=":>5.3f", add_name="avg"),
+                dict(name="dbg_mamba_s1_w_f0", fmt=":>5.3f", add_name="avg"),
+                dict(name="dbg_mamba_s2_w_f0", fmt=":>5.3f", add_name="avg"),
+                dict(name="dbg_mamba_s2_w_f1", fmt=":>5.3f", add_name="avg"),
+                dict(name="dbg_mamba_s3_w_f0", fmt=":>5.3f", add_name="avg"),
+                dict(name="dbg_mamba_s3_w_f1", fmt=":>5.3f", add_name="avg"),
+                dict(name="dbg_mamba_s3_w_f2", fmt=":>5.3f", add_name="avg"),
+                dict(name="dbg_mamba_s4_w_f0", fmt=":>5.3f", add_name="avg"),
+                dict(name="dbg_mamba_s4_w_f1", fmt=":>5.3f", add_name="avg"),
+                dict(name="dbg_mamba_s4_w_f2", fmt=":>5.3f", add_name="avg"),
+                dict(name="dbg_mamba_s4_w_f3", fmt=":>5.3f", add_name="avg"),
             ]
         )

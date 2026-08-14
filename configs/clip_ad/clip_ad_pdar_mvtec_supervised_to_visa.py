@@ -31,6 +31,12 @@ class cfg(base_cfg):
         self.data_test.root = "data"
         self.data_test.meta = "visa_meta.json"
         self.data_test.require_meta = True
+        # VisA contains several extremely small macaroni defects. Bilinear mask
+        # resize leaves only sub-0.5 values for 17 samples, which the evaluator
+        # would otherwise erase. Preserve those positives and fail loudly if an
+        # anomalous test mask is still missing or empty.
+        self.data_test.preserve_tiny_masks = True
+        self.data_test.require_nonempty_anomaly_mask = True
         self.data_test.cls_names = [
             "pcb1", "pcb2", "pcb3", "pcb4",
             "macaroni1", "macaroni2", "capsules", "candle",

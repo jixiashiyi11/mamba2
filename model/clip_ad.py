@@ -89,6 +89,7 @@ class CLIPNormalityAD(nn.Module):
         image_score_topk_ratio=0.01,
         topk_beta=0.5,
         arcc_mamba_context_scale=0.1,
+        arcc_lambda_override=None,
         global_score_weight=None,
         margin=0.2,
         **unused_kwargs,
@@ -204,6 +205,14 @@ class CLIPNormalityAD(nn.Module):
         self.image_score_topk_ratio = image_score_topk_ratio
         self.topk_beta = float(topk_beta)
         self.arcc_mamba_context_scale = float(arcc_mamba_context_scale)
+        self.arcc_lambda_override = None
+        if arcc_lambda_override is not None:
+            self.arcc_lambda_override = float(arcc_lambda_override)
+            if not 0.0 <= self.arcc_lambda_override <= 2.0:
+                raise ValueError(
+                    "arcc_lambda_override must be within [0, 2], "
+                    f"got {self.arcc_lambda_override}."
+                )
         if global_score_weight is not None:
             # Backward-compatible alias for older weighted-fusion configs.
             self.topk_beta = float(1.0 - global_score_weight)
@@ -395,12 +404,18 @@ class CLIPNormalityAD(nn.Module):
             edge=None,
             image_shape=image_shape,
         )
-        arcc_lambda = torch.clamp(self.arcc_lambda, min=0.0, max=2.0)
+        learned_arcc_lambda = torch.clamp(self.arcc_lambda, min=0.0, max=2.0)
+        if self.arcc_lambda_override is None:
+            arcc_lambda = learned_arcc_lambda
+        else:
+            # Diagnostic ablation only: 0 makes A_final exactly equal A_raw.
+            arcc_lambda = learned_arcc_lambda.new_tensor(self.arcc_lambda_override)
         final_map = raw_anomaly_map + arcc_lambda * raw_anomaly_map * torch.tanh(g_cal)
         return final_map, {
             "G_cal": g_cal,
             "arcc_mod_mask": mod_mask,
             "arcc_lambda": arcc_lambda,
+            "arcc_lambda_learned": learned_arcc_lambda,
             "mamba_context_tokens": context_tokens,
             **mamba_debug,
         }, context_tokens
@@ -649,8 +664,94 @@ class CLIPNormalityAD(nn.Module):
             arcc_delta = anomaly_map.detach() - raw_anomaly_map.detach()
             debug["dbg_arcc_delta_abs"] = arcc_delta.abs().mean()
             debug["dbg_arcc_delta_ratio"] = arcc_delta.abs().mean() / raw_anomaly_map.detach().abs().mean().clamp_min(eps)
+
+            # Pure diagnostics: split normal and anomalous-mask behavior without
+            # changing any loss term or gradient used for optimization.
+            if masks is not None:
+                target = masks.to(device=anomaly_map.device, dtype=anomaly_map.dtype)
+                if target.ndim == 4:
+                    target = target.squeeze(1)
+                if target.shape[-2:] != anomaly_map.shape[-2:]:
+                    target = F.interpolate(
+                        target.unsqueeze(1),
+                        size=anomaly_map.shape[-2:],
+                        mode="nearest",
+                    ).squeeze(1)
+                target = target.clamp(0.0, 1.0)
+                # Match the evaluator's actual binary-mask rule. Fractional
+                # interpolation residue below 0.5 must not count as a valid mask.
+                positive_mask = (target.flatten(1) > 0.5).any(dim=1)
+                if labels is not None:
+                    label_values = labels.to(device=anomaly_map.device).view(-1)
+                    normal_images = label_values == 0
+                    abnormal_images = label_values != 0
+                else:
+                    normal_images = ~positive_mask
+                    abnormal_images = positive_mask
+
+                final_logits = anomaly_map.detach() / self.supervised_score_temperature
+                raw_scores = raw_anomaly_map.detach()
+                final_scores = anomaly_map.detach()
+                bce_per_image = F.binary_cross_entropy_with_logits(
+                    final_logits,
+                    target,
+                    reduction="none",
+                ).flatten(1).mean(dim=1)
+                probs = torch.sigmoid(final_logits)
+                probs_flat = probs.flatten(1)
+                target_flat = target.flatten(1)
+                intersection = (probs_flat * target_flat).sum(dim=1)
+                dice_loss_per_image = 1.0 - (
+                    (2.0 * intersection + 1.0)
+                    / (probs_flat.sum(dim=1) + target_flat.sum(dim=1) + 1.0)
+                )
+
+                def selected_mean(values, selection):
+                    return values[selection].mean() if selection.any() else values.new_zeros(())
+
+                debug["dbg_mask_bce_normal"] = selected_mean(bce_per_image, normal_images)
+                debug["dbg_mask_bce_abnormal"] = selected_mean(bce_per_image, abnormal_images)
+                debug["dbg_mask_dice_positive"] = selected_mean(
+                    dice_loss_per_image,
+                    positive_mask,
+                )
+                normal_prob_per_image = probs.flatten(1).mean(dim=1)
+                normal_fg_per_image = (probs.flatten(1) > 0.5).float().mean(dim=1)
+                debug["dbg_normal_prob_mean"] = selected_mean(
+                    normal_prob_per_image,
+                    normal_images,
+                )
+                debug["dbg_normal_fg_ratio"] = selected_mean(
+                    normal_fg_per_image,
+                    normal_images,
+                )
+                raw_max = raw_scores.flatten(1).amax(dim=1)
+                final_max = final_scores.flatten(1).amax(dim=1)
+                debug["dbg_arcc_normal_max_gain"] = selected_mean(
+                    final_max - raw_max,
+                    normal_images,
+                )
+
+                binary_target = (target > 0.5).to(dtype=target.dtype)
+                outside_target = 1.0 - binary_target
+                inside_count = binary_target.flatten(1).sum(dim=1).clamp_min(1.0)
+                outside_count = outside_target.flatten(1).sum(dim=1).clamp_min(1.0)
+
+                def mask_gap(scores):
+                    inside_mean = (scores * binary_target).flatten(1).sum(dim=1) / inside_count
+                    outside_mean = (scores * outside_target).flatten(1).sum(dim=1) / outside_count
+                    return inside_mean - outside_mean
+
+                debug["dbg_raw_mask_gap"] = selected_mean(mask_gap(raw_scores), positive_mask)
+                debug["dbg_final_mask_gap"] = selected_mean(mask_gap(final_scores), positive_mask)
+                debug["dbg_batch_normal_count"] = normal_images.float().sum()
+                debug["dbg_batch_abnormal_count"] = abnormal_images.float().sum()
+                debug["dbg_batch_positive_mask_count"] = positive_mask.float().sum()
             if arcc_debug is not None:
                 debug["dbg_arcc_lambda"] = arcc_debug["arcc_lambda"].detach()
+                debug["dbg_arcc_lambda_learned"] = arcc_debug[
+                    "arcc_lambda_learned"
+                ].detach()
                 debug["dbg_g_cal_abs"] = arcc_debug["G_cal"].detach().abs().mean()
                 if "mamba_global_prior" in arcc_debug:
                     prior = arcc_debug["mamba_global_prior"].detach()
@@ -685,6 +786,12 @@ class CLIPNormalityAD(nn.Module):
                 if "mamba_depth_weight_mean" in arcc_debug:
                     for idx, weight in enumerate(arcc_debug["mamba_depth_weight_mean"].detach()):
                         debug[f"dbg_mamba_depth_w_f{idx}"] = weight
+                if "mamba_depth_stage_weight_means" in arcc_debug:
+                    for stage_idx, stage_means in enumerate(
+                        arcc_debug["mamba_depth_stage_weight_means"], start=1
+                    ):
+                        for source_idx, weight in enumerate(stage_means.detach().mean(dim=0)):
+                            debug[f"dbg_mamba_s{stage_idx}_w_f{source_idx}"] = weight
             else:
                 debug["dbg_arcc_lambda"] = raw_anomaly_map.new_zeros(())
                 debug["dbg_g_cal_abs"] = raw_anomaly_map.new_zeros(())

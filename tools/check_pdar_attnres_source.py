@@ -25,6 +25,7 @@ def main():
         "model/clip_ad.py",
         "trainer/clip_ad_trainer.py",
         "configs/clip_ad/clip_ad_supervised_mask_pdar_cssd.py",
+        "configs/clip_ad/clip_ad_pdar_mvtec_supervised_to_visa.py",
         "tools/test_pdar_attnres.py",
     ]
     for path in files:
@@ -57,6 +58,32 @@ def main():
         if text not in pdar:
             raise AssertionError(f"Missing PDAR full-history contract: {text}")
     print("PDAR full-history source contract: OK")
+
+    lss = _class_source(mambaad, "LSSModule")
+    required = (
+        "local_kernel_sizes=(5, 7)",
+        "local_dilations=(1, 1)",
+        "self.local_effective_receptive_fields",
+        "padding_5 = dilation_5 * (kernel_5 - 1) // 2",
+        "padding_7 = dilation_7 * (kernel_7 - 1) // 2",
+        "dilation=dilation_5",
+        "dilation=dilation_7",
+    )
+    for text in required:
+        if text not in lss:
+            raise AssertionError(f"Missing configurable LSS local-view operation: {text}")
+
+    progressive_required = (
+        "local_receptive_field_schedule=None",
+        "stage_kernel_sizes = [(3, 3) for _ in depths]",
+        "(receptive_field - 1) // 2",
+        "local_kernel_sizes=stage_kernel_sizes[idx]",
+        "local_dilations=stage_dilations[idx]",
+    )
+    for text in progressive_required:
+        if text not in pdar:
+            raise AssertionError(f"Missing PDAR progressive-view wiring: {text}")
+    print("PDAR progressive local-view contract: OK")
 
     mixer = _class_source(mambaad, "DepthAttentionResidual")
     required = (
@@ -105,6 +132,7 @@ def main():
 
     clip = _read("model/clip_ad.py")
     config = _read("configs/clip_ad/clip_ad_supervised_mask_pdar_cssd.py")
+    progressive_config = _read("configs/clip_ad/clip_ad_pdar_mvtec_supervised_to_visa.py")
     trainer = _read("trainer/clip_ad_trainer.py")
     if 'dbg_mamba_depth_w_f{idx}' not in clip:
         raise AssertionError("CLIP debug output does not use F-indexed weight names.")
@@ -113,6 +141,18 @@ def main():
         if name not in config or name not in trainer:
             raise AssertionError(f"Missing final depth log: {name}")
     print("F0-F4 debug naming: OK")
+
+    for text in (
+        "local_receptive_field_schedule=(",
+        "(3, 5)",
+        "(5, 7)",
+        "(7, 9)",
+        "(9, 11)",
+        "use_deformable_pool=False",
+    ):
+        if text not in progressive_config:
+            raise AssertionError(f"Missing progressive-view config setting: {text}")
+    print("MVTec-to-VisA progressive-view experiment config: OK")
 
 
 if __name__ == "__main__":

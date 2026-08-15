@@ -238,6 +238,7 @@ class MambaResponseContext(nn.Module):
         use_deformable_pool=False,
         context_scale=1.0,
         cssd_type="pdar",
+        local_receptive_field_schedule=None,
     ):
         super().__init__()
         from model.mambaad import CSSD, PDARCSSD
@@ -251,7 +252,7 @@ class MambaResponseContext(nn.Module):
         self.use_pdar_cssd = self.cssd_type in ("pdar", "pdar_cssd")
         self.input_norm = nn.LayerNorm(dim)
         cssd_cls = PDARCSSD if self.use_pdar_cssd else CSSD
-        self.cssd = cssd_cls(
+        cssd_kwargs = dict(
             hidden_dim=dim,
             grid_size=grid_size,
             depths=depths,
@@ -264,6 +265,11 @@ class MambaResponseContext(nn.Module):
             use_cnn_branch=use_cnn_branch,
             use_deformable_pool=use_deformable_pool,
         )
+        if self.use_pdar_cssd:
+            cssd_kwargs["local_receptive_field_schedule"] = local_receptive_field_schedule
+        elif local_receptive_field_schedule is not None:
+            raise ValueError('`local_receptive_field_schedule` is only supported by the PDAR-LSS path.')
+        self.cssd = cssd_cls(**cssd_kwargs)
         self.out_norm = nn.LayerNorm(dim)
         self.prior_head = nn.Conv2d(dim, 1, kernel_size=1)
 

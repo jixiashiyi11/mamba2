@@ -4,7 +4,7 @@ from configs.clip_ad.clip_ad_supervised_mask_pdar_cssd import cfg as base_cfg
 
 
 class cfg(base_cfg):
-    """Train PDAR-CSSD on labeled MVTec source data and evaluate only on VisA."""
+    """Train progressive-view PDAR-CSSD on MVTec and evaluate on VisA."""
 
     def __init__(self):
         super().__init__()
@@ -57,6 +57,14 @@ class cfg(base_cfg):
             use_selective_scan=True,
             use_cnn_branch=True,
             use_deformable_pool=False,
+            # LSS stages form a local-to-broad spatial-view hierarchy. Each
+            # pair is the effective receptive field of its two CNN branches.
+            local_receptive_field_schedule=(
+                (3, 5),
+                (5, 7),
+                (7, 9),
+                (9, 11),
+            ),
         )
         self.model.kwargs.update(
             image_score_topk_ratio=None,
@@ -66,6 +74,6 @@ class cfg(base_cfg):
             supervised_outside_topk_weight=0.1,
         )
 
-        self.trainer.logdir_sub = "pdar_mvtec_supervised_to_visa_max"
+        self.trainer.logdir_sub = "pdar_mvtec_supervised_to_visa_progressive_view_max"
         self.trainer.logdir_simple = True
         self.trainer.output_name = "outputs.npz"

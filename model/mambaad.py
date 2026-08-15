@@ -427,6 +427,8 @@ class LSSModule(nn.Module):
             use_deformable_pool: bool = True,
             add_outer_residual: bool = True,
             use_adaln: bool = True,
+            local_kernel_sizes=(5, 7),
+            local_dilations=(1, 1),
             **kwargs,
     ):
         super().__init__()
@@ -435,6 +437,19 @@ class LSSModule(nn.Module):
         self.use_deformable_pool = bool(use_deformable_pool)
         self.add_outer_residual = bool(add_outer_residual)
         self.use_adaln = bool(use_adaln)
+        if len(local_kernel_sizes) != 2 or len(local_dilations) != 2:
+            raise ValueError('LSS local branch expects exactly two kernel sizes and two dilation values.')
+        self.local_kernel_sizes = tuple(int(value) for value in local_kernel_sizes)
+        self.local_dilations = tuple(int(value) for value in local_dilations)
+        for kernel_size, dilation in zip(self.local_kernel_sizes, self.local_dilations):
+            if kernel_size <= 0 or kernel_size % 2 == 0:
+                raise ValueError(f'Local kernel sizes must be positive odd integers, got {kernel_size}.')
+            if dilation <= 0:
+                raise ValueError(f'Local dilation values must be positive integers, got {dilation}.')
+        self.local_effective_receptive_fields = tuple(
+            kernel_size + (kernel_size - 1) * (dilation - 1)
+            for kernel_size, dilation in zip(self.local_kernel_sizes, self.local_dilations)
+        )
         self.smm_blocks = nn.ModuleList()
         if self.use_selective_scan:
             self.smm_blocks = nn.ModuleList([
@@ -443,9 +458,14 @@ class LSSModule(nn.Module):
                          use_adaln=self.use_adaln, **kwargs)
                 for i in range(depth)])
 
-        # Original MambaAD LSS local branch. The same stage input is processed
-        # by 5x5 and 7x7 depth-wise convolutions in parallel with the HSS path.
+        # The same stage input is processed by two configurable depth-wise
+        # convolutions in parallel with the HSS path. The defaults (5x5 and
+        # 7x7, dilation 1) preserve the original MambaAD LSS exactly.
         if self.use_cnn_branch:
+            kernel_5, kernel_7 = self.local_kernel_sizes
+            dilation_5, dilation_7 = self.local_dilations
+            padding_5 = dilation_5 * (kernel_5 - 1) // 2
+            padding_7 = dilation_7 * (kernel_7 - 1) // 2
             self.conv1b7 = nn.Sequential(
                 nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1, stride=1),
                 nn.InstanceNorm2d(hidden_dim),
@@ -470,9 +490,10 @@ class LSSModule(nn.Module):
                 nn.Conv2d(
                     hidden_dim,
                     hidden_dim,
-                    kernel_size=5,
+                    kernel_size=kernel_5,
                     stride=1,
-                    padding=2,
+                    padding=padding_5,
+                    dilation=dilation_5,
                     bias=False,
                     groups=hidden_dim,
                 ),
@@ -483,9 +504,10 @@ class LSSModule(nn.Module):
                 nn.Conv2d(
                     hidden_dim,
                     hidden_dim,
-                    kernel_size=7,
+                    kernel_size=kernel_7,
                     stride=1,
-                    padding=3,
+                    padding=padding_7,
+                    dilation=dilation_7,
                     bias=False,
                     groups=hidden_dim,
                 ),
@@ -1096,7 +1118,8 @@ class PDARCSSD(nn.Module):
 
     def __init__(self, hidden_dim, grid_size, depths=(1, 1, 1, 1), d_state=16, drop_path_rate=0.0,
                  attn_drop_rate=0.0, scan_type='scan', num_direction=8,
-                 use_selective_scan=True, use_cnn_branch=True, use_deformable_pool=False):
+                 use_selective_scan=True, use_cnn_branch=True, use_deformable_pool=False,
+                 local_receptive_field_schedule=None):
         super().__init__()
         if not isinstance(depths, (list, tuple)) or len(depths) == 0:
             raise ValueError('`depths` must be a non-empty list or tuple.')
@@ -1105,6 +1128,41 @@ class PDARCSSD(nn.Module):
         self.use_selective_scan = bool(use_selective_scan)
         self.use_cnn_branch = bool(use_cnn_branch)
         self.use_deformable_pool = bool(use_deformable_pool)
+
+        if local_receptive_field_schedule is None:
+            # Backward-compatible original LSS: every stage uses 5x5 and 7x7
+            # depth-wise convolutions without dilation.
+            stage_kernel_sizes = [(5, 7) for _ in depths]
+            stage_dilations = [(1, 1) for _ in depths]
+            self.local_receptive_field_schedule = tuple((5, 7) for _ in depths)
+        else:
+            if len(local_receptive_field_schedule) != len(depths):
+                raise ValueError(
+                    '`local_receptive_field_schedule` must contain one pair for each PDAR-LSS stage.'
+                )
+            normalized_schedule = []
+            for stage_idx, receptive_fields in enumerate(local_receptive_field_schedule):
+                if len(receptive_fields) != 2:
+                    raise ValueError(
+                        f'PDAR-LSS stage {stage_idx + 1} must define exactly two receptive fields.'
+                    )
+                receptive_fields = tuple(int(value) for value in receptive_fields)
+                if any(value <= 0 or value % 2 == 0 for value in receptive_fields):
+                    raise ValueError(
+                        'Local receptive fields must be positive odd integers, '
+                        f'got {receptive_fields} at stage {stage_idx + 1}.'
+                    )
+                normalized_schedule.append(receptive_fields)
+
+            # A 3x3 depth-wise kernel with dilation d has effective receptive
+            # field 2d+1. Using the same 3x3 kernel at every stage changes only
+            # the spatial view, not the depth-wise convolution parameter count.
+            self.local_receptive_field_schedule = tuple(normalized_schedule)
+            stage_kernel_sizes = [(3, 3) for _ in depths]
+            stage_dilations = [
+                tuple((receptive_field - 1) // 2 for receptive_field in stage_fields)
+                for stage_fields in self.local_receptive_field_schedule
+            ]
 
         stage_drop_paths = torch.linspace(0, drop_path_rate, len(depths)).tolist()
         self.stages = nn.ModuleList([
@@ -1123,6 +1181,8 @@ class PDARCSSD(nn.Module):
                 use_deformable_pool=self.use_deformable_pool,
                 add_outer_residual=False,
                 use_adaln=False,
+                local_kernel_sizes=stage_kernel_sizes[idx],
+                local_dilations=stage_dilations[idx],
             )
             for idx, depth in enumerate(depths)
         ])

@@ -130,6 +130,40 @@ def run_test(batch_size, grid_size, hidden_dim, device):
     print(f"PDAR output shape: {tuple(output.shape)}")
     print(f"final context shape: {tuple(debug['depth_final_context'].shape)}")
 
+    # Verify the PDAR-specific progressive-view schedule. Every stage keeps the
+    # same pair of 3x3 depth-wise kernels while dilation alone expands the
+    # effective local receptive fields: (3,5) -> (5,7) -> (7,9) -> (9,11).
+    progressive_schedule = ((3, 5), (5, 7), (7, 9), (9, 11))
+    progressive = PDARCSSD(
+        hidden_dim=hidden_dim,
+        grid_size=grid_size,
+        depths=(1, 1, 1, 1),
+        d_state=16,
+        drop_path_rate=0.0,
+        attn_drop_rate=0.0,
+        scan_type="scan",
+        num_direction=8,
+        use_selective_scan=False,
+        use_cnn_branch=True,
+        use_deformable_pool=False,
+        local_receptive_field_schedule=progressive_schedule,
+    ).to(device)
+    assert progressive.local_receptive_field_schedule == progressive_schedule
+    for stage, expected_fields in zip(progressive.stages, progressive_schedule):
+        assert stage.local_kernel_sizes == (3, 3)
+        assert stage.local_effective_receptive_fields == expected_fields
+        for branch, expected_field in zip((stage.conv55, stage.conv77), expected_fields):
+            depthwise_conv = branch[0]
+            expected_dilation = (expected_field - 1) // 2
+            assert depthwise_conv.kernel_size == (3, 3)
+            assert depthwise_conv.dilation == (expected_dilation, expected_dilation)
+            assert depthwise_conv.padding == (expected_dilation, expected_dilation)
+
+    progressive_output = progressive(tokens, semantic, (grid_size, grid_size))
+    assert progressive_output.shape == (batch_size, token_count, hidden_dim)
+    assert torch.isfinite(progressive_output).all()
+    print(f"progressive local receptive fields: OK ({progressive_schedule})")
+
 
 def main():
     parser = argparse.ArgumentParser(description="Verify official AttnRes semantics in PDAR-CSSD.")

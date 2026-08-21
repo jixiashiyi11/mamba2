@@ -2023,6 +2023,7 @@ class ARCCCalibration(nn.Module):
             self,
             in_dim,
             use_response=True,
+            use_mamba_support=False,
             use_foreground=True,
             use_edge=True,
             kernel_size=3,
@@ -2031,6 +2032,7 @@ class ARCCCalibration(nn.Module):
     ):
         super().__init__()
         self.use_response = bool(use_response)
+        self.use_mamba_support = bool(use_mamba_support)
         self.use_foreground = bool(use_foreground)
         self.use_edge = bool(use_edge)
         kernel_size = int(kernel_size)
@@ -2038,7 +2040,12 @@ class ARCCCalibration(nn.Module):
             raise ValueError('ARCC deformable kernel_size must be odd.')
         self.kernel_size = kernel_size
         self.lambda_init = float(lambda_init)
-        extra_channels = int(self.use_response) + int(self.use_foreground) + int(self.use_edge)
+        extra_channels = (
+            int(self.use_response)
+            + int(self.use_mamba_support)
+            + int(self.use_foreground)
+            + int(self.use_edge)
+        )
         offset_in_dim = in_dim + extra_channels
         offset_channels = 3 * kernel_size * kernel_size
         self.offset_head = nn.Sequential(
@@ -2065,7 +2072,15 @@ class ARCCCalibration(nn.Module):
         nn.init.zeros_(self.calibration_head[-1].weight)
         nn.init.zeros_(self.calibration_head[-1].bias)
 
-    def forward(self, feature_map, local_logits, foreground=None, edge=None, image_shape=None):
+    def forward(
+            self,
+            feature_map,
+            local_logits,
+            mamba_support=None,
+            foreground=None,
+            edge=None,
+            image_shape=None,
+    ):
         target_shape = feature_map.shape[-2:]
         guidance = [feature_map]
         if self.use_response:
@@ -2073,6 +2088,18 @@ class ARCCCalibration(nn.Module):
             if response.shape[-2:] != target_shape:
                 response = F.interpolate(response, size=target_shape, mode='bilinear', align_corners=False)
             guidance.append(response)
+        if self.use_mamba_support:
+            if mamba_support is None:
+                raise ValueError('ARCC requires mamba_support when use_mamba_support=True.')
+            support = mamba_support.unsqueeze(1) if mamba_support.ndim == 3 else mamba_support
+            if support.shape[-2:] != target_shape:
+                support = F.interpolate(
+                    support.to(dtype=feature_map.dtype),
+                    size=target_shape,
+                    mode='bilinear',
+                    align_corners=False,
+                )
+            guidance.append(support.to(dtype=feature_map.dtype))
         if self.use_foreground:
             if foreground is None:
                 foreground = torch.ones(

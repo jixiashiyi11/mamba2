@@ -208,9 +208,11 @@ class CLIPADTrainer(BaseTrainer):
             "loss_mask_raw_bce",
             "loss_outside_topk",
             "loss_image_supervised",
+            "loss_pdar_image",
             "loss_mamba_context_bce",
             "loss_mamba_context_dice",
             "loss_mamba_context_outside_topk",
+            "loss_mamba_context_separation",
             "dbg_refine_cos",
             "dbg_refine_delta_l2",
             "dbg_mamba_context_cos",
@@ -228,6 +230,7 @@ class CLIPADTrainer(BaseTrainer):
             "dbg_arcc_lambda",
             "dbg_arcc_lambda_learned",
             "dbg_g_cal_abs",
+            "dbg_arcc_mamba_injection_gamma",
             "dbg_mask_bce_normal",
             "dbg_mask_bce_abnormal",
             "dbg_mask_dice_positive",
@@ -247,6 +250,17 @@ class CLIPADTrainer(BaseTrainer):
             "dbg_image_score_max",
             "dbg_image_score_top1",
             "dbg_image_score_top5",
+            "dbg_pdar_image_score_mean",
+            "dbg_pdar_image_scale",
+            "dbg_pdar_pool_entropy",
+            "dbg_image_fusion_w_global",
+            "dbg_image_fusion_w_raw_max",
+            "dbg_image_fusion_w_raw_top1",
+            "dbg_image_fusion_w_raw_top5",
+            "dbg_image_fusion_w_mamba_max",
+            "dbg_image_fusion_w_mamba_top1",
+            "dbg_image_fusion_w_mamba_top5",
+            "dbg_image_fusion_bias",
             "dbg_mamba_prior_mean",
             "dbg_mamba_prior_max",
             "dbg_mamba_prior_mask_in",
@@ -254,6 +268,20 @@ class CLIPADTrainer(BaseTrainer):
             "dbg_mamba_prior_gap",
             "dbg_mamba_prior_normal_topk",
             "dbg_mamba_prior_abnormal_topk",
+            "dbg_mamba_semantic_mean",
+            "dbg_mamba_semantic_max",
+            "dbg_mamba_verifier_mean",
+            "dbg_mamba_verifier_max",
+            "dbg_mamba_support_mean",
+            "dbg_mamba_veto_mean",
+            "dbg_mamba_veto_alpha",
+            "dbg_mamba_veto_max_gain",
+            "dbg_mamba_support_normal",
+            "dbg_mamba_support_mask_in",
+            "dbg_mamba_support_mask_out",
+            "dbg_mamba_veto_normal",
+            "dbg_mamba_veto_mask_in",
+            "dbg_mamba_veto_mask_out",
             "dbg_mamba_depth_entropy",
             "dbg_mamba_depth_max_weight",
             "dbg_mamba_depth_w_f0",
@@ -312,9 +340,12 @@ class CLIPADTrainer(BaseTrainer):
     def _image_score_variant_table(self, results):
         variant_keys = [
             ("default", "image_scores"),
+            ("legacy", "image_scores_legacy"),
+            ("pdar_only", "image_scores_pdar_only"),
             ("max", "image_scores_max"),
             ("top1", "image_scores_top1"),
             ("top5", "image_scores_top5"),
+            ("cnn_only", "image_scores_cnn_only"),
         ]
         variant_keys = [(name, key) for name, key in variant_keys if key in results]
         if len(variant_keys) <= 1:
@@ -355,6 +386,24 @@ class CLIPADTrainer(BaseTrainer):
         imgs_masks, anomaly_maps, image_scores, cls_names, anomalys, layer_text_maps = [], [], [], [], [], []
         image_scores_max, image_scores_top1, image_scores_top5 = [], [], []
         raw_anomaly_maps, arcc_cal_maps, mamba_prior_maps = [], [], []
+        mamba_semantic_maps, mamba_support_maps, mamba_veto_maps = [], [], []
+        save_mamba_full_maps = bool(getattr(self.cfg.trainer, "save_mamba_full_maps", True))
+        image_component_outputs = {
+            "global_scores": "S_global",
+            "raw_scores_max": "raw_score_max",
+            "raw_scores_top1": "raw_score_top1",
+            "raw_scores_top5": "raw_score_top5",
+            "mamba_scores_max": "mamba_score_max",
+            "mamba_scores_top1": "mamba_score_top1",
+            "mamba_scores_top5": "mamba_score_top5",
+            "image_scores_raw_top5": "image_score_raw_top5",
+            "image_scores_mamba_top5": "image_score_mamba_top5",
+            "image_scores_cnn_only": "image_score_cnn_only",
+            "image_scores_legacy": "image_score_legacy",
+            "image_scores_pdar_only": "image_score_pdar_only",
+            "image_evidence": "image_evidence",
+        }
+        image_component_values = {key: [] for key in image_component_outputs}
         mamba_depth_stage_means = {}
         mamba_depth_region_means = {}
         diagnostic_specs = {
@@ -366,6 +415,16 @@ class CLIPADTrainer(BaseTrainer):
             "dbg_arcc_normal_max_gain": "dbg_batch_normal_count",
             "dbg_raw_mask_gap": "dbg_batch_positive_mask_count",
             "dbg_final_mask_gap": "dbg_batch_positive_mask_count",
+            "dbg_mamba_support_normal": "dbg_batch_normal_count",
+            "dbg_mamba_support_mask_in": "dbg_batch_positive_mask_count",
+            "dbg_mamba_support_mask_out": "dbg_batch_positive_mask_count",
+            "dbg_mamba_veto_normal": "dbg_batch_normal_count",
+            "dbg_mamba_veto_mask_in": "dbg_batch_positive_mask_count",
+            "dbg_mamba_veto_mask_out": "dbg_batch_positive_mask_count",
+            "dbg_joint_vs_cnn_max_normal": "dbg_batch_normal_count",
+            "dbg_joint_vs_cnn_max_abnormal": "dbg_batch_abnormal_count",
+            "dbg_joint_vs_cnn_mask_in": "dbg_batch_positive_mask_count",
+            "dbg_joint_vs_cnn_mask_out": "dbg_batch_positive_mask_count",
         }
         diagnostic_sums = {key: 0.0 for key in diagnostic_specs}
         diagnostic_counts = {key: 0.0 for key in diagnostic_specs}
@@ -398,6 +457,12 @@ class CLIPADTrainer(BaseTrainer):
                 image_scores_top1.append(self.output["image_score_top1"].cpu().numpy())
             if isinstance(self.output, dict) and "image_score_top5" in self.output:
                 image_scores_top5.append(self.output["image_score_top5"].cpu().numpy())
+            if isinstance(self.output, dict):
+                for result_key, output_key in image_component_outputs.items():
+                    if output_key in self.output:
+                        image_component_values[result_key].append(
+                            self.output[output_key].cpu().numpy()
+                        )
             cls_names.append(np.array(self.cls_name))
             anomalys.append(self.anomaly.cpu().numpy().astype(int))
             if isinstance(self.output, dict) and "layer_text_maps" in self.output:
@@ -408,6 +473,12 @@ class CLIPADTrainer(BaseTrainer):
                 arcc_cal_maps.append(self.output["G_cal"].cpu().numpy())
             if isinstance(self.output, dict) and "mamba_global_prior" in self.output:
                 mamba_prior_maps.append(self.output["mamba_global_prior"].cpu().numpy())
+            if save_mamba_full_maps and isinstance(self.output, dict) and "mamba_semantic_map" in self.output:
+                mamba_semantic_maps.append(self.output["mamba_semantic_map"].cpu().numpy())
+            if save_mamba_full_maps and isinstance(self.output, dict) and "mamba_support_map" in self.output:
+                mamba_support_maps.append(self.output["mamba_support_map"].cpu().numpy())
+            if save_mamba_full_maps and isinstance(self.output, dict) and "mamba_veto_map" in self.output:
+                mamba_veto_maps.append(self.output["mamba_veto_map"].cpu().numpy())
             if isinstance(self.output, dict) and "mamba_depth_stage_weight_means" in self.output:
                 for stage_idx, stage_means in enumerate(
                     self.output["mamba_depth_stage_weight_means"], start=1
@@ -492,6 +563,15 @@ class CLIPADTrainer(BaseTrainer):
             results["arcc_cal_maps"] = arcc_cal_maps
         if mamba_prior_maps:
             results["mamba_prior_maps"] = mamba_prior_maps
+        if mamba_semantic_maps:
+            results["mamba_semantic_maps"] = mamba_semantic_maps
+        if mamba_support_maps:
+            results["mamba_support_maps"] = mamba_support_maps
+        if mamba_veto_maps:
+            results["mamba_veto_maps"] = mamba_veto_maps
+        for key, values in image_component_values.items():
+            if values:
+                results[key] = values
         for key, values in mamba_depth_stage_means.items():
             results[key] = values
         for key, values in mamba_depth_region_means.items():
@@ -518,6 +598,15 @@ class CLIPADTrainer(BaseTrainer):
                     results["arcc_cal_maps"] = []
                 if mamba_prior_maps:
                     results["mamba_prior_maps"] = []
+                if mamba_semantic_maps:
+                    results["mamba_semantic_maps"] = []
+                if mamba_support_maps:
+                    results["mamba_support_maps"] = []
+                if mamba_veto_maps:
+                    results["mamba_veto_maps"] = []
+                for key, values in image_component_values.items():
+                    if values:
+                        results[key] = []
                 for key in mamba_depth_stage_means:
                     results[key] = []
                 for key in mamba_depth_region_means:

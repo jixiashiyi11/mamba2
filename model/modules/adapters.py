@@ -159,7 +159,7 @@ class LocalGlobalPatchAdapter(nn.Module):
 
 
 class MultiLayerLocalPatchAdapter(nn.Module):
-    """Use low/mid CLIP patch tokens to locally refine the final CLIP patch tokens."""
+    """Fuse low/mid CLIP patch tokens into the final CLIP patch tokens."""
 
     def __init__(
         self,
@@ -169,28 +169,42 @@ class MultiLayerLocalPatchAdapter(nn.Module):
         local_kernel_size=3,
         local_layers=2,
         hidden_dim=None,
+        fusion_mode="cnn",
     ):
         super().__init__()
-        if local_kernel_size % 2 == 0:
-            raise ValueError("local_kernel_size must be odd.")
         self.adapter_scale = float(adapter_scale)
         self.local_layers = int(local_layers)
         if self.local_layers < 1:
             raise ValueError("local_layers must be >= 1.")
+        self.fusion_mode = str(fusion_mode).lower()
+        if self.fusion_mode not in ("cnn", "projection"):
+            raise ValueError("fusion_mode must be cnn or projection.")
+        if self.fusion_mode == "cnn" and local_kernel_size % 2 == 0:
+            raise ValueError("local_kernel_size must be odd.")
         hidden_dim = int(hidden_dim or dim)
-        padding = local_kernel_size // 2
 
         self.input_norms = nn.ModuleList([nn.LayerNorm(dim) for _ in range(self.local_layers)])
-        self.fuse = nn.Conv2d(dim * self.local_layers, hidden_dim, kernel_size=1)
-        self.dwconv = nn.Conv2d(
-            hidden_dim,
-            hidden_dim,
-            kernel_size=local_kernel_size,
-            padding=padding,
-            groups=hidden_dim,
-        )
-        self.act = nn.GELU()
-        self.out_proj = nn.Conv2d(hidden_dim, dim, kernel_size=1)
+        if self.fusion_mode == "projection":
+            # The same linear layer is applied to every patch independently:
+            # [F12; F18] -> delta F, with no spatial reshape or neighbour mixing.
+            self.projection = nn.Linear(dim * self.local_layers, dim)
+            self.fuse = None
+            self.dwconv = None
+            self.act = None
+            self.out_proj = None
+        else:
+            padding = local_kernel_size // 2
+            self.projection = None
+            self.fuse = nn.Conv2d(dim * self.local_layers, hidden_dim, kernel_size=1)
+            self.dwconv = nn.Conv2d(
+                hidden_dim,
+                hidden_dim,
+                kernel_size=local_kernel_size,
+                padding=padding,
+                groups=hidden_dim,
+            )
+            self.act = nn.GELU()
+            self.out_proj = nn.Conv2d(hidden_dim, dim, kernel_size=1)
         self.out_norm = nn.LayerNorm(dim)
 
     def _tokens_to_map(self, x, spatial_shape, norm):
@@ -205,16 +219,24 @@ class MultiLayerLocalPatchAdapter(nn.Module):
         if len(local_patches) < self.local_layers:
             raise ValueError(f"Expected at least {self.local_layers} local patch feature maps.")
         local_patches = list(local_patches[: self.local_layers])
-        maps = [
-            self._tokens_to_map(patch, spatial_shape, norm)
-            for patch, norm in zip(local_patches, self.input_norms)
-        ]
-        local = self.fuse(F.gelu(torch.cat(maps, dim=1)))
-        local = self.dwconv(local)
-        local = self.act(local)
-        local = self.out_proj(local)
-        bsz, dim, height, width = local.shape
-        local_delta = local.permute(0, 2, 3, 1).contiguous().view(bsz, height * width, dim)
+        if self.fusion_mode == "projection":
+            fused_tokens = torch.cat(
+                [norm(patch) for patch, norm in zip(local_patches, self.input_norms)],
+                dim=-1,
+            )
+            local_delta = self.projection(fused_tokens)
+        else:
+            maps = [
+                self._tokens_to_map(patch, spatial_shape, norm)
+                for patch, norm in zip(local_patches, self.input_norms)
+            ]
+            fused_input = torch.cat(maps, dim=1)
+            local = self.fuse(F.gelu(fused_input))
+            local = self.dwconv(local)
+            local = self.act(local)
+            local = self.out_proj(local)
+            bsz, dim, height, width = local.shape
+            local_delta = local.permute(0, 2, 3, 1).contiguous().view(bsz, height * width, dim)
         local_delta = self.out_norm(local_delta)
         refined = F.normalize(last_patch + self.adapter_scale * local_delta, dim=-1)
         return refined, local_delta
@@ -301,6 +323,10 @@ class MambaResponseContext(nn.Module):
         context_logits = self.prior_head(aux_map).squeeze(1)
         debug = {
             "mamba_context_logits": context_logits,
+            # Full PDAR/AttnRes output before the context_scale residual. The
+            # caller removes this tensor from exported diagnostics after using
+            # it for the optional ARCC delta route.
+            "mamba_full_context_tokens": aux_tokens,
             # Backward-compatible name used by existing visualization code.
             "mamba_global_prior": context_logits,
         }

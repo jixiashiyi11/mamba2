@@ -1,4 +1,5 @@
 import importlib
+import math
 import sys
 import types
 from pathlib import Path
@@ -22,6 +23,7 @@ from .modules.prompt_templates import (
 )
 from .modules.patch_features import fuse_layer_scores, project_clip_patch_tokens
 from .modules.scoring import abnormal_minus_normal, mean_topk_score, upsample_patch_map
+from util.mamba_veto import apply_mamba_probability_veto, resize_mamba_patch_targets
 
 
 def _load_aaclip_vendor():
@@ -82,14 +84,36 @@ class CLIPNormalityAD(nn.Module):
         mamba_context_dice_weight=0.0,
         mamba_context_outside_topk_weight=0.0,
         mamba_context_outside_topk_ratio=0.01,
+        mamba_context_separation_weight=0.0,
+        mamba_context_separation_margin=0.2,
+        mamba_context_mask_pool="nearest",
         loss_topk_ratio=0.01,
         surgery_until_layer=None,
         normal_templates=None,
         abnormal_templates=None,
         image_score_topk_ratio=0.01,
         topk_beta=0.5,
+        image_score_mode="legacy",
+        pdar_image_pool_temperature=2.0,
+        pdar_image_scale_init=0.1,
+        pdar_image_dropout=0.1,
+        pdar_image_attention_detach=True,
+        pdar_image_loss_weight=0.0,
         arcc_mamba_context_scale=0.1,
+        arcc_inject_mamba=False,
+        arcc_mamba_injection_init=0.1,
+        arcc_mamba_fusion_mode="add",
+        arcc_mamba_feature_source="context_tokens",
+        arcc_mamba_support_guidance=False,
+        arcc_mamba_support_detach=True,
         arcc_lambda_override=None,
+        arcc_mode="bidirectional",
+        mamba_veto_source="semantic",
+        mamba_veto_alpha_init=0.1,
+        mamba_veto_temperature=1.0,
+        mamba_veto_threshold=0.0,
+        mamba_veto_detach=True,
+        mamba_veto_enabled=True,
         global_score_weight=None,
         margin=0.2,
         **unused_kwargs,
@@ -200,11 +224,86 @@ class CLIPNormalityAD(nn.Module):
         self.mamba_context_dice_weight = float(mamba_context_dice_weight)
         self.mamba_context_outside_topk_weight = float(mamba_context_outside_topk_weight)
         self.mamba_context_outside_topk_ratio = mamba_context_outside_topk_ratio
+        self.mamba_context_separation_weight = float(mamba_context_separation_weight)
+        self.mamba_context_separation_margin = float(mamba_context_separation_margin)
+        self.mamba_context_mask_pool = str(mamba_context_mask_pool).lower()
+        if self.mamba_context_mask_pool not in ("nearest", "adaptive_max"):
+            raise ValueError(
+                "mamba_context_mask_pool must be 'nearest' or 'adaptive_max', "
+                f"got {mamba_context_mask_pool!r}."
+            )
         self.loss_topk_ratio = loss_topk_ratio
         self.margin = margin
         self.image_score_topk_ratio = image_score_topk_ratio
         self.topk_beta = float(topk_beta)
+        self.image_score_mode = str(image_score_mode).lower()
+        if self.image_score_mode not in ("legacy", "evidence_mil", "pdar_image_head"):
+            raise ValueError(
+                "image_score_mode must be 'legacy', 'evidence_mil', or "
+                "'pdar_image_head', "
+                f"got {image_score_mode!r}."
+            )
+        self.pdar_image_pool_temperature = max(float(pdar_image_pool_temperature), 1e-6)
+        self.pdar_image_attention_detach = bool(pdar_image_attention_detach)
+        self.pdar_image_loss_weight = float(pdar_image_loss_weight)
         self.arcc_mamba_context_scale = float(arcc_mamba_context_scale)
+        self.arcc_inject_mamba = bool(arcc_inject_mamba)
+        self.arcc_mamba_fusion_mode = str(arcc_mamba_fusion_mode).lower()
+        if self.arcc_mamba_fusion_mode not in ("add", "concat"):
+            raise ValueError(
+                "arcc_mamba_fusion_mode must be 'add' or 'concat', "
+                f"got {arcc_mamba_fusion_mode!r}."
+            )
+        self.arcc_mamba_feature_source = str(arcc_mamba_feature_source).lower()
+        if self.arcc_mamba_feature_source not in ("context_tokens", "pdar_delta"):
+            raise ValueError(
+                "arcc_mamba_feature_source must be 'context_tokens' or 'pdar_delta', "
+                f"got {arcc_mamba_feature_source!r}."
+            )
+        self.arcc_mamba_support_guidance = bool(arcc_mamba_support_guidance)
+        self.arcc_mamba_support_detach = bool(arcc_mamba_support_detach)
+        self.arcc_mode = str(arcc_mode).lower()
+        if self.arcc_mode not in ("bidirectional", "mamba_veto"):
+            raise ValueError(
+                "arcc_mode must be 'bidirectional' or 'mamba_veto', "
+                f"got {arcc_mode!r}."
+            )
+        if self.arcc_mode == "mamba_veto" and not (self.use_arcc and self.use_mamba_context):
+            raise ValueError("arcc_mode='mamba_veto' requires use_arcc=True and use_mamba_context=True.")
+        if self.arcc_inject_mamba and not (self.use_arcc and self.use_mamba_context):
+            raise ValueError("arcc_inject_mamba=True requires use_arcc=True and use_mamba_context=True.")
+        if self.arcc_mamba_support_guidance and not (
+            self.use_arcc and self.use_mamba_context and self.arcc_mode == "mamba_veto"
+        ):
+            raise ValueError(
+                "arcc_mamba_support_guidance=True requires use_arcc=True, "
+                "use_mamba_context=True, and arcc_mode='mamba_veto'."
+            )
+        if self.image_score_mode == "evidence_mil" and self.arcc_mode != "mamba_veto":
+            raise ValueError("image_score_mode='evidence_mil' requires arcc_mode='mamba_veto'.")
+        if self.image_score_mode == "pdar_image_head" and not self.use_mamba_context:
+            raise ValueError("image_score_mode='pdar_image_head' requires use_mamba_context=True.")
+        self.mamba_veto_source = str(mamba_veto_source).lower()
+        if self.mamba_veto_source not in ("semantic", "prior"):
+            raise ValueError(
+                "mamba_veto_source must be 'semantic' or 'prior', "
+                f"got {mamba_veto_source!r}."
+            )
+        if self.mamba_veto_source == "prior" and not self.use_mamba_context:
+            raise ValueError("mamba_veto_source='prior' requires use_mamba_context=True.")
+        self.mamba_veto_temperature = max(float(mamba_veto_temperature), 1e-6)
+        self.mamba_veto_threshold = float(mamba_veto_threshold)
+        self.mamba_veto_detach = bool(mamba_veto_detach)
+        self.mamba_veto_enabled = bool(mamba_veto_enabled)
+        alpha_init = float(mamba_veto_alpha_init)
+        if not 0.0 < alpha_init < 1.0:
+            raise ValueError(f"mamba_veto_alpha_init must be within (0, 1), got {alpha_init}.")
+        if self.arcc_mode == "mamba_veto":
+            alpha_logit = math.log(alpha_init / (1.0 - alpha_init))
+            self.mamba_veto_alpha_logit = nn.Parameter(torch.tensor(alpha_logit))
+            self.stage = f"{self.stage}_mambaveto"
+        else:
+            self.register_parameter("mamba_veto_alpha_logit", None)
         self.arcc_lambda_override = None
         if arcc_lambda_override is not None:
             self.arcc_lambda_override = float(arcc_lambda_override)
@@ -227,6 +326,44 @@ class CLIPNormalityAD(nn.Module):
         self._text_cache = {}
 
         embed_dim = int(self.clip_model.text_projection.shape[1])
+        self.arcc_mamba_projection = None
+        self.arcc_mamba_fusion = None
+        if self.arcc_inject_mamba:
+            injection_init = float(arcc_mamba_injection_init)
+            if not 0.0 < injection_init < 1.0:
+                raise ValueError(
+                    "arcc_mamba_injection_init must be within (0, 1), "
+                    f"got {injection_init}."
+                )
+            if self.arcc_mamba_fusion_mode == "add":
+                self.arcc_mamba_projection = nn.Conv2d(
+                    embed_dim,
+                    embed_dim,
+                    kernel_size=1,
+                    bias=False,
+                )
+                nn.init.eye_(self.arcc_mamba_projection.weight[:, :, 0, 0])
+            else:
+                # Concatenation keeps the two sources distinguishable until a
+                # learned 1x1 projection decides how to mix their channels.
+                # [I, I] plus the bounded gamma below starts from the familiar
+                # CNN + gamma * PDAR correction without locking training to it.
+                self.arcc_mamba_fusion = nn.Conv2d(
+                    2 * embed_dim,
+                    embed_dim,
+                    kernel_size=1,
+                    bias=False,
+                )
+                with torch.no_grad():
+                    self.arcc_mamba_fusion.weight.zero_()
+                    fusion_weight = self.arcc_mamba_fusion.weight[:, :, 0, 0]
+                    nn.init.eye_(fusion_weight[:, :embed_dim])
+                    nn.init.eye_(fusion_weight[:, embed_dim:])
+            injection_logit = math.log(injection_init / (1.0 - injection_init))
+            self.arcc_mamba_injection_logit = nn.Parameter(torch.tensor(injection_logit))
+            self.stage = f"{self.stage}_jointarcc"
+        else:
+            self.register_parameter("arcc_mamba_injection_logit", None)
         adapter_kwargs = dict(adapter_kwargs or {})
         self.patch_adapter = None
         if self.adapter_type == "mlp":
@@ -274,12 +411,50 @@ class CLIPNormalityAD(nn.Module):
             self.arcc = ARCCCalibration(
                 embed_dim,
                 use_response=bool(arcc_kwargs.get("use_response", True)),
+                use_mamba_support=self.arcc_mamba_support_guidance,
                 use_foreground=bool(arcc_kwargs.get("use_foreground", False)),
                 use_edge=bool(arcc_kwargs.get("use_edge", False)),
                 kernel_size=int(arcc_kwargs.get("kernel_size", 3)),
                 hidden_dim=arcc_kwargs.get("hidden_dim", None),
                 lambda_init=float(arcc_kwargs.get("lambda_init", 0.1)),
             )
+
+        self.image_fusion_head = None
+        self.pdar_image_head = None
+        if self.image_score_mode == "evidence_mil":
+            # Evidence order: global, raw max/top1/top5, Mamba max/top1/top5.
+            self.image_fusion_head = nn.Linear(7, 1)
+            with torch.no_grad():
+                self.image_fusion_head.weight.zero_()
+                self.image_fusion_head.weight[0, 0] = 1.0
+                self.image_fusion_head.weight[0, 3] = 0.5
+                self.image_fusion_head.weight[0, 6] = 0.5
+                self.image_fusion_head.bias.zero_()
+            self.stage = f"{self.stage}_imagemil"
+        elif self.image_score_mode == "pdar_image_head":
+            hidden_dim = max(1, embed_dim // 4)
+            self.pdar_image_head = nn.Sequential(
+                nn.LayerNorm(2 * embed_dim),
+                nn.Linear(2 * embed_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Dropout(float(pdar_image_dropout)),
+                nn.Linear(hidden_dim, 1),
+            )
+            # The combined image score starts exactly from the V7 legacy path.
+            # The auxiliary BCE can train the zero-initialized head safely.
+            nn.init.zeros_(self.pdar_image_head[-1].weight)
+            nn.init.zeros_(self.pdar_image_head[-1].bias)
+            scale_init = float(pdar_image_scale_init)
+            if not 0.0 < scale_init < 1.0:
+                raise ValueError(
+                    "pdar_image_scale_init must be within (0, 1), "
+                    f"got {pdar_image_scale_init}."
+                )
+            scale_logit = math.log(scale_init / (1.0 - scale_init))
+            self.pdar_image_scale_logit = nn.Parameter(torch.tensor(scale_logit))
+            self.stage = f"{self.stage}_pdarimage"
+        else:
+            self.register_parameter("pdar_image_scale_logit", None)
 
         # Keeps the legacy training loop/optimizer usable while preserving a
         # true frozen-CLIP baseline. The parameter is multiplied by zero.
@@ -294,7 +469,23 @@ class CLIPNormalityAD(nn.Module):
             self.mamba_context.train(mode)
         if self.arcc is not None:
             self.arcc.train(mode)
+        if self.arcc_mamba_projection is not None:
+            self.arcc_mamba_projection.train(mode)
+        if self.arcc_mamba_fusion is not None:
+            self.arcc_mamba_fusion.train(mode)
+        if self.image_fusion_head is not None:
+            self.image_fusion_head.train(mode)
+        if self.pdar_image_head is not None:
+            self.pdar_image_head.train(mode)
         return self
+
+    @staticmethod
+    def _map_evidence(score_map):
+        return (
+            mean_topk_score(score_map, None),
+            mean_topk_score(score_map, 0.01),
+            mean_topk_score(score_map, 0.05),
+        )
 
     def _encode_prompt_group(self, prompts, device):
         tokens = self.tokenize(prompts).to(device)
@@ -382,27 +573,99 @@ class CLIPNormalityAD(nn.Module):
         grid_h, grid_w = self._grid_size()
         return tokens.transpose(1, 2).reshape(tokens.shape[0], tokens.shape[-1], grid_h, grid_w)
 
-    def _apply_arcc(self, tokens, raw_patch_map, raw_anomaly_map, image_shape, mamba_source_tokens=None):
+    def _apply_arcc(
+        self,
+        tokens,
+        raw_patch_map,
+        raw_anomaly_map,
+        image_shape,
+        protos,
+        mamba_source_tokens=None,
+    ):
         if self.arcc is None:
             return raw_anomaly_map, None, tokens
         context_tokens = tokens
         mamba_debug = {}
-        feature_map = self._tokens_to_feature_map(tokens)
+        mamba_tokens = None
+        cnn_feature_map = self._tokens_to_feature_map(tokens)
+        feature_map = cnn_feature_map
+        injection_gamma = None
+        mamba_semantic_patch = None
+        mamba_semantic_logits = None
+        mamba_verifier_logits = None
+        mamba_support_guidance = None
+        grid_h, grid_w = self._grid_size()
         if self.mamba_context is not None:
             mamba_source_tokens = tokens if mamba_source_tokens is None else mamba_source_tokens
             mamba_tokens, mamba_debug = self.mamba_context(
                 mamba_source_tokens,
                 self._grid_size(),
             )
-            mamba_feature_map = self._tokens_to_feature_map(mamba_tokens)
-            feature_map = feature_map + self.arcc_mamba_context_scale * mamba_feature_map
-            context_tokens = feature_map.flatten(2).transpose(1, 2).contiguous()
+            full_context_tokens = mamba_debug.pop(
+                "mamba_full_context_tokens",
+                mamba_tokens,
+            )
+            if self.arcc_mamba_feature_source == "pdar_delta":
+                normalized_context = F.layer_norm(
+                    full_context_tokens,
+                    (full_context_tokens.shape[-1],),
+                )
+                normalized_raw = F.layer_norm(
+                    mamba_source_tokens,
+                    (mamba_source_tokens.shape[-1],),
+                )
+                mamba_injection_tokens = normalized_context - normalized_raw
+            else:
+                mamba_injection_tokens = mamba_tokens
+            mamba_feature_map = self._tokens_to_feature_map(mamba_injection_tokens)
+            if self.arcc_inject_mamba:
+                injection_gamma = torch.sigmoid(self.arcc_mamba_injection_logit)
+                if self.arcc_mamba_fusion_mode == "concat":
+                    feature_map = self.arcc_mamba_fusion(
+                        torch.cat(
+                            (cnn_feature_map, injection_gamma * mamba_feature_map),
+                            dim=1,
+                        )
+                    )
+                else:
+                    projected_mamba = self.arcc_mamba_projection(mamba_feature_map)
+                    feature_map = cnn_feature_map + injection_gamma * projected_mamba
+                context_tokens = feature_map.flatten(2).transpose(1, 2).contiguous()
+            elif self.arcc_mode == "bidirectional":
+                feature_map = feature_map + self.arcc_mamba_context_scale * mamba_feature_map
+                context_tokens = feature_map.flatten(2).transpose(1, 2).contiguous()
+            else:
+                # The verifier stays independent of the external CNN adapter
+                # and is not injected back into ARCC's feature stream.
+                context_tokens = mamba_tokens
+
+            if self.arcc_mode == "mamba_veto":
+                mamba_semantic_patch, _ = abnormal_minus_normal(mamba_tokens, protos)
+                mamba_semantic_logits = mamba_semantic_patch.reshape(
+                    mamba_semantic_patch.shape[0], grid_h, grid_w
+                )
+                if self.mamba_veto_source == "prior":
+                    mamba_verifier_logits = mamba_debug["mamba_context_logits"]
+                else:
+                    mamba_verifier_logits = mamba_semantic_logits
+                if getattr(self, "arcc_mamba_support_guidance", False):
+                    mamba_support_guidance = torch.sigmoid(
+                        (mamba_verifier_logits - self.mamba_veto_threshold)
+                        / self.mamba_veto_temperature
+                    )
+                    if getattr(self, "arcc_mamba_support_detach", True):
+                        mamba_support_guidance = mamba_support_guidance.detach()
+
+        arcc_guidance_kwargs = {}
+        if mamba_support_guidance is not None:
+            arcc_guidance_kwargs["mamba_support"] = mamba_support_guidance
         g_cal, mod_mask = self.arcc(
             feature_map,
             raw_patch_map,
             foreground=None,
             edge=None,
             image_shape=image_shape,
+            **arcc_guidance_kwargs,
         )
         learned_arcc_lambda = torch.clamp(self.arcc_lambda, min=0.0, max=2.0)
         if self.arcc_lambda_override is None:
@@ -410,15 +673,99 @@ class CLIPNormalityAD(nn.Module):
         else:
             # Diagnostic ablation only: 0 makes A_final exactly equal A_raw.
             arcc_lambda = learned_arcc_lambda.new_tensor(self.arcc_lambda_override)
-        final_map = raw_anomaly_map + arcc_lambda * raw_anomaly_map * torch.tanh(g_cal)
-        return final_map, {
+        bidirectional_map = raw_anomaly_map + arcc_lambda * raw_anomaly_map * torch.tanh(g_cal)
+        debug = {
             "G_cal": g_cal,
             "arcc_mod_mask": mod_mask,
             "arcc_lambda": arcc_lambda,
             "arcc_lambda_learned": learned_arcc_lambda,
+            "arcc_bidirectional_map": bidirectional_map,
             "mamba_context_tokens": context_tokens,
             **mamba_debug,
-        }, context_tokens
+        }
+        if self.pdar_image_head is not None:
+            # Consumed and removed by forward(); never exported as a full
+            # per-image tensor by the evaluator.
+            debug["_pdar_image_tokens"] = full_context_tokens
+        if injection_gamma is not None:
+            debug["arcc_mamba_injection_gamma"] = injection_gamma
+        if mamba_support_guidance is not None:
+            debug["arcc_mamba_support_guidance"] = mamba_support_guidance
+        if self.arcc_mode == "bidirectional":
+            return bidirectional_map, debug, context_tokens
+
+        mamba_semantic_map = upsample_patch_map(
+            mamba_semantic_patch,
+            grid_size=(grid_h, grid_w),
+            image_shape=image_shape,
+        )
+        if self.mamba_veto_source == "prior":
+            mamba_verifier_patch = mamba_verifier_logits.flatten(1)
+            mamba_verifier_map = upsample_patch_map(
+                mamba_verifier_patch,
+                grid_size=(grid_h, grid_w),
+                image_shape=image_shape,
+            )
+        else:
+            mamba_verifier_logits = mamba_semantic_logits
+            mamba_verifier_map = mamba_semantic_map
+        mamba_support = torch.sigmoid(
+            (mamba_verifier_map - self.mamba_veto_threshold)
+            / self.mamba_veto_temperature
+        )
+        if getattr(self, "mamba_veto_enabled", True):
+            veto_support = mamba_support.detach() if self.mamba_veto_detach else mamba_support
+            veto_alpha = torch.sigmoid(self.mamba_veto_alpha_logit)
+            final_map, suppressed_map, veto_map = apply_mamba_probability_veto(
+                raw_anomaly_map,
+                bidirectional_map,
+                veto_support,
+                veto_alpha,
+            )
+        else:
+            # ARCC-only ablation: retain exactly the same Mamba evidence and
+            # support guidance used by evidence-MIL, but do not apply the
+            # no-amplification clamp or the post-ARCC probability veto.
+            final_map = bidirectional_map
+            suppressed_map = bidirectional_map
+            veto_map = torch.zeros_like(bidirectional_map)
+            veto_alpha = bidirectional_map.new_zeros(())
+        debug.update(
+            {
+                "arcc_suppressed_map": suppressed_map,
+                "mamba_semantic_logits": mamba_semantic_logits,
+                "mamba_semantic_map": mamba_semantic_map,
+                "mamba_verifier_logits": mamba_verifier_logits,
+                "mamba_verifier_map": mamba_verifier_map,
+                "mamba_support_map": mamba_support,
+                "mamba_veto_map": veto_map,
+                "mamba_veto_alpha": veto_alpha,
+            }
+        )
+        if self.arcc_inject_mamba and not self.training:
+            # Evaluation-only counterfactual: reuse the exact ARCC and veto
+            # weights, but remove Mamba feature injection from ARCC's input.
+            # This isolates the contribution of the joint feature stream.
+            cnn_only_g_cal, _ = self.arcc(
+                cnn_feature_map,
+                raw_patch_map,
+                foreground=None,
+                edge=None,
+                image_shape=image_shape,
+                **arcc_guidance_kwargs,
+            )
+            cnn_only_bidirectional = (
+                raw_anomaly_map
+                + arcc_lambda * raw_anomaly_map * torch.tanh(cnn_only_g_cal)
+            )
+            cnn_only_final, _, _ = apply_mamba_probability_veto(
+                raw_anomaly_map,
+                cnn_only_bidirectional,
+                veto_support,
+                veto_alpha,
+            )
+            debug["arcc_cnn_only_final_map"] = cnn_only_final
+        return final_map, debug, context_tokens
 
     def _dice_loss(self, logits, targets):
         probs = torch.sigmoid(logits)
@@ -481,11 +828,11 @@ class CLIPNormalityAD(nn.Module):
 
     def _mamba_context_losses(self, context_logits, masks):
         targets = masks.to(device=context_logits.device, dtype=context_logits.dtype)
-        if targets.ndim == 3:
-            targets = targets.unsqueeze(1)
-        if targets.shape[-2:] != context_logits.shape[-2:]:
-            targets = F.interpolate(targets, size=context_logits.shape[-2:], mode="nearest")
-        targets = targets.clamp(0.0, 1.0)
+        targets = resize_mamba_patch_targets(
+            targets,
+            output_size=context_logits.shape[-2:],
+            mode=self.mamba_context_mask_pool,
+        )
         logits = context_logits.unsqueeze(1) / self.supervised_score_temperature
         loss_bce = F.binary_cross_entropy_with_logits(logits, targets)
         loss_dice = self._dice_loss(logits, targets)
@@ -496,12 +843,48 @@ class CLIPNormalityAD(nn.Module):
         )
         return loss_bce, loss_dice, loss_outside
 
+    def _mamba_context_separation_loss(self, context_logits, masks):
+        """Require positive-mask logits to exceed the hardest outside logits."""
+        targets = masks.to(device=context_logits.device, dtype=context_logits.dtype)
+        targets = resize_mamba_patch_targets(
+            targets,
+            output_size=context_logits.shape[-2:],
+            mode=self.mamba_context_mask_pool,
+        ).squeeze(1)
+        losses = []
+        for logits_per_image, target_per_image in zip(context_logits, targets):
+            inside = target_per_image > 0.5
+            outside = ~inside
+            if not inside.any() or not outside.any():
+                continue
+            inside_mean = logits_per_image[inside].mean()
+            outside_values = logits_per_image[outside]
+            if self.mamba_context_outside_topk_ratio is None:
+                outside_topk = outside_values.max()
+            else:
+                topk = max(
+                    1,
+                    int(outside_values.numel() * float(self.mamba_context_outside_topk_ratio)),
+                )
+                outside_topk = outside_values.topk(topk).values.mean()
+            losses.append(
+                F.relu(
+                    self.mamba_context_separation_margin
+                    + outside_topk
+                    - inside_mean
+                )
+            )
+        if not losses:
+            return context_logits.new_zeros(())
+        return torch.stack(losses).mean()
+
     def _adapter_losses(
         self,
         raw_patch,
         refined_patch,
         patch_score,
         image_score,
+        pdar_image_logit=None,
         anomaly_map=None,
         raw_anomaly_map=None,
         arcc_debug=None,
@@ -522,9 +905,15 @@ class CLIPNormalityAD(nn.Module):
         loss_consistency = 1.0 - torch.sum(refined_norm * raw_norm, dim=-1).mean()
         image_target = torch.zeros_like(image_score)
         loss_image_supervised = image_score.new_zeros(())
+        loss_pdar_image = image_score.new_zeros(())
         if self.use_supervised_masks and labels is not None:
             image_target = labels.to(device=image_score.device, dtype=image_score.dtype).view_as(image_score)
             loss_image_supervised = F.binary_cross_entropy_with_logits(image_score, image_target)
+            if pdar_image_logit is not None:
+                loss_pdar_image = F.binary_cross_entropy_with_logits(
+                    pdar_image_logit,
+                    image_target,
+                )
         loss_image_normal = F.binary_cross_entropy_with_logits(image_score, image_target)
         loss_arcc_normal = image_score.new_zeros(())
         loss_arcc_cal = image_score.new_zeros(())
@@ -547,6 +936,7 @@ class CLIPNormalityAD(nn.Module):
         loss_mamba_context_bce = image_score.new_zeros(())
         loss_mamba_context_dice = image_score.new_zeros(())
         loss_mamba_context_outside_topk = image_score.new_zeros(())
+        loss_mamba_context_separation = image_score.new_zeros(())
         if self.use_supervised_masks and masks is not None and anomaly_map is not None and raw_anomaly_map is not None:
             loss_mask_bce, loss_mask_dice, loss_mask_raw_bce = self._supervised_mask_losses(
                 anomaly_map,
@@ -559,18 +949,24 @@ class CLIPNormalityAD(nn.Module):
             self.use_supervised_masks
             and masks is not None
             and arcc_debug is not None
-            and "mamba_context_logits" in arcc_debug
+            and "mamba_verifier_logits" in arcc_debug
             and (
                 self.mamba_context_bce_weight > 0
                 or self.mamba_context_dice_weight > 0
                 or self.mamba_context_outside_topk_weight > 0
+                or self.mamba_context_separation_weight > 0
             )
         ):
             (
                 loss_mamba_context_bce,
                 loss_mamba_context_dice,
                 loss_mamba_context_outside_topk,
-            ) = self._mamba_context_losses(arcc_debug["mamba_context_logits"], masks)
+            ) = self._mamba_context_losses(arcc_debug["mamba_verifier_logits"], masks)
+            if self.mamba_context_separation_weight > 0:
+                loss_mamba_context_separation = self._mamba_context_separation_loss(
+                    arcc_debug["mamba_verifier_logits"],
+                    masks,
+                )
         total = (
             self.loss_normal_topk_weight * loss_normal_topk
             + self.loss_consistency_weight * loss_consistency
@@ -582,9 +978,11 @@ class CLIPNormalityAD(nn.Module):
             + self.supervised_raw_bce_weight * loss_mask_raw_bce
             + self.supervised_outside_topk_weight * loss_outside_topk
             + self.supervised_image_weight * loss_image_supervised
+            + self.pdar_image_loss_weight * loss_pdar_image
             + self.mamba_context_bce_weight * loss_mamba_context_bce
             + self.mamba_context_dice_weight * loss_mamba_context_dice
             + self.mamba_context_outside_topk_weight * loss_mamba_context_outside_topk
+            + self.mamba_context_separation_weight * loss_mamba_context_separation
         )
         return {
             "loss_normal_topk": loss_normal_topk,
@@ -597,9 +995,11 @@ class CLIPNormalityAD(nn.Module):
             "loss_mask_raw_bce": loss_mask_raw_bce,
             "loss_outside_topk": loss_outside_topk,
             "loss_image_supervised": loss_image_supervised,
+            "loss_pdar_image": loss_pdar_image,
             "loss_mamba_context_bce": loss_mamba_context_bce,
             "loss_mamba_context_dice": loss_mamba_context_dice,
             "loss_mamba_context_outside_topk": loss_mamba_context_outside_topk,
+            "loss_mamba_context_separation": loss_mamba_context_separation,
             "loss_patch": loss_normal_topk,
             "total": total,
             "loss_total": total,
@@ -744,6 +1144,36 @@ class CLIPNormalityAD(nn.Module):
 
                 debug["dbg_raw_mask_gap"] = selected_mean(mask_gap(raw_scores), positive_mask)
                 debug["dbg_final_mask_gap"] = selected_mean(mask_gap(final_scores), positive_mask)
+                if arcc_debug is not None and "arcc_cnn_only_final_map" in arcc_debug:
+                    cnn_only_scores = arcc_debug["arcc_cnn_only_final_map"].detach()
+                    joint_minus_cnn = final_scores - cnn_only_scores
+                    cnn_only_max = cnn_only_scores.flatten(1).amax(dim=1)
+                    joint_max = final_scores.flatten(1).amax(dim=1)
+                    max_delta = joint_max - cnn_only_max
+                    debug["dbg_joint_vs_cnn_max_normal"] = selected_mean(
+                        max_delta,
+                        normal_images,
+                    )
+                    debug["dbg_joint_vs_cnn_max_abnormal"] = selected_mean(
+                        max_delta,
+                        abnormal_images,
+                    )
+                    inside_delta = (
+                        (joint_minus_cnn * binary_target).flatten(1).sum(dim=1)
+                        / inside_count
+                    )
+                    outside_delta = (
+                        (joint_minus_cnn * outside_target).flatten(1).sum(dim=1)
+                        / outside_count
+                    )
+                    debug["dbg_joint_vs_cnn_mask_in"] = selected_mean(
+                        inside_delta,
+                        positive_mask,
+                    )
+                    debug["dbg_joint_vs_cnn_mask_out"] = selected_mean(
+                        outside_delta,
+                        positive_mask,
+                    )
                 debug["dbg_batch_normal_count"] = normal_images.float().sum()
                 debug["dbg_batch_abnormal_count"] = abnormal_images.float().sum()
                 debug["dbg_batch_positive_mask_count"] = positive_mask.float().sum()
@@ -753,6 +1183,76 @@ class CLIPNormalityAD(nn.Module):
                     "arcc_lambda_learned"
                 ].detach()
                 debug["dbg_g_cal_abs"] = arcc_debug["G_cal"].detach().abs().mean()
+                if "arcc_mamba_injection_gamma" in arcc_debug:
+                    debug["dbg_arcc_mamba_injection_gamma"] = arcc_debug[
+                        "arcc_mamba_injection_gamma"
+                    ].detach()
+                if "arcc_mamba_support_guidance" in arcc_debug:
+                    debug["dbg_arcc_mamba_support_guidance_mean"] = arcc_debug[
+                        "arcc_mamba_support_guidance"
+                    ].detach().mean()
+                if "mamba_semantic_map" in arcc_debug:
+                    semantic_map = arcc_debug["mamba_semantic_map"].detach()
+                    verifier_map = arcc_debug["mamba_verifier_map"].detach()
+                    support_map = arcc_debug["mamba_support_map"].detach()
+                    veto_map = arcc_debug["mamba_veto_map"].detach()
+                    debug["dbg_mamba_semantic_mean"] = semantic_map.mean()
+                    debug["dbg_mamba_semantic_max"] = semantic_map.amax()
+                    debug["dbg_mamba_verifier_mean"] = verifier_map.mean()
+                    debug["dbg_mamba_verifier_max"] = verifier_map.amax()
+                    debug["dbg_mamba_support_mean"] = support_map.mean()
+                    debug["dbg_mamba_veto_mean"] = veto_map.mean()
+                    debug["dbg_mamba_veto_alpha"] = arcc_debug[
+                        "mamba_veto_alpha"
+                    ].detach()
+                    debug["dbg_mamba_veto_max_gain"] = (
+                        anomaly_map.detach() - raw_anomaly_map.detach()
+                    ).amax()
+                    if masks is not None:
+                        veto_target = masks.to(
+                            device=support_map.device,
+                            dtype=support_map.dtype,
+                        )
+                        if veto_target.ndim == 4:
+                            veto_target = veto_target.squeeze(1)
+                        if veto_target.shape[-2:] != support_map.shape[-2:]:
+                            veto_target = F.interpolate(
+                                veto_target.unsqueeze(1),
+                                size=support_map.shape[-2:],
+                                mode="nearest",
+                            ).squeeze(1)
+                        veto_positive = (veto_target.flatten(1) > 0.5).any(dim=1)
+                        if labels is not None:
+                            veto_normal = labels.to(device=support_map.device).view(-1) == 0
+                        else:
+                            veto_normal = ~veto_positive
+
+                        def selected_region_mean(values, selection):
+                            return values[selection].mean() if selection.any() else values.new_zeros(())
+
+                        debug["dbg_mamba_support_normal"] = selected_region_mean(
+                            support_map.flatten(1).mean(dim=1), veto_normal
+                        )
+                        debug["dbg_mamba_veto_normal"] = selected_region_mean(
+                            veto_map.flatten(1).mean(dim=1), veto_normal
+                        )
+                        inside_mask = veto_target > 0.5
+                        outside_mask = ~inside_mask
+                        inside_count = inside_mask.flatten(1).sum(dim=1).clamp_min(1)
+                        outside_count = outside_mask.flatten(1).sum(dim=1).clamp_min(1)
+                        for name, values in (("support", support_map), ("veto", veto_map)):
+                            inside_mean = (
+                                (values * inside_mask).flatten(1).sum(dim=1) / inside_count
+                            )
+                            outside_mean = (
+                                (values * outside_mask).flatten(1).sum(dim=1) / outside_count
+                            )
+                            debug[f"dbg_mamba_{name}_mask_in"] = selected_region_mean(
+                                inside_mean, veto_positive
+                            )
+                            debug[f"dbg_mamba_{name}_mask_out"] = selected_region_mean(
+                                outside_mean, veto_positive
+                            )
                 if "mamba_global_prior" in arcc_debug:
                     prior = arcc_debug["mamba_global_prior"].detach()
                     debug["dbg_mamba_prior_mean"] = prior.mean()
@@ -841,13 +1341,63 @@ class CLIPNormalityAD(nn.Module):
             s_text_map,
             raw_anomaly_map,
             image_shape=(imgs.shape[2], imgs.shape[3]),
+            protos=protos,
             mamba_source_tokens=raw_patch_feat,
         )
+        pdar_image_tokens = None
+        if arcc_debug is not None:
+            pdar_image_tokens = arcc_debug.pop("_pdar_image_tokens", None)
         topk_score = mean_topk_score(anomaly_map, self.image_score_topk_ratio)
-        image_score = s_global + self.topk_beta * topk_score
-        topk_score_max = mean_topk_score(anomaly_map, None)
-        topk_score_top1 = mean_topk_score(anomaly_map, 0.01)
-        topk_score_top5 = mean_topk_score(anomaly_map, 0.05)
+        topk_score_max, topk_score_top1, topk_score_top5 = self._map_evidence(anomaly_map)
+        raw_score_max, raw_score_top1, raw_score_top5 = self._map_evidence(raw_anomaly_map)
+        if arcc_debug is not None and "mamba_verifier_logits" in arcc_debug:
+            mamba_score_max, mamba_score_top1, mamba_score_top5 = self._map_evidence(
+                arcc_debug["mamba_verifier_logits"]
+            )
+        else:
+            mamba_score_max = s_global.new_zeros(s_global.shape)
+            mamba_score_top1 = s_global.new_zeros(s_global.shape)
+            mamba_score_top5 = s_global.new_zeros(s_global.shape)
+        image_evidence = torch.stack(
+            (
+                s_global,
+                raw_score_max,
+                raw_score_top1,
+                raw_score_top5,
+                mamba_score_max,
+                mamba_score_top1,
+                mamba_score_top5,
+            ),
+            dim=1,
+        )
+        legacy_image_score = s_global + self.topk_beta * topk_score
+        pdar_image_logit = None
+        pdar_image_scale = s_global.new_zeros(())
+        pdar_pool_entropy = s_global.new_zeros(())
+        if self.pdar_image_head is not None:
+            if pdar_image_tokens is None or arcc_debug is None:
+                raise RuntimeError("PDAR image head requires full PDAR tokens and ARCC diagnostics.")
+            verifier_logits = arcc_debug["mamba_verifier_logits"].flatten(1)
+            attention_logits = verifier_logits / self.pdar_image_pool_temperature
+            if self.pdar_image_attention_detach:
+                attention_logits = attention_logits.detach()
+            attention = torch.softmax(attention_logits, dim=1)
+            pdar_mean = pdar_image_tokens.mean(dim=1)
+            pdar_suspicious = torch.sum(
+                attention.unsqueeze(-1) * pdar_image_tokens,
+                dim=1,
+            )
+            pdar_image_feature = torch.cat((pdar_mean, pdar_suspicious), dim=-1)
+            pdar_image_logit = self.pdar_image_head(pdar_image_feature).squeeze(1)
+            pdar_image_scale = torch.sigmoid(self.pdar_image_scale_logit)
+            image_score = legacy_image_score + pdar_image_scale * pdar_image_logit
+            pdar_pool_entropy = -(
+                attention * attention.clamp_min(1e-8).log()
+            ).sum(dim=1).mean()
+        elif self.image_fusion_head is not None:
+            image_score = self.image_fusion_head(image_evidence).squeeze(1)
+        else:
+            image_score = legacy_image_score
         image_score_variants = {
             "topk_score_max": topk_score_max,
             "topk_score_top1": topk_score_top1,
@@ -856,6 +1406,37 @@ class CLIPNormalityAD(nn.Module):
             "image_score_top1": s_global + self.topk_beta * topk_score_top1,
             "image_score_top5": s_global + self.topk_beta * topk_score_top5,
         }
+        image_component_scores = {
+            "raw_score_max": raw_score_max,
+            "raw_score_top1": raw_score_top1,
+            "raw_score_top5": raw_score_top5,
+            "mamba_score_max": mamba_score_max,
+            "mamba_score_top1": mamba_score_top1,
+            "mamba_score_top5": mamba_score_top5,
+            "image_score_raw_top5": s_global + self.topk_beta * raw_score_top5,
+            "image_score_mamba_top5": s_global + self.topk_beta * mamba_score_top5,
+            "image_evidence": image_evidence,
+            "image_score_legacy": legacy_image_score,
+        }
+        if pdar_image_logit is not None:
+            image_component_scores["image_score_pdar_only"] = pdar_image_logit
+        if arcc_debug is not None and "arcc_cnn_only_final_map" in arcc_debug:
+            cnn_only_score_max = mean_topk_score(
+                arcc_debug["arcc_cnn_only_final_map"],
+                None,
+            )
+            image_component_scores["image_score_cnn_only"] = (
+                s_global + self.topk_beta * cnn_only_score_max
+            )
+        image_fusion_debug = {}
+        if self.image_fusion_head is not None:
+            weight_names = (
+                "global", "raw_max", "raw_top1", "raw_top5",
+                "mamba_max", "mamba_top1", "mamba_top5",
+            )
+            for name, weight in zip(weight_names, self.image_fusion_head.weight[0]):
+                image_fusion_debug[f"dbg_image_fusion_w_{name}"] = weight
+            image_fusion_debug["dbg_image_fusion_bias"] = self.image_fusion_head.bias[0]
 
         out = {
             "S_global": s_global,
@@ -866,6 +1447,15 @@ class CLIPNormalityAD(nn.Module):
             "topk_score": topk_score,
             "image_score": image_score,
             **image_score_variants,
+            **image_component_scores,
+            **image_fusion_debug,
+            "dbg_pdar_image_score_mean": (
+                pdar_image_logit.mean()
+                if pdar_image_logit is not None
+                else s_global.new_zeros(())
+            ),
+            "dbg_pdar_image_scale": pdar_image_scale,
+            "dbg_pdar_pool_entropy": pdar_pool_entropy,
             "anomaly_map": anomaly_map,
             "global_sim": global_sim,
             "patch_sim": patch_sim,
@@ -907,6 +1497,7 @@ class CLIPNormalityAD(nn.Module):
                     refined_patch_feat,
                     s_text_patch,
                     image_score,
+                    pdar_image_logit=pdar_image_logit,
                     anomaly_map=anomaly_map,
                     raw_anomaly_map=raw_anomaly_map,
                     arcc_debug=arcc_debug,

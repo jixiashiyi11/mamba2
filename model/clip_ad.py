@@ -86,6 +86,10 @@ class CLIPNormalityAD(nn.Module):
         mamba_context_outside_topk_ratio=0.01,
         mamba_context_separation_weight=0.0,
         mamba_context_separation_margin=0.2,
+        mamba_feature_contrast_target_weight=0.0,
+        mamba_feature_contrast_warmup_epochs=0,
+        mamba_feature_contrast_temperature=0.1,
+        mamba_feature_contrast_hard_negative_ratio=0.05,
         mamba_context_mask_pool="nearest",
         loss_topk_ratio=0.01,
         surgery_until_layer=None,
@@ -94,6 +98,14 @@ class CLIPNormalityAD(nn.Module):
         image_score_topk_ratio=0.01,
         topk_beta=0.5,
         image_score_mode="legacy",
+        image_reviewer_raw_temperature=1.0,
+        image_reviewer_topk_ratio=0.05,
+        image_reviewer_weight_init=(1.0, 0.5, 0.5, 0.5),
+        image_relative_reviewer_margin=0.01,
+        image_relative_reviewer_max_scale=0.3,
+        image_relative_reviewer_scale_init=0.05,
+        image_relative_reviewer_base_weight_init=(1.0, 1e-4, 1e-4, 0.5),
+        image_relative_reviewer_detach_mamba=True,
         pdar_image_pool_temperature=2.0,
         pdar_image_scale_init=0.1,
         pdar_image_dropout=0.1,
@@ -107,6 +119,7 @@ class CLIPNormalityAD(nn.Module):
         arcc_mamba_support_guidance=False,
         arcc_mamba_support_detach=True,
         arcc_lambda_override=None,
+        arcc_variant="deformable",
         arcc_mode="bidirectional",
         mamba_veto_source="semantic",
         mamba_veto_alpha_init=0.1,
@@ -226,6 +239,28 @@ class CLIPNormalityAD(nn.Module):
         self.mamba_context_outside_topk_ratio = mamba_context_outside_topk_ratio
         self.mamba_context_separation_weight = float(mamba_context_separation_weight)
         self.mamba_context_separation_margin = float(mamba_context_separation_margin)
+        self.mamba_feature_contrast_target_weight = float(
+            mamba_feature_contrast_target_weight
+        )
+        self.mamba_feature_contrast_warmup_epochs = int(
+            mamba_feature_contrast_warmup_epochs
+        )
+        self.mamba_feature_contrast_temperature = float(
+            mamba_feature_contrast_temperature
+        )
+        self.mamba_feature_contrast_hard_negative_ratio = float(
+            mamba_feature_contrast_hard_negative_ratio
+        )
+        if self.mamba_feature_contrast_target_weight < 0.0:
+            raise ValueError("mamba_feature_contrast_target_weight must be non-negative.")
+        if self.mamba_feature_contrast_warmup_epochs < 0:
+            raise ValueError("mamba_feature_contrast_warmup_epochs must be non-negative.")
+        if self.mamba_feature_contrast_temperature <= 0.0:
+            raise ValueError("mamba_feature_contrast_temperature must be positive.")
+        if not 0.0 < self.mamba_feature_contrast_hard_negative_ratio <= 1.0:
+            raise ValueError(
+                "mamba_feature_contrast_hard_negative_ratio must be in (0, 1]."
+            )
         self.mamba_context_mask_pool = str(mamba_context_mask_pool).lower()
         if self.mamba_context_mask_pool not in ("nearest", "adaptive_max"):
             raise ValueError(
@@ -237,11 +272,75 @@ class CLIPNormalityAD(nn.Module):
         self.image_score_topk_ratio = image_score_topk_ratio
         self.topk_beta = float(topk_beta)
         self.image_score_mode = str(image_score_mode).lower()
-        if self.image_score_mode not in ("legacy", "evidence_mil", "pdar_image_head"):
+        if self.image_score_mode not in (
+            "legacy",
+            "evidence_mil",
+            "reviewer_mil",
+            "relative_reviewer_mil",
+            "pdar_image_head",
+        ):
             raise ValueError(
-                "image_score_mode must be 'legacy', 'evidence_mil', or "
+                "image_score_mode must be 'legacy', 'evidence_mil', "
+                "'reviewer_mil', 'relative_reviewer_mil', or "
                 "'pdar_image_head', "
                 f"got {image_score_mode!r}."
+            )
+        self.image_reviewer_raw_temperature = float(
+            image_reviewer_raw_temperature
+        )
+        self.image_reviewer_topk_ratio = image_reviewer_topk_ratio
+        if self.image_reviewer_raw_temperature <= 0.0:
+            raise ValueError("image_reviewer_raw_temperature must be positive.")
+        if not 0.0 < float(self.image_reviewer_topk_ratio) <= 1.0:
+            raise ValueError("image_reviewer_topk_ratio must be in (0, 1].")
+        self.image_reviewer_weight_init = tuple(
+            float(value) for value in image_reviewer_weight_init
+        )
+        if len(self.image_reviewer_weight_init) != 4:
+            raise ValueError(
+                "image_reviewer_weight_init must contain wg, wr, wa, and wd."
+            )
+        if any(value <= 0.0 for value in self.image_reviewer_weight_init):
+            raise ValueError("All image reviewer initial weights must be positive.")
+        self.image_relative_reviewer_margin = float(
+            image_relative_reviewer_margin
+        )
+        self.image_relative_reviewer_max_scale = float(
+            image_relative_reviewer_max_scale
+        )
+        self.image_relative_reviewer_scale_init = float(
+            image_relative_reviewer_scale_init
+        )
+        self.image_relative_reviewer_base_weight_init = tuple(
+            float(value) for value in image_relative_reviewer_base_weight_init
+        )
+        self.image_relative_reviewer_detach_mamba = bool(
+            image_relative_reviewer_detach_mamba
+        )
+        if self.image_relative_reviewer_margin < 0.0:
+            raise ValueError("image_relative_reviewer_margin must be non-negative.")
+        if self.image_relative_reviewer_max_scale <= 0.0:
+            raise ValueError("image_relative_reviewer_max_scale must be positive.")
+        if not (
+            0.0
+            < self.image_relative_reviewer_scale_init
+            < self.image_relative_reviewer_max_scale
+        ):
+            raise ValueError(
+                "image_relative_reviewer_scale_init must be in "
+                "(0, image_relative_reviewer_max_scale)."
+            )
+        if len(self.image_relative_reviewer_base_weight_init) != 4:
+            raise ValueError(
+                "image_relative_reviewer_base_weight_init must contain weights "
+                "for global, raw max, raw top1, and raw top5 evidence."
+            )
+        if any(
+            value <= 0.0
+            for value in self.image_relative_reviewer_base_weight_init
+        ):
+            raise ValueError(
+                "All relative reviewer base weights must be positive."
             )
         self.pdar_image_pool_temperature = max(float(pdar_image_pool_temperature), 1e-6)
         self.pdar_image_attention_detach = bool(pdar_image_attention_detach)
@@ -262,6 +361,21 @@ class CLIPNormalityAD(nn.Module):
             )
         self.arcc_mamba_support_guidance = bool(arcc_mamba_support_guidance)
         self.arcc_mamba_support_detach = bool(arcc_mamba_support_detach)
+        self.arcc_variant = str(arcc_variant).lower()
+        if self.arcc_variant not in ("deformable", "pgsam_iterative"):
+            raise ValueError(
+                "arcc_variant must be 'deformable' or 'pgsam_iterative', "
+                f"got {arcc_variant!r}."
+            )
+        if self.mamba_feature_contrast_target_weight > 0 and not (
+            self.use_supervised_masks
+            and self.use_mamba_context
+            and self.arcc_variant == "pgsam_iterative"
+        ):
+            raise ValueError(
+                "Mamba feature contrast requires supervised masks, Mamba context, "
+                "and arcc_variant='pgsam_iterative'."
+            )
         self.arcc_mode = str(arcc_mode).lower()
         if self.arcc_mode not in ("bidirectional", "mamba_veto"):
             raise ValueError(
@@ -279,8 +393,31 @@ class CLIPNormalityAD(nn.Module):
                 "arcc_mamba_support_guidance=True requires use_arcc=True, "
                 "use_mamba_context=True, and arcc_mode='mamba_veto'."
             )
-        if self.image_score_mode == "evidence_mil" and self.arcc_mode != "mamba_veto":
-            raise ValueError("image_score_mode='evidence_mil' requires arcc_mode='mamba_veto'.")
+        if self.arcc_variant == "pgsam_iterative" and not (
+            self.use_arcc and self.use_mamba_context and self.arcc_mode == "mamba_veto"
+        ):
+            raise ValueError(
+                "arcc_variant='pgsam_iterative' requires use_arcc=True, "
+                "use_mamba_context=True, and arcc_mode='mamba_veto'."
+            )
+        if self.arcc_variant == "pgsam_iterative" and (
+            self.arcc_inject_mamba or self.arcc_mamba_support_guidance
+        ):
+            raise ValueError(
+                "PGSAM iterative ARCC requires legacy arcc_inject_mamba and "
+                "arcc_mamba_support_guidance to remain False."
+            )
+        if self.image_score_mode in (
+            "evidence_mil",
+            "reviewer_mil",
+            "relative_reviewer_mil",
+        ) and (
+            self.arcc_mode != "mamba_veto"
+        ):
+            raise ValueError(
+                f"image_score_mode={self.image_score_mode!r} requires "
+                "arcc_mode='mamba_veto'."
+            )
         if self.image_score_mode == "pdar_image_head" and not self.use_mamba_context:
             raise ValueError("image_score_mode='pdar_image_head' requires use_mamba_context=True.")
         self.mamba_veto_source = str(mamba_veto_source).lower()
@@ -404,22 +541,61 @@ class CLIPNormalityAD(nn.Module):
         self.arcc = None
         self.arcc_lambda = None
         if self.use_arcc:
-            from model.mambaad import ARCCCalibration
-
             arcc_kwargs = dict(arcc_kwargs or {})
-            self.arcc_lambda = nn.Parameter(torch.tensor(float(arcc_kwargs.get("lambda_init", 0.1))))
-            self.arcc = ARCCCalibration(
-                embed_dim,
-                use_response=bool(arcc_kwargs.get("use_response", True)),
-                use_mamba_support=self.arcc_mamba_support_guidance,
-                use_foreground=bool(arcc_kwargs.get("use_foreground", False)),
-                use_edge=bool(arcc_kwargs.get("use_edge", False)),
-                kernel_size=int(arcc_kwargs.get("kernel_size", 3)),
-                hidden_dim=arcc_kwargs.get("hidden_dim", None),
-                lambda_init=float(arcc_kwargs.get("lambda_init", 0.1)),
-            )
+            if self.arcc_variant == "pgsam_iterative":
+                from model.mambaad import PGSAMIterativeARCC
+
+                self.arcc = PGSAMIterativeARCC(
+                    embed_dim,
+                    cross_dim=int(arcc_kwargs.get("cross_dim", 128)),
+                    num_heads=int(arcc_kwargs.get("num_heads", 4)),
+                    num_refine_steps=int(arcc_kwargs.get("num_refine_steps", 2)),
+                    gate_hidden_dim=int(arcc_kwargs.get("gate_hidden_dim", 64)),
+                    gamma_init=float(arcc_kwargs.get("gamma_init", 0.05)),
+                    rho_init=float(arcc_kwargs.get("rho_init", 0.1)),
+                    rho_max=float(arcc_kwargs.get("rho_max", 0.5)),
+                    eps=float(arcc_kwargs.get("eps", 1e-6)),
+                    arcc_context_mode=str(
+                        arcc_kwargs.get("arcc_context_mode", "real")
+                    ),
+                    normalize_cross_features=bool(
+                        arcc_kwargs.get("normalize_cross_features", False)
+                    ),
+                    cross_norm_eps=float(
+                        arcc_kwargs.get("cross_norm_eps", 1e-6)
+                    ),
+                    use_context_gate=bool(
+                        arcc_kwargs.get("use_context_gate", True)
+                    ),
+                    use_dynamic_gate=bool(
+                        arcc_kwargs.get("use_dynamic_gate", True)
+                    ),
+                )
+                self.stage = f"{self.stage}_pgsamiterative"
+            else:
+                from model.mambaad import ARCCCalibration
+
+                self.arcc_lambda = nn.Parameter(
+                    torch.tensor(float(arcc_kwargs.get("lambda_init", 0.1)))
+                )
+                self.arcc = ARCCCalibration(
+                    embed_dim,
+                    use_response=bool(arcc_kwargs.get("use_response", True)),
+                    use_mamba_support=self.arcc_mamba_support_guidance,
+                    use_foreground=bool(arcc_kwargs.get("use_foreground", False)),
+                    use_edge=bool(arcc_kwargs.get("use_edge", False)),
+                    kernel_size=int(arcc_kwargs.get("kernel_size", 3)),
+                    hidden_dim=arcc_kwargs.get("hidden_dim", None),
+                    lambda_init=float(arcc_kwargs.get("lambda_init", 0.1)),
+                )
 
         self.image_fusion_head = None
+        self.image_reviewer_weight_logits = None
+        self.image_reviewer_bias = None
+        self.relative_reviewer_base_weight_logits = None
+        self.relative_reviewer_bias = None
+        self.relative_reviewer_agree_logit = None
+        self.relative_reviewer_reject_logit = None
         self.pdar_image_head = None
         if self.image_score_mode == "evidence_mil":
             # Evidence order: global, raw max/top1/top5, Mamba max/top1/top5.
@@ -431,6 +607,43 @@ class CLIPNormalityAD(nn.Module):
                 self.image_fusion_head.weight[0, 6] = 0.5
                 self.image_fusion_head.bias.zero_()
             self.stage = f"{self.stage}_imagemil"
+        elif self.image_score_mode == "reviewer_mil":
+            # Positive magnitudes are parameterized through softplus. The
+            # disagreement magnitude is subtracted explicitly in forward(),
+            # so Mamba disagreement can never accidentally become a bonus.
+            initial_logits = [
+                math.log(math.expm1(value))
+                for value in self.image_reviewer_weight_init
+            ]
+            self.image_reviewer_weight_logits = nn.Parameter(
+                torch.tensor(initial_logits, dtype=torch.float32)
+            )
+            self.image_reviewer_bias = nn.Parameter(torch.zeros(()))
+            self.stage = f"{self.stage}_reviewermil"
+        elif self.image_score_mode == "relative_reviewer_mil":
+            # The base score contains no stand-alone Mamba evidence. Mamba is
+            # only allowed to make a small, bounded correction after comparing
+            # its support inside the raw candidate region against background.
+            base_logits = [
+                math.log(math.expm1(value))
+                for value in self.image_relative_reviewer_base_weight_init
+            ]
+            self.relative_reviewer_base_weight_logits = nn.Parameter(
+                torch.tensor(base_logits, dtype=torch.float32)
+            )
+            self.relative_reviewer_bias = nn.Parameter(torch.zeros(()))
+            scale_ratio = (
+                self.image_relative_reviewer_scale_init
+                / self.image_relative_reviewer_max_scale
+            )
+            scale_logit = math.log(scale_ratio / (1.0 - scale_ratio))
+            self.relative_reviewer_agree_logit = nn.Parameter(
+                torch.tensor(scale_logit, dtype=torch.float32)
+            )
+            self.relative_reviewer_reject_logit = nn.Parameter(
+                torch.tensor(scale_logit, dtype=torch.float32)
+            )
+            self.stage = f"{self.stage}_relreviewermil"
         elif self.image_score_mode == "pdar_image_head":
             hidden_dim = max(1, embed_dim // 4)
             self.pdar_image_head = nn.Sequential(
@@ -618,6 +831,7 @@ class CLIPNormalityAD(nn.Module):
             else:
                 mamba_injection_tokens = mamba_tokens
             mamba_feature_map = self._tokens_to_feature_map(mamba_injection_tokens)
+            global_context_feature_map = self._tokens_to_feature_map(full_context_tokens)
             if self.arcc_inject_mamba:
                 injection_gamma = torch.sigmoid(self.arcc_mamba_injection_logit)
                 if self.arcc_mamba_fusion_mode == "concat":
@@ -655,6 +869,69 @@ class CLIPNormalityAD(nn.Module):
                     )
                     if getattr(self, "arcc_mamba_support_detach", True):
                         mamba_support_guidance = mamba_support_guidance.detach()
+
+        if self.arcc_variant == "pgsam_iterative":
+            if mamba_tokens is None or mamba_verifier_logits is None:
+                raise RuntimeError(
+                    "PGSAM iterative ARCC requires PDAR context and the unchanged "
+                    "Evidence-MIL verifier path."
+                )
+            final_patch_logits, iterative_debug = self.arcc(
+                cnn_feature_map,
+                global_context_feature_map,
+                raw_patch_map,
+            )
+            final_map = F.interpolate(
+                final_patch_logits,
+                size=image_shape,
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(1)
+
+            # The semantic/prior maps below are retained only for V18's
+            # independent Mamba losses, diagnostics, and Evidence-MIL image
+            # score. They do not enter the new pixel-level ARCC.
+            mamba_semantic_map = upsample_patch_map(
+                mamba_semantic_patch,
+                grid_size=(grid_h, grid_w),
+                image_shape=image_shape,
+            )
+            if self.mamba_veto_source == "prior":
+                mamba_verifier_map = upsample_patch_map(
+                    mamba_verifier_logits.flatten(1),
+                    grid_size=(grid_h, grid_w),
+                    image_shape=image_shape,
+                )
+            else:
+                mamba_verifier_map = mamba_semantic_map
+            mamba_support = torch.sigmoid(
+                (mamba_verifier_map - self.mamba_veto_threshold)
+                / self.mamba_veto_temperature
+            )
+            debug = {
+                **iterative_debug,
+                # Compatibility-only: the context gate is not a deformable
+                # modulation mask and is therefore exposed under its own name.
+                "arcc_mod_mask": None,
+                "A_final_patch": final_patch_logits.squeeze(1),
+                "arcc_suppressed_map": final_map,
+                "mamba_context_tokens": mamba_tokens,
+                "mamba_semantic_logits": mamba_semantic_logits,
+                "mamba_semantic_map": mamba_semantic_map,
+                "mamba_verifier_logits": mamba_verifier_logits,
+                "mamba_verifier_map": mamba_verifier_map,
+                "mamba_support_map": mamba_support,
+                "mamba_veto_map": torch.zeros_like(final_map),
+                "mamba_veto_alpha": final_map.new_zeros(()),
+                # Private training-only tensor consumed before outputs are
+                # exported. This is the exact high-dimensional PDAR context
+                # used as K/V by the QKV fusion path.
+                "_mamba_contrast_tokens": full_context_tokens,
+                **mamba_debug,
+            }
+            if self.pdar_image_head is not None:
+                debug["_pdar_image_tokens"] = full_context_tokens
+            return final_map, debug, mamba_tokens
 
         arcc_guidance_kwargs = {}
         if mamba_support_guidance is not None:
@@ -878,6 +1155,155 @@ class CLIPNormalityAD(nn.Module):
             return context_logits.new_zeros(())
         return torch.stack(losses).mean()
 
+    def _mamba_feature_contrast_weight(self, current_epoch):
+        """Return the deterministic epoch-wise contrast weight.
+
+        The trainer passes a one-based epoch, so target=0.2 and warmup=2
+        produce 0.1, 0.2, 0.2, ... for epochs 1, 2, 3, ... . This is not a
+        parameter and therefore cannot be reduced by gradient descent.
+        """
+        target = self.mamba_feature_contrast_target_weight
+        if target <= 0.0:
+            return 0.0
+        if self.mamba_feature_contrast_warmup_epochs <= 0:
+            return target
+        # A direct model call that omits the epoch is treated as epoch 1,
+        # never as a zero-weight learnable shortcut.
+        epoch = max(1.0, float(current_epoch or 1.0))
+        progress = min(
+            1.0,
+            epoch / float(self.mamba_feature_contrast_warmup_epochs),
+        )
+        return target * progress
+
+    def _mamba_feature_contrast_loss(
+        self,
+        context_tokens,
+        context_logits,
+        masks,
+    ):
+        """Contrast abnormal patches with hard normal patches in PDAR space.
+
+        Contrast is computed independently inside every abnormal image. This
+        avoids collapsing normal textures from unrelated object categories
+        into one global prototype. The hardest mask-out patches are selected
+        by the detached verifier logits so the loss focuses on false-positive
+        normal structures without letting the selector itself carry gradient.
+        """
+        if context_tokens.ndim != 3:
+            raise ValueError("Mamba contrast tokens must have shape [B, N, D].")
+        if context_logits.ndim != 3:
+            raise ValueError("Mamba verifier logits must have shape [B, H, W].")
+        if context_logits.shape[0] != context_tokens.shape[0]:
+            raise ValueError("Mamba contrast tokens/logits batch sizes must match.")
+        if context_logits.shape[-2] * context_logits.shape[-1] != context_tokens.shape[1]:
+            raise ValueError("Mamba contrast token count must match the verifier grid.")
+
+        targets = masks.to(device=context_tokens.device, dtype=context_tokens.dtype)
+        targets = resize_mamba_patch_targets(
+            targets,
+            output_size=context_logits.shape[-2:],
+            mode=self.mamba_context_mask_pool,
+        ).squeeze(1)
+        target_flat = targets.flatten(1) > 0.5
+        verifier_flat = context_logits.detach().flatten(1)
+
+        # Float32 cosine logits remain stable under AMP; gradients still flow
+        # back into the original PDAR/HSS context through the cast operation.
+        features = F.normalize(context_tokens.float(), dim=-1)
+        losses = []
+        contrast_gaps = []
+        prototype_cosines = []
+        hard_negative_ratio = self.mamba_feature_contrast_hard_negative_ratio
+        temperature = self.mamba_feature_contrast_temperature
+
+        for feature_i, verifier_i, target_i in zip(
+            features,
+            verifier_flat,
+            target_flat,
+        ):
+            inside = target_i
+            outside = ~inside
+            if not inside.any() or not outside.any():
+                continue
+
+            positive_features = feature_i[inside]
+            outside_features = feature_i[outside]
+            outside_scores = verifier_i[outside]
+            hard_negative_count = max(
+                1,
+                int(outside_features.shape[0] * hard_negative_ratio),
+            )
+            # At least match the positive count when possible, while retaining
+            # the configured top-ratio floor for tiny anomaly masks.
+            hard_negative_count = max(
+                hard_negative_count,
+                min(positive_features.shape[0], outside_features.shape[0]),
+            )
+            hard_negative_count = min(
+                hard_negative_count,
+                outside_features.shape[0],
+            )
+            hard_indices = outside_scores.topk(hard_negative_count).indices
+            negative_features = outside_features[hard_indices]
+
+            abnormal_prototype = F.normalize(
+                positive_features.mean(dim=0),
+                dim=0,
+            )
+            normal_prototype = F.normalize(
+                negative_features.mean(dim=0),
+                dim=0,
+            )
+
+            positive_logits = torch.stack(
+                (
+                    positive_features @ normal_prototype,
+                    positive_features @ abnormal_prototype,
+                ),
+                dim=1,
+            ) / temperature
+            negative_logits = torch.stack(
+                (
+                    negative_features @ normal_prototype,
+                    negative_features @ abnormal_prototype,
+                ),
+                dim=1,
+            ) / temperature
+            positive_labels = torch.ones(
+                positive_logits.shape[0],
+                device=positive_logits.device,
+                dtype=torch.long,
+            )
+            negative_labels = torch.zeros(
+                negative_logits.shape[0],
+                device=negative_logits.device,
+                dtype=torch.long,
+            )
+            # Equal class weighting prevents the much larger normal region
+            # from overwhelming small anomalous regions.
+            loss_i = 0.5 * (
+                F.cross_entropy(positive_logits, positive_labels)
+                + F.cross_entropy(negative_logits, negative_labels)
+            )
+            losses.append(loss_i)
+            contrast_gaps.append(
+                (positive_logits[:, 1] - positive_logits[:, 0]).mean()
+                * temperature
+            )
+            prototype_cosines.append(
+                torch.sum(abnormal_prototype * normal_prototype)
+            )
+
+        if not losses:
+            zero = context_tokens.new_zeros((), dtype=torch.float32)
+            return zero, zero, zero
+        return (
+            torch.stack(losses).mean(),
+            torch.stack(contrast_gaps).mean(),
+            torch.stack(prototype_cosines).mean(),
+        )
+
     def _adapter_losses(
         self,
         raw_patch,
@@ -888,8 +1314,10 @@ class CLIPNormalityAD(nn.Module):
         anomaly_map=None,
         raw_anomaly_map=None,
         arcc_debug=None,
+        mamba_contrast_tokens=None,
         masks=None,
         labels=None,
+        current_epoch=None,
     ):
         normal_patch_score = patch_score
         if labels is not None:
@@ -937,6 +1365,12 @@ class CLIPNormalityAD(nn.Module):
         loss_mamba_context_dice = image_score.new_zeros(())
         loss_mamba_context_outside_topk = image_score.new_zeros(())
         loss_mamba_context_separation = image_score.new_zeros(())
+        loss_mamba_feature_contrast = image_score.new_zeros(())
+        dbg_mamba_feature_contrast_gap = image_score.new_zeros(())
+        dbg_mamba_feature_prototype_cosine = image_score.new_zeros(())
+        mamba_feature_contrast_weight = image_score.new_tensor(
+            self._mamba_feature_contrast_weight(current_epoch)
+        )
         if self.use_supervised_masks and masks is not None and anomaly_map is not None and raw_anomaly_map is not None:
             loss_mask_bce, loss_mask_dice, loss_mask_raw_bce = self._supervised_mask_losses(
                 anomaly_map,
@@ -967,6 +1401,23 @@ class CLIPNormalityAD(nn.Module):
                     arcc_debug["mamba_verifier_logits"],
                     masks,
                 )
+        if (
+            self.use_supervised_masks
+            and masks is not None
+            and arcc_debug is not None
+            and "mamba_verifier_logits" in arcc_debug
+            and mamba_contrast_tokens is not None
+            and self.mamba_feature_contrast_target_weight > 0
+        ):
+            (
+                loss_mamba_feature_contrast,
+                dbg_mamba_feature_contrast_gap,
+                dbg_mamba_feature_prototype_cosine,
+            ) = self._mamba_feature_contrast_loss(
+                mamba_contrast_tokens,
+                arcc_debug["mamba_verifier_logits"],
+                masks,
+            )
         total = (
             self.loss_normal_topk_weight * loss_normal_topk
             + self.loss_consistency_weight * loss_consistency
@@ -983,6 +1434,7 @@ class CLIPNormalityAD(nn.Module):
             + self.mamba_context_dice_weight * loss_mamba_context_dice
             + self.mamba_context_outside_topk_weight * loss_mamba_context_outside_topk
             + self.mamba_context_separation_weight * loss_mamba_context_separation
+            + mamba_feature_contrast_weight * loss_mamba_feature_contrast
         )
         return {
             "loss_normal_topk": loss_normal_topk,
@@ -1000,6 +1452,10 @@ class CLIPNormalityAD(nn.Module):
             "loss_mamba_context_dice": loss_mamba_context_dice,
             "loss_mamba_context_outside_topk": loss_mamba_context_outside_topk,
             "loss_mamba_context_separation": loss_mamba_context_separation,
+            "loss_mamba_feature_contrast": loss_mamba_feature_contrast,
+            "dbg_mamba_feature_contrast_weight": mamba_feature_contrast_weight,
+            "dbg_mamba_feature_contrast_gap": dbg_mamba_feature_contrast_gap,
+            "dbg_mamba_feature_prototype_cosine": dbg_mamba_feature_prototype_cosine,
             "loss_patch": loss_normal_topk,
             "total": total,
             "loss_total": total,
@@ -1178,11 +1634,101 @@ class CLIPNormalityAD(nn.Module):
                 debug["dbg_batch_abnormal_count"] = abnormal_images.float().sum()
                 debug["dbg_batch_positive_mask_count"] = positive_mask.float().sum()
             if arcc_debug is not None:
-                debug["dbg_arcc_lambda"] = arcc_debug["arcc_lambda"].detach()
-                debug["dbg_arcc_lambda_learned"] = arcc_debug[
-                    "arcc_lambda_learned"
-                ].detach()
+                if "arcc_lambda" in arcc_debug:
+                    debug["dbg_arcc_lambda"] = arcc_debug["arcc_lambda"].detach()
+                    debug["dbg_arcc_lambda_learned"] = arcc_debug[
+                        "arcc_lambda_learned"
+                    ].detach()
+                else:
+                    debug["dbg_arcc_lambda"] = raw_anomaly_map.new_zeros(())
+                    debug["dbg_arcc_lambda_learned"] = raw_anomaly_map.new_zeros(())
                 debug["dbg_g_cal_abs"] = arcc_debug["G_cal"].detach().abs().mean()
+                if "cross_gamma" in arcc_debug:
+                    debug["dbg_arcc_cross_gamma"] = arcc_debug[
+                        "cross_gamma"
+                    ].detach()
+                    calibration_delta = arcc_debug["calibration_delta"].detach()
+                    context_gate = arcc_debug.get("context_gate")
+                    if context_gate is not None:
+                        context_gate = context_gate.detach()
+                        debug["dbg_arcc_context_gate_mean"] = context_gate.mean()
+                        debug["dbg_arcc_context_gate_max"] = context_gate.amax()
+                    debug["dbg_arcc_cross_feature_norm"] = arcc_debug[
+                        "cross_feature_norm"
+                    ].detach()
+                    debug["dbg_arcc_local_context_difference"] = arcc_debug[
+                        "local_context_difference"
+                    ].detach()
+                    if "dynamic_gate_norm" in arcc_debug:
+                        debug["dbg_arcc_dynamic_gate_norm"] = arcc_debug[
+                            "dynamic_gate_norm"
+                        ].detach()
+                    for step_idx in (1, 2):
+                        debug[f"dbg_arcc_refine_step{step_idx}_abs"] = arcc_debug[
+                            f"refine_step{step_idx}_abs"
+                        ].detach()
+                        debug[f"dbg_arcc_refine_step{step_idx}_signed_mean"] = arcc_debug[
+                            f"refine_step{step_idx}_signed_mean"
+                        ].detach()
+                    debug["dbg_arcc_final_minus_raw_abs"] = arcc_debug[
+                        "final_minus_raw_abs"
+                    ].detach()
+                    debug["dbg_arcc_final_minus_raw_signed_mean"] = arcc_debug[
+                        "final_minus_raw_signed_mean"
+                    ].detach()
+
+                    if masks is not None:
+                        patch_target = masks.to(
+                            device=calibration_delta.device,
+                            dtype=calibration_delta.dtype,
+                        )
+                        if patch_target.ndim == 3:
+                            patch_target = patch_target.unsqueeze(1)
+                        if patch_target.shape[-2:] != calibration_delta.shape[-2:]:
+                            patch_target = F.adaptive_max_pool2d(
+                                patch_target,
+                                output_size=calibration_delta.shape[-2:],
+                            )
+                        patch_inside = patch_target > 0.5
+                        patch_outside = ~patch_inside
+
+                        def region_mean(values, selection):
+                            return (
+                                values[selection].mean()
+                                if selection.any()
+                                else values.new_zeros(())
+                            )
+
+                        debug["dbg_arcc_delta_inside"] = region_mean(
+                            calibration_delta,
+                            patch_inside,
+                        )
+                        debug["dbg_arcc_delta_outside"] = region_mean(
+                            calibration_delta,
+                            patch_outside,
+                        )
+                        if context_gate is not None:
+                            debug["dbg_arcc_gate_inside"] = region_mean(
+                                context_gate,
+                                patch_inside,
+                            )
+                            debug["dbg_arcc_gate_outside"] = region_mean(
+                                context_gate,
+                                patch_outside,
+                            )
+                        raw_flat = raw_anomaly_map.detach().flatten(1)
+                        final_flat = anomaly_map.detach().flatten(1)
+                        normal_topk = max(1, int(raw_flat.shape[1] * 0.01))
+                        raw_normal_topk = raw_flat.topk(normal_topk, dim=1).values.mean(dim=1)
+                        final_normal_topk = final_flat.topk(normal_topk, dim=1).values.mean(dim=1)
+                        debug["dbg_arcc_normal_topk_before"] = selected_mean(
+                            raw_normal_topk,
+                            normal_images,
+                        )
+                        debug["dbg_arcc_normal_topk_after"] = selected_mean(
+                            final_normal_topk,
+                            normal_images,
+                        )
                 if "arcc_mamba_injection_gamma" in arcc_debug:
                     debug["dbg_arcc_mamba_injection_gamma"] = arcc_debug[
                         "arcc_mamba_injection_gamma"
@@ -1297,7 +1843,15 @@ class CLIPNormalityAD(nn.Module):
                 debug["dbg_g_cal_abs"] = raw_anomaly_map.new_zeros(())
             return debug
 
-    def forward(self, imgs, cls_names=None, masks=None, labels=None, return_loss=True):
+    def forward(
+        self,
+        imgs,
+        cls_names=None,
+        masks=None,
+        labels=None,
+        return_loss=True,
+        current_epoch=None,
+    ):
         if cls_names is None:
             cls_names = ["object"] * imgs.shape[0]
         global_feat, patch_feats = self.encode_image_features(imgs)
@@ -1345,8 +1899,10 @@ class CLIPNormalityAD(nn.Module):
             mamba_source_tokens=raw_patch_feat,
         )
         pdar_image_tokens = None
+        mamba_contrast_tokens = None
         if arcc_debug is not None:
             pdar_image_tokens = arcc_debug.pop("_pdar_image_tokens", None)
+            mamba_contrast_tokens = arcc_debug.pop("_mamba_contrast_tokens", None)
         topk_score = mean_topk_score(anomaly_map, self.image_score_topk_ratio)
         topk_score_max, topk_score_top1, topk_score_top5 = self._map_evidence(anomaly_map)
         raw_score_max, raw_score_top1, raw_score_top5 = self._map_evidence(raw_anomaly_map)
@@ -1370,6 +1926,161 @@ class CLIPNormalityAD(nn.Module):
             ),
             dim=1,
         )
+        reviewer_evidence = None
+        relative_reviewer_evidence = None
+        relative_reviewer_candidate_support = None
+        relative_reviewer_background_support = None
+        relative_reviewer_gap = None
+        relative_reviewer_agree = None
+        relative_reviewer_reject = None
+        relative_reviewer_neutral = None
+        relative_reviewer_base_score = None
+        relative_reviewer_score_delta = None
+        if self.image_score_mode == "reviewer_mil":
+            if arcc_debug is None or "mamba_support_map" not in arcc_debug:
+                raise RuntimeError(
+                    "reviewer_mil requires a full-resolution Mamba support map."
+                )
+
+            # R is the CLIP/local-branch candidate probability. M is Mamba's
+            # spatial support probability. Agreement and disagreement are
+            # formed pixel by pixel before pooling, so support at a different
+            # location cannot incorrectly approve a raw candidate.
+            raw_candidate_map = torch.sigmoid(
+                raw_anomaly_map / self.image_reviewer_raw_temperature
+            )
+            mamba_support_map = arcc_debug["mamba_support_map"]
+            if mamba_support_map.shape[-2:] != raw_candidate_map.shape[-2:]:
+                mamba_support_map = F.interpolate(
+                    mamba_support_map.unsqueeze(1),
+                    size=raw_candidate_map.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(1)
+            mamba_support_map = mamba_support_map.clamp(0.0, 1.0)
+            agree_map = raw_candidate_map * mamba_support_map
+            disagree_map = raw_candidate_map * (1.0 - mamba_support_map)
+
+            reviewer_raw = mean_topk_score(
+                raw_candidate_map,
+                self.image_reviewer_topk_ratio,
+            )
+            reviewer_mamba = mean_topk_score(
+                mamba_support_map,
+                self.image_reviewer_topk_ratio,
+            )
+            reviewer_agree = mean_topk_score(
+                agree_map,
+                self.image_reviewer_topk_ratio,
+            )
+            reviewer_disagree = mean_topk_score(
+                disagree_map,
+                self.image_reviewer_topk_ratio,
+            )
+            reviewer_evidence = torch.stack(
+                (s_global, reviewer_raw, reviewer_agree, reviewer_disagree),
+                dim=1,
+            )
+            raw_centered = raw_candidate_map.flatten(1)
+            raw_centered = raw_centered - raw_centered.mean(dim=1, keepdim=True)
+            mamba_centered = mamba_support_map.flatten(1)
+            mamba_centered = mamba_centered - mamba_centered.mean(
+                dim=1,
+                keepdim=True,
+            )
+            reviewer_raw_mamba_corr = (
+                (raw_centered * mamba_centered).sum(dim=1)
+                / (
+                    raw_centered.square().sum(dim=1).sqrt()
+                    * mamba_centered.square().sum(dim=1).sqrt()
+                ).clamp_min(1e-6)
+            )
+        elif self.image_score_mode == "relative_reviewer_mil":
+            if arcc_debug is None or "mamba_support_map" not in arcc_debug:
+                raise RuntimeError(
+                    "relative_reviewer_mil requires a full-resolution Mamba "
+                    "support map."
+                )
+
+            # R selects the suspicious region. Mamba does not receive the
+            # image-level loss through this path: it only supplies a detached
+            # relative judgement, candidate support minus background support.
+            raw_candidate_map = torch.sigmoid(
+                raw_anomaly_map / self.image_reviewer_raw_temperature
+            )
+            mamba_support_map = arcc_debug["mamba_support_map"]
+            if mamba_support_map.shape[-2:] != raw_candidate_map.shape[-2:]:
+                mamba_support_map = F.interpolate(
+                    mamba_support_map.unsqueeze(1),
+                    size=raw_candidate_map.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(1)
+            mamba_support_map = mamba_support_map.clamp(0.0, 1.0)
+            if self.image_relative_reviewer_detach_mamba:
+                mamba_support_map = mamba_support_map.detach()
+
+            raw_flat = raw_candidate_map.flatten(1)
+            mamba_flat = mamba_support_map.flatten(1)
+            num_locations = raw_flat.shape[1]
+            candidate_count = max(
+                1,
+                min(
+                    num_locations,
+                    int(num_locations * float(self.image_reviewer_topk_ratio)),
+                ),
+            )
+            # The discrete top-k membership is not a useful gradient path; the
+            # selected raw values themselves remain differentiable.
+            candidate_indices = torch.topk(
+                raw_flat.detach(),
+                k=candidate_count,
+                dim=1,
+            ).indices
+            candidate_raw = torch.gather(raw_flat, 1, candidate_indices)
+            candidate_mamba = torch.gather(mamba_flat, 1, candidate_indices)
+
+            relative_reviewer_candidate_support = candidate_mamba.mean(dim=1)
+            if candidate_count < num_locations:
+                background_mamba_sum = (
+                    mamba_flat.sum(dim=1) - candidate_mamba.sum(dim=1)
+                )
+                relative_reviewer_background_support = (
+                    background_mamba_sum / float(num_locations - candidate_count)
+                )
+            else:
+                relative_reviewer_background_support = mamba_flat.mean(dim=1)
+
+            reviewer_candidate_strength = candidate_raw.mean(dim=1)
+            relative_reviewer_gap = (
+                relative_reviewer_candidate_support
+                - relative_reviewer_background_support
+            )
+            relative_reviewer_agree = reviewer_candidate_strength * F.relu(
+                relative_reviewer_gap - self.image_relative_reviewer_margin
+            )
+            relative_reviewer_reject = reviewer_candidate_strength * F.relu(
+                -relative_reviewer_gap - self.image_relative_reviewer_margin
+            )
+            relative_reviewer_neutral = (
+                relative_reviewer_gap.abs()
+                <= self.image_relative_reviewer_margin
+            ).to(raw_candidate_map.dtype)
+            relative_reviewer_evidence = torch.stack(
+                (
+                    s_global,
+                    raw_score_max,
+                    raw_score_top1,
+                    raw_score_top5,
+                    reviewer_candidate_strength,
+                    relative_reviewer_candidate_support,
+                    relative_reviewer_background_support,
+                    relative_reviewer_gap,
+                    relative_reviewer_agree,
+                    relative_reviewer_reject,
+                ),
+                dim=1,
+            )
         legacy_image_score = s_global + self.topk_beta * topk_score
         pdar_image_logit = None
         pdar_image_scale = s_global.new_zeros(())
@@ -1396,6 +2107,43 @@ class CLIPNormalityAD(nn.Module):
             ).sum(dim=1).mean()
         elif self.image_fusion_head is not None:
             image_score = self.image_fusion_head(image_evidence).squeeze(1)
+        elif self.image_reviewer_weight_logits is not None:
+            reviewer_weights = F.softplus(self.image_reviewer_weight_logits)
+            w_global, w_raw, w_agree, w_disagree = reviewer_weights
+            image_score = (
+                w_global * reviewer_evidence[:, 0]
+                + w_raw * reviewer_evidence[:, 1]
+                + w_agree * reviewer_evidence[:, 2]
+                - w_disagree * reviewer_evidence[:, 3]
+                + self.image_reviewer_bias
+            )
+        elif self.relative_reviewer_base_weight_logits is not None:
+            base_weights = F.softplus(
+                self.relative_reviewer_base_weight_logits
+            )
+            base_evidence = torch.stack(
+                (s_global, raw_score_max, raw_score_top1, raw_score_top5),
+                dim=1,
+            )
+            relative_reviewer_base_score = (
+                (base_evidence * base_weights.unsqueeze(0)).sum(dim=1)
+                + self.relative_reviewer_bias
+            )
+            relative_reviewer_agree_scale = (
+                self.image_relative_reviewer_max_scale
+                * torch.sigmoid(self.relative_reviewer_agree_logit)
+            )
+            relative_reviewer_reject_scale = (
+                self.image_relative_reviewer_max_scale
+                * torch.sigmoid(self.relative_reviewer_reject_logit)
+            )
+            relative_reviewer_score_delta = (
+                relative_reviewer_agree_scale * relative_reviewer_agree
+                - relative_reviewer_reject_scale * relative_reviewer_reject
+            )
+            image_score = (
+                relative_reviewer_base_score + relative_reviewer_score_delta
+            )
         else:
             image_score = legacy_image_score
         image_score_variants = {
@@ -1418,6 +2166,15 @@ class CLIPNormalityAD(nn.Module):
             "image_evidence": image_evidence,
             "image_score_legacy": legacy_image_score,
         }
+        if reviewer_evidence is not None:
+            image_component_scores["image_reviewer_evidence"] = reviewer_evidence
+        if relative_reviewer_evidence is not None:
+            image_component_scores["image_relative_reviewer_evidence"] = (
+                relative_reviewer_evidence
+            )
+            image_component_scores["image_score_relative_reviewer_base"] = (
+                relative_reviewer_base_score
+            )
         if pdar_image_logit is not None:
             image_component_scores["image_score_pdar_only"] = pdar_image_logit
         if arcc_debug is not None and "arcc_cnn_only_final_map" in arcc_debug:
@@ -1437,6 +2194,73 @@ class CLIPNormalityAD(nn.Module):
             for name, weight in zip(weight_names, self.image_fusion_head.weight[0]):
                 image_fusion_debug[f"dbg_image_fusion_w_{name}"] = weight
             image_fusion_debug["dbg_image_fusion_bias"] = self.image_fusion_head.bias[0]
+        if self.image_reviewer_weight_logits is not None:
+            reviewer_weights = F.softplus(self.image_reviewer_weight_logits)
+            reviewer_weight_names = ("global", "raw", "agree", "disagree")
+            for name, weight in zip(reviewer_weight_names, reviewer_weights):
+                image_fusion_debug[f"dbg_image_reviewer_w_{name}"] = weight
+            image_fusion_debug["dbg_image_reviewer_bias"] = self.image_reviewer_bias
+            image_fusion_debug.update(
+                {
+                    "dbg_image_reviewer_raw": reviewer_evidence[:, 1].mean(),
+                    "dbg_image_reviewer_mamba": reviewer_mamba.mean(),
+                    "dbg_image_reviewer_agree": reviewer_evidence[:, 2].mean(),
+                    "dbg_image_reviewer_disagree": reviewer_evidence[:, 3].mean(),
+                    "dbg_image_reviewer_raw_mamba_corr": (
+                        reviewer_raw_mamba_corr.mean()
+                    ),
+                    "dbg_image_reviewer_global_contrib": (
+                        reviewer_weights[0] * reviewer_evidence[:, 0]
+                    ).mean(),
+                    "dbg_image_reviewer_raw_contrib": (
+                        reviewer_weights[1] * reviewer_evidence[:, 1]
+                    ).mean(),
+                    "dbg_image_reviewer_agree_contrib": (
+                        reviewer_weights[2] * reviewer_evidence[:, 2]
+                    ).mean(),
+                    "dbg_image_reviewer_disagree_contrib": (
+                        -reviewer_weights[3] * reviewer_evidence[:, 3]
+                    ).mean(),
+                }
+            )
+        if self.relative_reviewer_base_weight_logits is not None:
+            base_weights = F.softplus(
+                self.relative_reviewer_base_weight_logits
+            )
+            base_weight_names = ("global", "raw_max", "raw_top1", "raw_top5")
+            for name, weight in zip(base_weight_names, base_weights):
+                image_fusion_debug[f"dbg_reviewer_w_{name}"] = weight
+            relative_reviewer_agree_scale = (
+                self.image_relative_reviewer_max_scale
+                * torch.sigmoid(self.relative_reviewer_agree_logit)
+            )
+            relative_reviewer_reject_scale = (
+                self.image_relative_reviewer_max_scale
+                * torch.sigmoid(self.relative_reviewer_reject_logit)
+            )
+            image_fusion_debug.update(
+                {
+                    "dbg_reviewer_bias": self.relative_reviewer_bias,
+                    "dbg_reviewer_candidate_support": (
+                        relative_reviewer_candidate_support.mean()
+                    ),
+                    "dbg_reviewer_background_support": (
+                        relative_reviewer_background_support.mean()
+                    ),
+                    "dbg_reviewer_relative_gap": relative_reviewer_gap.mean(),
+                    "dbg_reviewer_agree": relative_reviewer_agree.mean(),
+                    "dbg_reviewer_reject": relative_reviewer_reject.mean(),
+                    "dbg_reviewer_neutral_ratio": relative_reviewer_neutral.mean(),
+                    "dbg_reviewer_agree_scale": relative_reviewer_agree_scale,
+                    "dbg_reviewer_reject_scale": relative_reviewer_reject_scale,
+                    "dbg_reviewer_score_delta": (
+                        relative_reviewer_score_delta.mean()
+                    ),
+                    "dbg_reviewer_base_score": (
+                        relative_reviewer_base_score.mean()
+                    ),
+                }
+            )
 
         out = {
             "S_global": s_global,
@@ -1501,8 +2325,10 @@ class CLIPNormalityAD(nn.Module):
                     anomaly_map=anomaly_map,
                     raw_anomaly_map=raw_anomaly_map,
                     arcc_debug=arcc_debug,
+                    mamba_contrast_tokens=mamba_contrast_tokens,
                     masks=masks,
                     labels=labels,
+                    current_epoch=current_epoch,
                 )
                 total = losses["total"]
             else:

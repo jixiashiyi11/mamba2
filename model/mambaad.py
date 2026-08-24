@@ -2138,6 +2138,333 @@ class ARCCCalibration(nn.Module):
         return calibration.squeeze(1), mod_mask
 
 
+class PGSAMCrossContextFusion(nn.Module):
+    """Lightweight 2D Q/K/V fusion inspired by PG-SAM CrossAttentionFusion."""
+
+    def __init__(
+            self,
+            in_dim,
+            cross_dim=128,
+            num_heads=4,
+            normalize_cross_features=False,
+            cross_norm_eps=1e-6,
+    ):
+        super().__init__()
+        self.cross_dim = int(cross_dim)
+        self.num_heads = int(num_heads)
+        if self.cross_dim % self.num_heads != 0:
+            raise ValueError('cross_dim must be divisible by num_heads.')
+        self.head_dim = self.cross_dim // self.num_heads
+        self.scale = self.head_dim ** -0.5
+        self.query_norm = nn.LayerNorm(in_dim)
+        self.context_norm = nn.LayerNorm(in_dim)
+
+        def projection():
+            return nn.Sequential(
+                nn.Conv2d(in_dim, self.cross_dim, kernel_size=1, bias=False),
+                nn.Conv2d(
+                    self.cross_dim,
+                    self.cross_dim,
+                    kernel_size=3,
+                    padding=1,
+                    groups=self.cross_dim,
+                    bias=False,
+                ),
+            )
+
+        self.q_projection = projection()
+        self.k_projection = projection()
+        self.v_projection = projection()
+        self.output_projection = nn.Conv2d(
+            self.cross_dim,
+            self.cross_dim,
+            kernel_size=1,
+            bias=False,
+        )
+        # V21 keeps V20 reproducible by making this optional. A fixed
+        # channel-wise LayerNorm prevents the context branch from solving the
+        # task through an oversized, spatially uniform correction. Disabling
+        # affine parameters also prevents its scale from immediately growing
+        # back during training.
+        self.cross_feature_norm = (
+            nn.LayerNorm(
+                self.cross_dim,
+                eps=max(float(cross_norm_eps), 1e-12),
+                elementwise_affine=False,
+            )
+            if bool(normalize_cross_features)
+            else None
+        )
+
+    @staticmethod
+    def _normalize_2d(x, norm):
+        return norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2).contiguous()
+
+    def _split_heads(self, x):
+        batch, _, height, width = x.shape
+        return x.reshape(
+            batch,
+            self.num_heads,
+            self.head_dim,
+            height * width,
+        ).transpose(-2, -1)
+
+    def forward(self, patch_features, context_features):
+        batch, _, height, width = patch_features.shape
+        query_input = self._normalize_2d(patch_features, self.query_norm)
+        context_input = self._normalize_2d(context_features, self.context_norm)
+        projected_query = self.q_projection(query_input)
+        query = self._split_heads(projected_query)
+        key = self._split_heads(self.k_projection(context_input))
+        value = self._split_heads(self.v_projection(context_input))
+
+        attention = torch.softmax(
+            torch.matmul(query, key.transpose(-2, -1)) * self.scale,
+            dim=-1,
+        )
+        attended = torch.matmul(attention, value)
+        attended = attended.transpose(-2, -1).reshape(
+            batch,
+            self.cross_dim,
+            height,
+            width,
+        )
+        # The outer F_joint = F_local + gamma * gate * F_cross supplies the
+        # residual connection. Keeping F_cross context-only also makes the
+        # zero-context ablation a true removal of Mamba information.
+        cross_features = self.output_projection(attended)
+        if self.cross_feature_norm is not None:
+            cross_features = self._normalize_2d(
+                cross_features,
+                self.cross_feature_norm,
+            )
+
+        attention_float = attention.float().clamp_min(1e-8)
+        entropy = -(attention_float * attention_float.log()).sum(dim=-1)
+        if attention.shape[-1] > 1:
+            entropy = entropy / math.log(attention.shape[-1])
+        return cross_features, entropy.mean().to(dtype=patch_features.dtype)
+
+
+class PGSAMIterativeARCC(nn.Module):
+    """PG-SAM-inspired feature-context iterative ARCC.
+
+    The module consumes only high-dimensional PDAR context. It never consumes
+    a Mamba anomaly probability. Context is detached at this boundary so ARCC
+    losses cannot update PDAR through the cross-attention guidance path.
+    """
+
+    def __init__(
+            self,
+            in_dim,
+            cross_dim=128,
+            num_heads=4,
+            num_refine_steps=2,
+            gate_hidden_dim=64,
+            gamma_init=0.05,
+            rho_init=0.1,
+            rho_max=0.5,
+            eps=1e-6,
+            arcc_context_mode='real',
+            normalize_cross_features=False,
+            cross_norm_eps=1e-6,
+            use_context_gate=True,
+            use_dynamic_gate=True,
+    ):
+        super().__init__()
+        self.in_dim = int(in_dim)
+        self.cross_dim = int(cross_dim)
+        self.num_refine_steps = int(num_refine_steps)
+        if self.num_refine_steps != 2:
+            raise ValueError('The first PGSAM iterative ARCC experiment requires exactly two steps.')
+        self.eps = max(float(eps), 1e-12)
+        self.use_context_gate = bool(use_context_gate)
+        self.use_dynamic_gate = bool(use_dynamic_gate)
+        self.arcc_context_mode = str(arcc_context_mode).lower()
+        if self.arcc_context_mode not in ('real', 'shuffle', 'zero'):
+            raise ValueError("arcc_context_mode must be 'real', 'shuffle', or 'zero'.")
+
+        self.local_projection = nn.Conv2d(
+            self.in_dim,
+            self.cross_dim,
+            kernel_size=1,
+            bias=False,
+        )
+        self.cross_fusion = PGSAMCrossContextFusion(
+            self.in_dim,
+            cross_dim=self.cross_dim,
+            num_heads=num_heads,
+            normalize_cross_features=normalize_cross_features,
+            cross_norm_eps=cross_norm_eps,
+        )
+        if self.use_context_gate:
+            gate_input_dim = 3 * self.cross_dim + 1
+            self.context_gate = nn.Sequential(
+                nn.Conv2d(gate_input_dim, int(gate_hidden_dim), kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(int(gate_hidden_dim), 1, kernel_size=1),
+            )
+        else:
+            self.context_gate = None
+        self.cross_gamma = nn.Parameter(torch.tensor(float(gamma_init)))
+
+        # The shared base refiner is modulated per image by a small
+        # hypernetwork, avoiding a huge per-sample 768x768x3x3 kernel.
+        self.base_refiner = nn.Conv2d(
+            self.cross_dim + 1,
+            self.cross_dim,
+            kernel_size=3,
+            padding=1,
+        )
+        self.hypernetwork = (
+            nn.Sequential(
+                nn.Linear(self.cross_dim, self.cross_dim),
+                nn.GELU(),
+                nn.Linear(self.cross_dim, self.cross_dim),
+            )
+            if self.use_dynamic_gate
+            else None
+        )
+        self.delta_head = nn.Conv2d(self.cross_dim, 1, kernel_size=1)
+        if self.hypernetwork is not None:
+            nn.init.zeros_(self.hypernetwork[-1].weight)
+            nn.init.zeros_(self.hypernetwork[-1].bias)
+        nn.init.zeros_(self.delta_head.weight)
+        nn.init.zeros_(self.delta_head.bias)
+
+        rho_init = float(rho_init)
+        self.rho_max = float(rho_max)
+        if not 0.0 < rho_init < self.rho_max:
+            raise ValueError('rho_init must be positive and smaller than rho_max.')
+        rho_fraction = rho_init / self.rho_max
+        self.rho_logit = nn.Parameter(
+            torch.tensor(math.log(rho_fraction / (1.0 - rho_fraction)))
+        )
+
+    @staticmethod
+    def _single_channel_map(value, name):
+        if value.ndim == 3:
+            value = value.unsqueeze(1)
+        if value.ndim != 4 or value.shape[1] != 1:
+            raise ValueError(f'{name} must have shape [B, 1, H, W] or [B, H, W].')
+        return value
+
+    @staticmethod
+    def _require_finite(name, value):
+        if not torch.isfinite(value).all():
+            raise FloatingPointError(f'Non-finite tensor detected in PGSAM iterative ARCC: {name}.')
+
+    def _context_ablation(self, context_features):
+        # These counterfactuals are evaluation-only so the V18 training
+        # protocol is unchanged. Training always uses real detached context.
+        if self.training or self.arcc_context_mode == 'real':
+            return context_features
+        if self.arcc_context_mode == 'zero':
+            return torch.zeros_like(context_features)
+        if context_features.shape[0] < 2:
+            return context_features
+        return context_features.roll(shifts=1, dims=0)
+
+    def forward(self, patch_features, mamba_context, initial_logits):
+        if patch_features.ndim != 4 or mamba_context.ndim != 4:
+            raise ValueError('PGSAM iterative ARCC features must have shape [B, C, H, W].')
+        if patch_features.shape != mamba_context.shape:
+            raise ValueError(
+                'Patch and Mamba context shapes must match, got '
+                f'{tuple(patch_features.shape)} and {tuple(mamba_context.shape)}.'
+            )
+        if patch_features.shape[1] != self.in_dim:
+            raise ValueError(f'Expected {self.in_dim} input channels.')
+        initial_logits = self._single_channel_map(initial_logits, 'initial_logits')
+        if (
+            initial_logits.shape[0] != patch_features.shape[0]
+            or initial_logits.shape[-2:] != patch_features.shape[-2:]
+        ):
+            raise ValueError('Feature and initial-logit batch/spatial shapes must match.')
+        self._require_finite('patch_features', patch_features)
+        self._require_finite('mamba_context', mamba_context)
+        self._require_finite('initial_logits', initial_logits)
+
+        detached_context = self._context_ablation(mamba_context.detach())
+        local_features = self.local_projection(patch_features)
+        cross_features, attention_entropy = self.cross_fusion(
+            patch_features,
+            detached_context.to(dtype=patch_features.dtype),
+        )
+
+        current_logits = initial_logits
+        update_steps = []
+        context_gates = []
+        dynamic_gates = []
+        rho = self.rho_max * torch.sigmoid(self.rho_logit)
+        for _ in range(self.num_refine_steps):
+            probability = torch.sigmoid(current_logits)
+            if self.context_gate is None:
+                # PG-SAM-style direct residual fusion: QKV decides which
+                # Mamba content is retrieved; no second spatial gate decides
+                # whether that retrieved content is allowed to enter.
+                joint_features = local_features + self.cross_gamma * cross_features
+            else:
+                gate_evidence = torch.cat(
+                    (
+                        local_features,
+                        cross_features,
+                        (local_features - cross_features).abs(),
+                        probability,
+                    ),
+                    dim=1,
+                )
+                context_gate = torch.sigmoid(self.context_gate(gate_evidence))
+                joint_features = (
+                    local_features
+                    + self.cross_gamma * context_gate * cross_features
+                )
+                context_gates.append(context_gate)
+
+            refined = self.base_refiner(
+                torch.cat((joint_features, current_logits), dim=1)
+            )
+            if self.hypernetwork is not None:
+                weighted_sum = (probability * joint_features).flatten(2).sum(dim=-1)
+                probability_mass = probability.flatten(2).sum(dim=-1).clamp_min(self.eps)
+                anomaly_token = weighted_sum / probability_mass
+                dynamic_gate = torch.sigmoid(self.hypernetwork(anomaly_token))
+                refined = refined * dynamic_gate.unsqueeze(-1).unsqueeze(-1)
+                dynamic_gates.append(dynamic_gate)
+            delta = self.delta_head(F.gelu(refined))
+            update = rho * torch.tanh(delta)
+            current_logits = current_logits + update
+            update_steps.append(update)
+
+        calibration_delta = current_logits - initial_logits
+        self._require_finite('final_patch_logits', current_logits)
+        debug = {
+            # For this variant G_cal means the iterative patch-logit residual,
+            # not the legacy deformable ARCC calibration-head output.
+            'G_cal': calibration_delta.squeeze(1),
+            'calibration_delta': calibration_delta,
+            'cross_gamma': self.cross_gamma,
+            'rho': rho,
+            'cross_attention_entropy': attention_entropy,
+            'cross_feature_norm': cross_features.float().pow(2).sum(dim=1).sqrt().mean(),
+            'local_context_difference': (local_features - cross_features).abs().mean(),
+            'refine_updates': tuple(update_steps),
+            'final_minus_raw_abs': calibration_delta.abs().mean(),
+            'final_minus_raw_signed_mean': calibration_delta.mean(),
+            'arcc_context_mode': self.arcc_context_mode,
+        }
+        if context_gates:
+            debug['context_gate'] = torch.stack(context_gates, dim=0).mean(dim=0)
+        if dynamic_gates:
+            debug['dynamic_gate_norm'] = (
+                torch.stack(dynamic_gates, dim=0).float().norm(dim=-1).mean()
+            )
+        for step_idx, update in enumerate(update_steps, start=1):
+            debug[f'refine_step{step_idx}_abs'] = update.abs().mean()
+            debug[f'refine_step{step_idx}_signed_mean'] = update.mean()
+        return current_logits, debug
+
+
 class TextGuidedLocalRelationBranch(nn.Module):
     def __init__(
             self,

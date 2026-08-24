@@ -4,7 +4,7 @@ from configs.clip_ad.clip_ad_mtvecad import cfg as base_cfg
 class cfg(base_cfg):
     def __init__(self):
         super().__init__()
-        self.epoch_full = 15
+        self.epoch_full = 3
         self.test_start_epoch = 1
         self.test_per_epoch = 1
         self.lr = 1e-4

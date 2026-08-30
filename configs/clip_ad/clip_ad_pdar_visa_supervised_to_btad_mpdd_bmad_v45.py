@@ -32,7 +32,11 @@ class cfg(base_cfg):
             "Retina_OCT",
         ]
         self.data_test.preserve_tiny_masks = True
-        self.data_test.require_nonempty_anomaly_mask = True
+        # The published BTAD conversion contains 11 image-level anomalies whose
+        # mask files are present but entirely zero. Keep those official samples
+        # for benchmark-compatible image evaluation instead of fabricating a
+        # pixel mask or aborting the complete joint test.
+        self.data_test.require_nonempty_anomaly_mask = False
         self.data_test.enforce_disjoint_train_test = True
 
         # The ordinary metric table remains per category. This mapping adds the

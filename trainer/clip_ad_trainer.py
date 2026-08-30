@@ -8,6 +8,7 @@ import tabulate
 import torch
 import torch.nn.functional as F
 from sklearn.metrics import average_precision_score, precision_recall_curve, roc_auc_score
+from torch.utils.data import DataLoader, Subset
 
 from . import TRAINER
 from ._base_trainer import BaseTrainer
@@ -39,6 +40,23 @@ class CLIPADTrainer(BaseTrainer):
         self._sync_metric_recorder(self.cls_names)
         log_msg(self.logger, f"==> Source-domain train classes: {list(self.train_loader.dataset.cls_names)}")
         log_msg(self.logger, f"==> Target-domain test classes: {self.cls_names}")
+        self.meta_validation_enabled = bool(
+            getattr(cfg.trainer, "meta_validation_enabled", False)
+        )
+        self.meta_best_auc = float("-inf")
+        self.meta_best_epoch = None
+        self.meta_best_path = os.path.join(cfg.logdir, "net_meta_best.pth")
+        if self.meta_validation_enabled:
+            sampler = getattr(self.train_loader, "batch_sampler", None)
+            if not hasattr(sampler, "heldout_classes"):
+                raise ValueError(
+                    "meta_validation_enabled requires a rotating hold-out batch sampler."
+                )
+            log_msg(
+                self.logger,
+                "==> Meta-validation enabled: VisA is final-test only; "
+                "source held-out category AUROC selects net_meta_best.pth.",
+            )
 
     @staticmethod
     def _dataset_image_paths(dataset):
@@ -170,6 +188,122 @@ class CLIPADTrainer(BaseTrainer):
         self.mask_path = inputs.get("mask_path") if isinstance(inputs, dict) else None
         self.bs = self.imgs.shape[0]
 
+    def _unwrapped_net(self):
+        return self.net.module if hasattr(self.net, "module") else self.net
+
+    @torch.no_grad()
+    def meta_validate(self):
+        """Evaluate the current source-category hold-out fold only."""
+        if not self.meta_validation_enabled:
+            raise RuntimeError("meta_validate() called while meta-validation is disabled.")
+
+        batch_sampler = self.train_loader.batch_sampler
+        heldout_classes = tuple(batch_sampler.heldout_classes)
+        heldout_set = set(heldout_classes)
+        heldout_indices = [
+            index
+            for index, sample in enumerate(self.train_loader.dataset.samples)
+            if str(sample["cls_name"]) in heldout_set
+        ]
+        if not heldout_indices:
+            raise RuntimeError(
+                f"No source samples found for held-out classes {heldout_classes}."
+            )
+
+        validation_loader = DataLoader(
+            Subset(self.train_loader.dataset, heldout_indices),
+            batch_size=self.cfg.trainer.data.batch_size_per_gpu_test,
+            shuffle=False,
+            num_workers=self.cfg.trainer.data.num_workers_per_gpu,
+            pin_memory=self.cfg.trainer.data.pin_memory,
+            persistent_workers=False,
+        )
+        self.net.eval()
+        scores, labels, class_names = [], [], []
+        for batch in validation_loader:
+            self.set_input(batch)
+            self.forward(return_loss=False)
+            scores.append(self.image_score.detach().float().cpu().numpy().reshape(-1))
+            labels.append(self.anomaly.detach().cpu().numpy().reshape(-1))
+            class_names.extend(str(name) for name in self.cls_name)
+
+        scores = np.concatenate(scores)
+        labels = np.concatenate(labels).astype(int)
+        class_names = np.asarray(class_names)
+        rows = []
+        class_aurocs = []
+        for class_name in heldout_classes:
+            class_rows = class_names == class_name
+            class_labels = labels[class_rows]
+            if class_rows.sum() == 0 or np.unique(class_labels).size < 2:
+                raise RuntimeError(
+                    "Each held-out source class must contain normal and anomalous images; "
+                    f"invalid class={class_name!r}."
+                )
+            class_auc = roc_auc_score(class_labels, scores[class_rows]) * 100.0
+            class_aurocs.append(class_auc)
+            rows.append([class_name, int(class_rows.sum()), class_auc])
+        mean_auc = float(np.mean(class_aurocs))
+        rows.append(["Mean", len(labels), mean_auc])
+        table = tabulate.tabulate(
+            rows,
+            headers=["Held-out class", "Images", "Image AUROC"],
+            tablefmt="pipe",
+            floatfmt=".3f",
+            numalign="center",
+            stralign="center",
+        )
+        log_msg(
+            self.logger,
+            f"==> Source meta-validation | epoch={self.epoch} | "
+            f"fold={heldout_classes}\n{table}",
+        )
+
+        if mean_auc > self.meta_best_auc:
+            self.meta_best_auc = mean_auc
+            self.meta_best_epoch = int(self.epoch)
+            if self.master:
+                state_dict = {
+                    key: value.detach().cpu()
+                    for key, value in self._unwrapped_net().state_dict().items()
+                }
+                # Keep net_meta_best.pth compatible with the project's normal
+                # checkpoint_path loader, which expects a plain state dict.
+                torch.save(state_dict, self.meta_best_path)
+                torch.save(
+                    {
+                        "meta_auc": mean_auc,
+                        "epoch": self.meta_best_epoch,
+                        "heldout_classes": heldout_classes,
+                    },
+                    os.path.join(self.cfg.logdir, "meta_best_info.pth"),
+                )
+            log_msg(
+                self.logger,
+                f"==> New source meta-validation best: {mean_auc:.3f} "
+                f"at epoch {self.meta_best_epoch}.",
+            )
+        return mean_auc
+
+    def load_meta_best(self):
+        if not self.meta_validation_enabled:
+            return
+        if not os.path.isfile(self.meta_best_path):
+            raise FileNotFoundError(
+                f"Meta-validation checkpoint does not exist: {self.meta_best_path}"
+            )
+        state_dict = torch.load(self.meta_best_path, map_location="cpu")
+        self._unwrapped_net().load_state_dict(state_dict, strict=True)
+        info_path = os.path.join(self.cfg.logdir, "meta_best_info.pth")
+        info = torch.load(info_path, map_location="cpu")
+        self.meta_best_auc = float(info["meta_auc"])
+        self.meta_best_epoch = int(info["epoch"])
+        log_msg(
+            self.logger,
+            "==> Loaded source meta-validation best before the single VisA test: "
+            f"epoch={self.meta_best_epoch}, AUROC={self.meta_best_auc:.3f}.",
+        )
+
     def forward(self, return_loss=True):
         score_cls_names = self._get_model_cls_names()
         self.output = self.net(
@@ -217,9 +351,109 @@ class CLIPADTrainer(BaseTrainer):
             "loss_mamba_context_outside_topk",
             "loss_mamba_context_separation",
             "loss_mamba_feature_contrast",
+            "loss_mamba_semantic_alignment_preserve",
+            "loss_mamba_direct_alignment",
+            "loss_mamba_prototype_calibration_ce",
+            "loss_mamba_candidate_hard_negative",
+            "dbg_mamba_candidate_hard_negative_weight",
+            "dbg_mamba_candidate_hard_negative_support",
+            "dbg_mamba_candidate_positive_support",
+            "loss_mamba_hard_normal_ce",
+            "loss_mamba_hard_normal_rank",
+            "dbg_mamba_hard_normal_weight_factor",
+            "dbg_hard_normal_selected_count",
+            "dbg_hn_prob_easy_normal",
+            "dbg_hn_prob_hard_normal",
+            "dbg_hn_prob_mask_in",
+            "dbg_anomaly_prob_easy_normal",
+            "dbg_anomaly_prob_hard_normal",
+            "dbg_anomaly_prob_mask_in",
+            "dbg_hn_anomaly_margin_hard_normal",
+            "dbg_anomaly_hn_margin_mask_in",
+            "loss_mamba_residual_gate",
+            "loss_image_rank",
+            "dbg_image_rank_violation",
+            "loss_image_class_rank",
+            "dbg_image_class_rank_violation",
+            "dbg_image_class_rank_valid_classes",
+            "loss_image_class_auc",
+            "dbg_image_class_auc_pair_gap",
+            "dbg_image_class_auc_valid_classes",
             "dbg_mamba_feature_contrast_weight",
             "dbg_mamba_feature_contrast_gap",
             "dbg_mamba_feature_prototype_cosine",
+            "dbg_mamba_semantic_align_scale",
+            "dbg_mamba_semantic_align_cosine",
+            "dbg_mamba_semantic_align_delta_l2",
+            "dbg_mamba_semantic_align_score_delta_abs",
+            "dbg_mamba_direct_alignment_cosine",
+            "dbg_mamba_direct_alignment_delta_l2",
+            "dbg_mamba_prototype_logit_scale",
+            "dbg_mamba_prototype_margin_abs",
+            "dbg_mamba_prototype_entropy",
+            "dbg_mamba_arcc_lambda",
+            "dbg_mamba_arcc_support_normal",
+            "dbg_mamba_arcc_support_mask_in",
+            "dbg_mamba_arcc_support_mask_out",
+            "dbg_mamba_arcc_candidate_gate_mean",
+            "dbg_mamba_arcc_candidate_gate_inside",
+            "dbg_mamba_arcc_candidate_gate_outside",
+            "dbg_mamba_arcc_delta_mean",
+            "dbg_mamba_arcc_delta_inside",
+            "dbg_mamba_arcc_delta_outside",
+            "dbg_mamba_arcc_before_normal_topk",
+            "dbg_mamba_arcc_after_normal_topk",
+            "dbg_mamba_arcc_before_mask_in",
+            "dbg_mamba_arcc_after_mask_in",
+            "dbg_mamba_arcc_amplified_pct",
+            "dbg_mamba_arcc_suppressed_pct",
+            "dbg_mamba_arcc_final_minus_arcc_abs",
+            "loss_pdar_scale_route",
+            "loss_pdar_scale_expert",
+            "dbg_pdar_scale_weight_factor",
+            "dbg_pdar_scale_target",
+            "dbg_pdar_scale_pred_depth",
+            "dbg_pdar_scale_depth_abs_error",
+            "dbg_pdar_stage_neighbor_cosine",
+            "dbg_mamba_residual_gate_mean",
+            "dbg_mamba_residual_oracle_mean",
+            "dbg_mamba_residual_correction_abs",
+            "dbg_mamba_residual_local_mamba_gap",
+            "dbg_mamba_residual_image_w_global",
+            "dbg_mamba_residual_image_w_fused",
+            "dbg_mamba_residual_image_bias",
+            "dbg_relative_mamba_w_global",
+            "dbg_relative_mamba_w_relative",
+            "dbg_relative_mamba_bias",
+            "dbg_relative_mamba_score",
+            "dbg_relative_mamba_baseline",
+            "dbg_relative_mamba_iqr",
+            "dbg_relative_mamba_exceedance_ratio",
+            "dbg_relative_mamba_score_normal",
+            "dbg_relative_mamba_score_abnormal",
+            "dbg_mamba_coherence_scale",
+            "dbg_mamba_coherence_score",
+            "dbg_mamba_coherence_high_ratio",
+            "dbg_mamba_coherence_delta",
+            "dbg_mamba_coherence_score_normal",
+            "dbg_mamba_coherence_score_abnormal",
+            "dbg_mamba_coherence_delta_normal",
+            "dbg_mamba_coherence_delta_abnormal",
+            "dbg_semantic_fusion_w_global",
+            "dbg_semantic_fusion_w_raw",
+            "dbg_semantic_fusion_w_mamba",
+            "dbg_semantic_fusion_bias",
+            "dbg_semantic_fusion_delta",
+            "dbg_semantic_fusion_delta_normal",
+            "dbg_semantic_fusion_delta_abnormal",
+            "dbg_candidate_zoom_score",
+            "dbg_candidate_zoom_residual",
+            "dbg_candidate_zoom_scale",
+            "dbg_candidate_zoom_delta",
+            "dbg_candidate_zoom_score_normal",
+            "dbg_candidate_zoom_score_abnormal",
+            "dbg_candidate_zoom_delta_normal",
+            "dbg_candidate_zoom_delta_abnormal",
             "dbg_refine_cos",
             "dbg_refine_delta_l2",
             "dbg_mamba_context_cos",
@@ -300,6 +534,15 @@ class CLIPADTrainer(BaseTrainer):
             "dbg_image_reviewer_raw_contrib",
             "dbg_image_reviewer_agree_contrib",
             "dbg_image_reviewer_disagree_contrib",
+            "dbg_candidate_reviewer_support",
+            "dbg_candidate_reviewer_scale",
+            "dbg_candidate_background_support",
+            "dbg_candidate_relative_gap",
+            "dbg_candidate_reviewer_correction",
+            "dbg_candidate_support_normal",
+            "dbg_candidate_support_abnormal",
+            "dbg_candidate_correction_normal",
+            "dbg_candidate_correction_abnormal",
             "dbg_reviewer_w_global",
             "dbg_reviewer_w_raw_max",
             "dbg_reviewer_w_raw_top1",
@@ -315,6 +558,11 @@ class CLIPADTrainer(BaseTrainer):
             "dbg_reviewer_reject_scale",
             "dbg_reviewer_score_delta",
             "dbg_reviewer_base_score",
+            "dbg_reviewer_base_is_final_max",
+            "dbg_reviewer_relative_gap_normal",
+            "dbg_reviewer_relative_gap_abnormal",
+            "dbg_reviewer_score_delta_normal",
+            "dbg_reviewer_score_delta_abnormal",
             "dbg_mamba_prior_mean",
             "dbg_mamba_prior_max",
             "dbg_mamba_prior_mask_in",
@@ -366,6 +614,7 @@ class CLIPADTrainer(BaseTrainer):
 
     def _metric_table(self, results):
         msg = {}
+        class_metric_values = {metric: {} for metric in self.metrics}
         for idx, cls_name in enumerate(self.cls_names):
             metric_results = self.evaluator.run(results, cls_name, self.logger)
             msg["Name"] = msg.get("Name", [])
@@ -374,6 +623,7 @@ class CLIPADTrainer(BaseTrainer):
             msg["Name"].append("Avg") if avg_act else None
             for metric in self.metrics:
                 metric_result = metric_results[metric] * 100
+                class_metric_values[metric][cls_name] = metric_result
                 self.metric_recorder[f"{metric}_{cls_name}"].append(metric_result)
                 max_metric = max(self.metric_recorder[f"{metric}_{cls_name}"])
                 max_metric_idx = self.metric_recorder[f"{metric}_{cls_name}"].index(max_metric) + 1
@@ -391,6 +641,42 @@ class CLIPADTrainer(BaseTrainer):
         table = tabulate.tabulate(msg, headers="keys", tablefmt="pipe", floatfmt=".3f", numalign="center", stralign="center")
         log_msg(self.logger, f"\n{table}")
 
+        class_groups = getattr(self.cfg, "eval_class_groups", None)
+        if class_groups:
+            group_rows = []
+            for group_name, member_names in class_groups.items():
+                unknown = sorted(set(member_names) - set(self.cls_names))
+                if unknown:
+                    raise ValueError(
+                        f"Unknown eval_class_groups members for {group_name}: {unknown}"
+                    )
+                row = {"Dataset": group_name}
+                for metric in self.metrics:
+                    values = [
+                        class_metric_values[metric][name] for name in member_names
+                    ]
+                    row[metric] = float(np.mean(values))
+                group_rows.append(row)
+
+            overall = {"Dataset": "Dataset_Macro_Avg"}
+            for metric in self.metrics:
+                overall[metric] = float(
+                    np.mean([row[metric] for row in group_rows])
+                )
+            group_rows.append(overall)
+            group_table = tabulate.tabulate(
+                group_rows,
+                headers="keys",
+                tablefmt="pipe",
+                floatfmt=".3f",
+                numalign="center",
+                stralign="center",
+            )
+            log_msg(
+                self.logger,
+                f"\n==> Dataset-group macro averages\n{group_table}",
+            )
+
     def _image_score_variant_table(self, results):
         variant_keys = [
             ("default", "image_scores"),
@@ -400,6 +686,7 @@ class CLIPADTrainer(BaseTrainer):
             ("top1", "image_scores_top1"),
             ("top5", "image_scores_top5"),
             ("cnn_only", "image_scores_cnn_only"),
+            ("mamba_residual", "image_scores_mamba_residual"),
         ]
         variant_keys = [(name, key) for name, key in variant_keys if key in results]
         if len(variant_keys) <= 1:
@@ -441,7 +728,13 @@ class CLIPADTrainer(BaseTrainer):
         image_scores_max, image_scores_top1, image_scores_top5 = [], [], []
         raw_anomaly_maps, arcc_cal_maps, mamba_prior_maps = [], [], []
         mamba_semantic_maps, mamba_support_maps, mamba_veto_maps = [], [], []
+        mamba_arcc_before_patches, mamba_arcc_support_patches = [], []
+        mamba_arcc_candidate_gate_patches, mamba_arcc_delta_patches = [], []
+        pdar_depth_maps = []
         save_mamba_full_maps = bool(getattr(self.cfg.trainer, "save_mamba_full_maps", True))
+        save_mamba_arcc_diagnostics = bool(
+            getattr(self.cfg.trainer, "save_mamba_arcc_diagnostic_maps", False)
+        )
         image_component_outputs = {
             "global_scores": "S_global",
             "raw_scores_max": "raw_score_max",
@@ -459,6 +752,29 @@ class CLIPADTrainer(BaseTrainer):
             "image_reviewer_evidence": "image_reviewer_evidence",
             "image_relative_reviewer_evidence": "image_relative_reviewer_evidence",
             "image_scores_relative_reviewer_base": "image_score_relative_reviewer_base",
+            "mamba_residual_scores_topk": "mamba_residual_score_topk",
+            "image_scores_mamba_residual": "image_score_mamba_residual",
+            "image_mamba_residual_evidence": "image_mamba_residual_evidence",
+            "mamba_relative_scores": "mamba_relative_score",
+            "image_relative_mamba_evidence": "image_relative_mamba_evidence",
+            "mamba_coherence_scores": "mamba_coherence_score",
+            "mamba_coherence_high_ratios": "mamba_coherence_high_ratio",
+            "image_scores_mamba_coherence_base": (
+                "image_score_mamba_coherence_base"
+            ),
+            "image_mamba_coherence_deltas": "image_mamba_coherence_delta",
+            "image_scores_semantic_fusion_base": (
+                "image_score_semantic_fusion_base"
+            ),
+            "image_semantic_fusion_deltas": "image_semantic_fusion_delta",
+            "image_semantic_fusion_weights": "image_semantic_fusion_weights",
+            "image_semantic_fusion_biases": "image_semantic_fusion_bias",
+            "image_scores_candidate_zoom_base": (
+                "image_score_candidate_zoom_base"
+            ),
+            "candidate_zoom_scores": "candidate_zoom_score",
+            "candidate_zoom_residuals": "candidate_zoom_residual",
+            "image_candidate_zoom_deltas": "image_candidate_zoom_delta",
         }
         image_component_values = {key: [] for key in image_component_outputs}
         mamba_depth_stage_means = {}
@@ -478,10 +794,55 @@ class CLIPADTrainer(BaseTrainer):
             "dbg_mamba_veto_normal": "dbg_batch_normal_count",
             "dbg_mamba_veto_mask_in": "dbg_batch_positive_mask_count",
             "dbg_mamba_veto_mask_out": "dbg_batch_positive_mask_count",
+            "dbg_mamba_arcc_lambda": "dbg_batch_image_count",
+            "dbg_mamba_arcc_support_normal": "dbg_batch_normal_count",
+            "dbg_mamba_arcc_support_mask_in": "dbg_batch_positive_mask_count",
+            "dbg_mamba_arcc_support_mask_out": "dbg_batch_positive_mask_count",
+            "dbg_mamba_arcc_candidate_gate_mean": "dbg_batch_image_count",
+            "dbg_mamba_arcc_candidate_gate_inside": "dbg_batch_positive_mask_count",
+            "dbg_mamba_arcc_candidate_gate_outside": "dbg_batch_positive_mask_count",
+            "dbg_mamba_arcc_delta_mean": "dbg_batch_image_count",
+            "dbg_mamba_arcc_delta_inside": "dbg_batch_positive_mask_count",
+            "dbg_mamba_arcc_delta_outside": "dbg_batch_positive_mask_count",
+            "dbg_mamba_arcc_before_normal_topk": "dbg_batch_normal_count",
+            "dbg_mamba_arcc_after_normal_topk": "dbg_batch_normal_count",
+            "dbg_mamba_arcc_before_mask_in": "dbg_batch_positive_mask_count",
+            "dbg_mamba_arcc_after_mask_in": "dbg_batch_positive_mask_count",
+            "dbg_mamba_arcc_amplified_pct": "dbg_batch_image_count",
+            "dbg_mamba_arcc_suppressed_pct": "dbg_batch_image_count",
+            "dbg_mamba_arcc_final_minus_arcc_abs": "dbg_batch_image_count",
+            "dbg_hn_prob_easy_normal": "dbg_batch_image_count",
+            "dbg_hn_prob_hard_normal": "dbg_batch_image_count",
+            "dbg_hn_prob_mask_in": "dbg_batch_positive_mask_count",
+            "dbg_anomaly_prob_easy_normal": "dbg_batch_image_count",
+            "dbg_anomaly_prob_hard_normal": "dbg_batch_image_count",
+            "dbg_anomaly_prob_mask_in": "dbg_batch_positive_mask_count",
+            "dbg_hn_anomaly_margin_hard_normal": "dbg_batch_image_count",
+            "dbg_anomaly_hn_margin_mask_in": "dbg_batch_positive_mask_count",
+            "dbg_hard_normal_selected_count": "dbg_batch_image_count",
             "dbg_joint_vs_cnn_max_normal": "dbg_batch_normal_count",
             "dbg_joint_vs_cnn_max_abnormal": "dbg_batch_abnormal_count",
             "dbg_joint_vs_cnn_mask_in": "dbg_batch_positive_mask_count",
             "dbg_joint_vs_cnn_mask_out": "dbg_batch_positive_mask_count",
+            "dbg_reviewer_relative_gap_normal": "dbg_batch_normal_count",
+            "dbg_reviewer_relative_gap_abnormal": "dbg_batch_abnormal_count",
+            "dbg_reviewer_score_delta_normal": "dbg_batch_normal_count",
+            "dbg_reviewer_score_delta_abnormal": "dbg_batch_abnormal_count",
+            "dbg_mamba_residual_gate_normal": "dbg_batch_normal_count",
+            "dbg_mamba_residual_gate_mask_in": "dbg_batch_positive_mask_count",
+            "dbg_mamba_residual_gate_mask_out": "dbg_batch_positive_mask_count",
+            "dbg_relative_mamba_score_normal": "dbg_batch_normal_count",
+            "dbg_relative_mamba_score_abnormal": "dbg_batch_abnormal_count",
+            "dbg_mamba_coherence_score_normal": "dbg_batch_normal_count",
+            "dbg_mamba_coherence_score_abnormal": "dbg_batch_abnormal_count",
+            "dbg_mamba_coherence_delta_normal": "dbg_batch_normal_count",
+            "dbg_mamba_coherence_delta_abnormal": "dbg_batch_abnormal_count",
+            "dbg_semantic_fusion_delta_normal": "dbg_batch_normal_count",
+            "dbg_semantic_fusion_delta_abnormal": "dbg_batch_abnormal_count",
+            "dbg_candidate_zoom_score_normal": "dbg_batch_normal_count",
+            "dbg_candidate_zoom_score_abnormal": "dbg_batch_abnormal_count",
+            "dbg_candidate_zoom_delta_normal": "dbg_batch_normal_count",
+            "dbg_candidate_zoom_delta_abnormal": "dbg_batch_abnormal_count",
         }
         diagnostic_sums = {key: 0.0 for key in diagnostic_specs}
         diagnostic_counts = {key: 0.0 for key in diagnostic_specs}
@@ -536,6 +897,19 @@ class CLIPADTrainer(BaseTrainer):
                 mamba_support_maps.append(self.output["mamba_support_map"].cpu().numpy())
             if save_mamba_full_maps and isinstance(self.output, dict) and "mamba_veto_map" in self.output:
                 mamba_veto_maps.append(self.output["mamba_veto_map"].cpu().numpy())
+            if save_mamba_arcc_diagnostics and isinstance(self.output, dict):
+                diagnostic_patch_outputs = (
+                    (mamba_arcc_before_patches, "mamba_arcc_before_patch"),
+                    (mamba_arcc_support_patches, "mamba_arcc_support_patch"),
+                    (
+                        mamba_arcc_candidate_gate_patches,
+                        "mamba_arcc_candidate_gate_patch",
+                    ),
+                    (mamba_arcc_delta_patches, "mamba_arcc_delta_patch"),
+                )
+                for values, output_key in diagnostic_patch_outputs:
+                    if output_key in self.output:
+                        values.append(self.output[output_key].cpu().numpy())
             if isinstance(self.output, dict) and "mamba_depth_stage_weight_means" in self.output:
                 for stage_idx, stage_means in enumerate(
                     self.output["mamba_depth_stage_weight_means"], start=1
@@ -561,6 +935,21 @@ class CLIPADTrainer(BaseTrainer):
                     for region_name, values in region_means.items():
                         key = f"mamba_depth_{block_name}_{region_name}_means"
                         mamba_depth_region_means.setdefault(key, []).append(values)
+            if isinstance(self.output, dict) and "mamba_depth_weights" in self.output:
+                # Expected depth of the final patch-wise routing distribution.
+                # The saved map is normalized to [0, 1]: 0 means the shallowest
+                # historical feature and 1 means the deepest/global feature.
+                depth_weights = self.output["mamba_depth_weights"].detach().float()
+                depth_levels = torch.linspace(
+                    0.0,
+                    1.0,
+                    depth_weights.shape[1],
+                    device=depth_weights.device,
+                    dtype=depth_weights.dtype,
+                ).view(1, -1, 1, 1)
+                pdar_depth_maps.append(
+                    (depth_weights * depth_levels).sum(dim=1).cpu().numpy()
+                )
             if self.img_path is not None:
                 img_paths.append(np.array(self.img_path))
             if self.mask_path is not None:
@@ -626,6 +1015,18 @@ class CLIPADTrainer(BaseTrainer):
             results["mamba_support_maps"] = mamba_support_maps
         if mamba_veto_maps:
             results["mamba_veto_maps"] = mamba_veto_maps
+        if mamba_arcc_before_patches:
+            results["mamba_arcc_before_patches"] = mamba_arcc_before_patches
+        if mamba_arcc_support_patches:
+            results["mamba_arcc_support_patches"] = mamba_arcc_support_patches
+        if mamba_arcc_candidate_gate_patches:
+            results["mamba_arcc_candidate_gate_patches"] = (
+                mamba_arcc_candidate_gate_patches
+            )
+        if mamba_arcc_delta_patches:
+            results["mamba_arcc_delta_patches"] = mamba_arcc_delta_patches
+        if pdar_depth_maps:
+            results["pdar_depth_maps"] = pdar_depth_maps
         for key, values in image_component_values.items():
             if values:
                 results[key] = values
@@ -661,6 +1062,16 @@ class CLIPADTrainer(BaseTrainer):
                     results["mamba_support_maps"] = []
                 if mamba_veto_maps:
                     results["mamba_veto_maps"] = []
+                if mamba_arcc_before_patches:
+                    results["mamba_arcc_before_patches"] = []
+                if mamba_arcc_support_patches:
+                    results["mamba_arcc_support_patches"] = []
+                if mamba_arcc_candidate_gate_patches:
+                    results["mamba_arcc_candidate_gate_patches"] = []
+                if mamba_arcc_delta_patches:
+                    results["mamba_arcc_delta_patches"] = []
+                if pdar_depth_maps:
+                    results["pdar_depth_maps"] = []
                 for key, values in image_component_values.items():
                     if values:
                         results[key] = []
